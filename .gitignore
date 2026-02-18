@@ -1,0 +1,20 @@
+# Build artifacts
+bin/*.exe
+bin/*.dll
+bin/*.pdb
+bin/*.exp
+bin/*.lib
+*.obj
+
+# Output
+schema-dump/
+
+# VS temp
+*.suo
+*.user
+*.sdf
+*.opensdf
+.vs/
+
+# Temp files
+*.log
