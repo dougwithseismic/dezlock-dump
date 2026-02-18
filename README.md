@@ -1,8 +1,8 @@
 # dezlock-dump
 
-Runtime schema + RTTI extraction tool for Deadlock (Source 2). Injects a minimal worker DLL into a running Deadlock process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, and inheritance chains.
+Runtime schema + RTTI + vtable extraction tool for Deadlock (Source 2). Injects a minimal worker DLL into a running Deadlock process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, and **every virtual function table**.
 
-No source2gen required — reads directly from the game's `SchemaSystem` at runtime.
+No source2gen required — reads directly from the game's `SchemaSystem` and MSVC x64 RTTI at runtime.
 
 **Auto-discovers all modules** — walks every loaded DLL for schema data (client.dll, server.dll, engine2.dll, animationsystem.dll, etc).
 
@@ -17,6 +17,8 @@ For each module with schema data (e.g. `client.dll` → `client`):
 | `schema-dump/<module>-enums.txt` | Greppable text | Every enum + enumerator values |
 | `schema-dump/<module>/hierarchy/` | Tree | Per-class files organized by inheritance |
 | `schema-dump/all-modules.json` | JSON | Full structured export for tooling (all modules) |
+
+Additionally, `%TEMP%\dezlock-export.json` contains the complete JSON export with vtable data.
 
 ## Quick Start
 
@@ -87,18 +89,97 @@ grep -r m_iHealth schema-dump/*.txt
 cat schema-dump/hierarchy/C_BaseEntity/C_CitadelPlayerPawn.txt
 ```
 
+## SDK Header Generation
+
+`import-schema.py` converts the JSON export into ready-to-include C++ headers:
+
+```bash
+# After running dezlock-dump.exe
+python import-schema.py --game deadlock
+```
+
+### Generated Files
+
+| File | Contents |
+|------|----------|
+| `_all-vtables.hpp` | Per-class vtable RVAs and function indices |
+| `_all-offsets.hpp` | All field offsets as `constexpr uint32_t` |
+| `_all-enums.hpp` | All enums as `enum class` |
+| `<module>/<ClassName>.hpp` | Padded struct with `static_assert` validation |
+
+### Vtable Header
+
+```cpp
+namespace deadlock::generated::vtables {
+namespace CCitadelInput {
+    constexpr uint32_t vtable_rva = 0x22A4A58;
+    constexpr int entry_count = 30;
+    namespace fn {
+        constexpr int idx_0 = 0;  // rva=0x508F10
+        constexpr int idx_5 = 5;  // rva=0x15AF360 (CreateMove)
+        // ...
+    }
+}
+}
+```
+
+Vtable indices are ABI-stable — they don't change across patches. Only the RVAs shift. Hook by index, resolve the vtable at runtime with `module_base + vtable_rva`.
+
+### Offset Header
+
+```cpp
+namespace deadlock::generated::offsets {
+namespace C_BaseEntity {
+    constexpr uint32_t m_iHealth = 0x354;
+    constexpr uint32_t m_iMaxHealth = 0x350;
+    constexpr uint32_t m_pGameSceneNode = 0x330;
+    // ...
+}
+}
+```
+
+### Struct Headers
+
+Per-class headers with full padding and compile-time offset verification — if an offset is wrong after a patch, the build fails immediately:
+
+```cpp
+#pragma pack(push, 1)
+struct C_BaseEntity {
+    uint8_t _pad0000[0x330];
+    void* m_pGameSceneNode;         // 0x330
+    uint8_t _pad0338[0x18];
+    int32_t m_iMaxHealth;           // 0x350
+    int32_t m_iHealth;              // 0x354
+    // ...
+};
+#pragma pack(pop)
+static_assert(sizeof(C_BaseEntity) == 0xF60, "C_BaseEntity size");
+static_assert(offsetof(C_BaseEntity, m_iHealth) == 0x354, "m_iHealth");
+```
+
 ## What Gets Captured
 
-| Data | Source | Notes |
-|------|--------|-------|
-| Classes | SchemaSystem CUtlTSHash | All registered classes per module |
-| Fields | SchemaClassFieldData_t | Name, type, offset, size |
-| Field metadata | SchemaMetadataEntryData_t | `[MNetworkEnable]`, `[MNetworkChangeCallback]`, etc. |
-| Static fields | SchemaClassFieldData_t | Class-level (non-instance) members |
-| Class metadata | SchemaMetadataEntryData_t | Class-level annotations |
-| Base classes | SchemaBaseClassInfoData_t | Multiple inheritance with offsets |
-| Enums | SchemaEnumInfoData_t | All enumerators with values |
-| RTTI hierarchy | MSVC x64 RTTI | Full inheritance chains via TypeDescriptor |
+| Data | Source | Example Count |
+|------|--------|---------------|
+| Classes | SchemaSystem CUtlTSHash | ~5,000 |
+| Fields | SchemaClassFieldData_t | ~21,000 |
+| Enums | SchemaEnumInfoData_t | ~24 |
+| RTTI classes | MSVC x64 TypeDescriptor | ~8,500 |
+| Vtables | RTTI COL → .rdata scan | ~12,500 |
+| Virtual functions | .text pointer entries | ~688,000 |
+
+### Vtable Counts by Module
+
+| Module | Vtables | Functions |
+|--------|---------|-----------|
+| client.dll | 2,459 | 128,443 |
+| server.dll | 7,323 | 515,909 |
+| engine2.dll | 876 | 10,525 |
+| animationsystem.dll | 1,102 | 16,211 |
+| particles.dll | 793 | 16,496 |
+| worldrenderer.dll | 26 | 341 |
+
+This includes **RTTI-only classes** that have no schema entry — things like `CCitadelInput`, `CInput`, `CGameTraceManager`. These are often the most important for hooking.
 
 ## How It Works
 
@@ -108,9 +189,24 @@ cat schema-dump/hierarchy/C_BaseEntity/C_CitadelPlayerPawn.txt
 4. For each module, walks `SchemaSystem_001` — enumerates classes (CUtlTSHash at +0x0560) and enums (+0x0BE8)
 5. Reads field metadata, class metadata, and static fields from each class
 6. Walks RTTI (`_TypeDescriptor` + `_RTTICompleteObjectLocator`) in each module
-7. Exports JSON to `%TEMP%`, signals completion via marker file
-8. Main exe reads JSON and generates all output formats per module
-9. Worker auto-unloads via `FreeLibraryAndExitThread`
+7. **Pass 4 — Vtable discovery**: scans `.rdata` for pointers to COL structures (vtable[-1]), reads consecutive `.text`-pointing entries as virtual function addresses
+8. Exports JSON to `%TEMP%`, signals completion via marker file
+9. Main exe reads JSON and generates all output formats per module
+10. Worker auto-unloads via `FreeLibraryAndExitThread`
+
+### Vtable Discovery Detail
+
+```
+For each CompleteObjectLocator found via RTTI:
+  → Compute absolute address of COL in memory
+  → Build hashset of all COL addresses
+
+Single linear scan of .rdata section:
+  → Check each 8-byte value against COL hashset
+  → Match = vtable[-1], so vtable[0] starts at match + 8
+  → Read entries while they point into .text section (max 512)
+  → Store as RVAs (module_base subtracted, portable across sessions)
+```
 
 ## Output Format
 
@@ -155,6 +251,28 @@ CEntityComponent (0x8, 0 fields)
         `-- C_BasePlayerPawn (0x1100, 18 fields)
             `-- C_CitadelPlayerPawn (0x1800, 31 fields)
 ```
+
+### JSON vtables (`dezlock-export.json`)
+
+```json
+{
+  "modules": [{
+    "name": "client.dll",
+    "vtables": [{
+      "class": "CCitadelInput",
+      "vtable_rva": "0x22A4A58",
+      "functions": [
+        {"index": 0, "rva": "0x508F10"},
+        {"index": 5, "rva": "0x15AF360"}
+      ]
+    }]
+  }]
+}
+```
+
+## Why Not source2gen?
+
+source2gen works great but requires building and injecting a separate loader, generates thousands of SDK header files you then have to parse, and doesn't give you vtables or RTTI inheritance. dezlock-dump gives you one JSON file with everything — schema + RTTI + vtables — in ~2 seconds. Use whatever fits your workflow.
 
 ## Contributing
 
