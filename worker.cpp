@@ -53,6 +53,15 @@ void* find_schema_system() {
 // JSON export (writes directly to file, no TCP)
 // ============================================================================
 
+// Helper: check if a string is safe for JSON (all printable ASCII)
+static bool is_json_safe(const char* s) {
+    if (!s || !s[0]) return false;
+    for (const char* p = s; *p; p++) {
+        if (*p < 0x20 || *p > 0x7E) return false;
+    }
+    return true;
+}
+
 // Helper: escape a string for JSON output
 static std::string json_escape(const char* s) {
     std::string out;
@@ -69,10 +78,15 @@ static std::string json_escape(const char* s) {
 }
 
 // Write a single field (instance or static) as JSON
-static void write_field_json(FILE* fp, const schema::RuntimeField& f, bool first) {
+// Returns true if written, false if skipped (invalid data)
+static bool write_field_json(FILE* fp, const schema::RuntimeField& f, bool first) {
+    // Belt-and-suspenders: skip fields with non-ASCII names or types
+    if (!is_json_safe(f.name)) return false;
+    if (f.type_name && !is_json_safe(f.type_name)) return false;
+
     if (!first) fprintf(fp, ",");
     fprintf(fp, "\n        {\"name\": \"%s\", \"type\": \"%s\", \"offset\": %d, \"size\": %d",
-            f.name ? f.name : "",
+            json_escape(f.name).c_str(),
             json_escape(f.type_name).c_str(),
             f.offset, f.size);
     if (!f.metadata.empty()) {
@@ -84,6 +98,7 @@ static void write_field_json(FILE* fp, const schema::RuntimeField& f, bool first
         fprintf(fp, "]");
     }
     fprintf(fp, "}");
+    return true;
 }
 
 bool write_export(schema::SchemaManager& mgr, const char* path) {
@@ -136,10 +151,11 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
         int idx = 0;
         for (const auto& [key, cls] : cache) {
             if (key.rfind(prefix, 0) != 0) continue;
+            if (!is_json_safe(cls.name)) continue;  // skip classes with garbage names
             if (idx > 0) fprintf(fp, ",\n");
 
             fprintf(fp, "        {\n");
-            fprintf(fp, "          \"name\": \"%s\",\n", cls.name ? cls.name : "");
+            fprintf(fp, "          \"name\": \"%s\",\n", json_escape(cls.name).c_str());
             fprintf(fp, "          \"size\": %d,\n", cls.size);
 
             // Class metadata
@@ -154,11 +170,11 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
 
             auto* rtti = mgr.get_inheritance(cls.name);
             if (rtti && !rtti->parent.empty()) {
-                fprintf(fp, "          \"parent\": \"%s\",\n", rtti->parent.c_str());
+                fprintf(fp, "          \"parent\": \"%s\",\n", json_escape(rtti->parent.c_str()).c_str());
                 fprintf(fp, "          \"inheritance\": [");
                 for (size_t i = 0; i < rtti->chain.size(); i++) {
                     if (i > 0) fprintf(fp, ", ");
-                    fprintf(fp, "\"%s\"", rtti->chain[i].c_str());
+                    fprintf(fp, "\"%s\"", json_escape(rtti->chain[i].c_str()).c_str());
                 }
                 fprintf(fp, "],\n");
             } else {
@@ -171,7 +187,7 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
                 for (size_t i = 0; i < cls.base_classes.size(); i++) {
                     if (i > 0) fprintf(fp, ", ");
                     fprintf(fp, "{\"name\": \"%s\", \"offset\": %d}",
-                            cls.base_classes[i].name ? cls.base_classes[i].name : "",
+                            json_escape(cls.base_classes[i].name ? cls.base_classes[i].name : "").c_str(),
                             cls.base_classes[i].offset);
                 }
                 fprintf(fp, "],\n");
@@ -179,19 +195,26 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
 
             // Instance fields
             fprintf(fp, "          \"fields\": [");
-            for (size_t i = 0; i < cls.fields.size(); i++) {
-                write_field_json(fp, cls.fields[i], i == 0);
+            {
+                bool first_f = true;
+                for (size_t i = 0; i < cls.fields.size(); i++) {
+                    if (write_field_json(fp, cls.fields[i], first_f))
+                        first_f = false;
+                }
+                if (!first_f) fprintf(fp, "\n          ");
             }
-            if (!cls.fields.empty()) fprintf(fp, "\n          ");
             fprintf(fp, "]");
 
             // Static fields
             if (!cls.static_fields.empty()) {
                 fprintf(fp, ",\n          \"static_fields\": [");
+                bool first_sf = true;
                 for (size_t i = 0; i < cls.static_fields.size(); i++) {
-                    write_field_json(fp, cls.static_fields[i], i == 0);
+                    if (write_field_json(fp, cls.static_fields[i], first_sf))
+                        first_sf = false;
                 }
-                fprintf(fp, "\n          ]");
+                if (!first_sf) fprintf(fp, "\n          ");
+                fprintf(fp, "]");
             }
 
             fprintf(fp, "\n        }");
@@ -207,21 +230,59 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
             if (idx > 0) fprintf(fp, ",\n");
 
             fprintf(fp, "        {\n");
-            fprintf(fp, "          \"name\": \"%s\",\n", en.name ? en.name : "");
+            // Skip enums with invalid names
+            if (!is_json_safe(en.name)) { idx++; continue; }
+            fprintf(fp, "          \"name\": \"%s\",\n", en.name);
             fprintf(fp, "          \"size\": %d,\n", (int)en.size);
             fprintf(fp, "          \"values\": [");
+            bool first_val = true;
             for (size_t i = 0; i < en.values.size(); i++) {
                 const auto& v = en.values[i];
-                if (i > 0) fprintf(fp, ",");
+                if (!is_json_safe(v.name)) continue;
+                if (!first_val) fprintf(fp, ",");
+                first_val = false;
                 fprintf(fp, "\n            {\"name\": \"%s\", \"value\": %lld}",
-                        v.name ? v.name : "", (long long)v.value);
+                        v.name, (long long)v.value);
             }
             if (!en.values.empty()) fprintf(fp, "\n          ");
             fprintf(fp, "]\n");
             fprintf(fp, "        }");
             idx++;
         }
-        fprintf(fp, "\n      ]\n");
+        fprintf(fp, "\n      ],\n");
+
+        // ---- Vtables ----
+        // Vtables come from RTTI, matched to module via source_module field.
+        // Includes ALL RTTI classes (even those without schema entries, like
+        // CCitadelInput) — these are the most important for hooking.
+        fprintf(fp, "      \"vtables\": [\n");
+        {
+            const auto& rtti_map = mgr.rtti_map();
+            int vt_idx = 0;
+            for (const auto& [name, info] : rtti_map) {
+                if (info.vtable_rva == 0 || info.vtable_func_rvas.empty())
+                    continue;
+                if (!is_json_safe(name.c_str())) continue;
+
+                // Match by source_module (set during load_rtti)
+                if (info.source_module != mod) continue;
+
+                if (vt_idx > 0) fprintf(fp, ",\n");
+                fprintf(fp, "        {\n");
+                fprintf(fp, "          \"class\": \"%s\",\n", json_escape(name.c_str()).c_str());
+                fprintf(fp, "          \"vtable_rva\": \"0x%X\",\n", info.vtable_rva);
+                fprintf(fp, "          \"functions\": [");
+                for (size_t fi = 0; fi < info.vtable_func_rvas.size(); fi++) {
+                    if (fi > 0) fprintf(fp, ",");
+                    fprintf(fp, "\n            {\"index\": %d, \"rva\": \"0x%X\"}",
+                            (int)fi, info.vtable_func_rvas[fi]);
+                }
+                fprintf(fp, "\n          ]\n");
+                fprintf(fp, "        }");
+                vt_idx++;
+            }
+            fprintf(fp, "\n      ]\n");
+        }
 
         fprintf(fp, "    }");
     }
@@ -308,7 +369,7 @@ void worker_thread(HMODULE hModule) {
 
             MODULEINFO mi = {};
             if (GetModuleInformation(GetCurrentProcess(), hmod, &mi, sizeof(mi))) {
-                mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage);
+                mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage, mod_name.c_str());
                 LOG_I("  RTTI %s: %d classes total", mod_name.c_str(), mgr.rtti_class_count());
             }
         }

@@ -112,12 +112,18 @@ static bool seh_read_i64(uintptr_t addr, int64_t* out) {
 static bool seh_read_string(uintptr_t addr, const char** out) {
     __try {
         const char* s = reinterpret_cast<const char*>(addr);
-        // Quick sanity: check first byte is printable or null
-        if (s && (s[0] == '\0' || (s[0] >= 0x20 && s[0] < 0x7F))) {
-            *out = s;
-            return true;
+        if (!s) return false;
+        // Validate: at least 1 char, all printable ASCII up to first null or 128 chars
+        // This catches raw memory pointers that happen to start with a printable byte
+        int len = 0;
+        for (int i = 0; i < 128 && s[i]; ++i) {
+            char c = s[i];
+            if (c < 0x20 || c > 0x7E) return false;  // non-printable = garbage
+            len++;
         }
-        return false;
+        if (len == 0) return false;  // empty string
+        *out = s;
+        return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -315,7 +321,18 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
 
     // ---- Static fields ----
     // classinfo+0x1E = m_nStaticFieldCount (int16)
-    // classinfo+0x30 = m_pStaticFields (SchemaClassFieldData_t*)
+    // classinfo+0x30 = m_pStaticFields (SchemaStaticFieldData_t*)
+    //
+    // SchemaStaticFieldData_t has SAME layout as SchemaClassFieldData_t (0x20 bytes):
+    //   +0x00  m_pszName (const char*)
+    //   +0x08  m_pSchemaType (CSchemaType*)
+    //   +0x10  m_pInstance (void*) — pointer to static data, NOT an int32 offset
+    //   +0x14  (upper 32 bits of pointer)
+    //   +0x18  m_pMetadata (SchemaMetadataEntryData_t*)
+    //
+    // We store the instance pointer as-is in the offset field (truncated to int32
+    // for the RuntimeField struct). Static field offsets aren't meaningful for struct
+    // generation; they represent global addresses.
     int16_t static_count = 0;
     seh_read_i16(ci + 0x1E, &static_count);
 
@@ -343,25 +360,13 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
                 sf.size = seh_get_type_size(reinterpret_cast<void*>(sf_type_ptr));
             }
 
-            seh_read_i32(sf_addr + 0x10, &sf.offset);
+            // +0x10 is m_pInstance (void*), not an offset. Store 0 for static fields
+            // since the address is process-specific and not useful for SDK generation.
+            sf.offset = 0;
 
-            // Static field metadata
-            int16_t sf_meta_count = 0;
-            seh_read_i16(sf_addr + 0x14, &sf_meta_count);
-            uintptr_t sf_meta_ptr = 0;
-            seh_read_ptr(sf_addr + 0x18, &sf_meta_ptr);
-            if (sf_meta_ptr && sf_meta_count > 0 && sf_meta_count < 64) {
-                for (int16_t m = 0; m < sf_meta_count; ++m) {
-                    uintptr_t meta_entry = sf_meta_ptr + m * 0x10;
-                    uintptr_t mname_ptr = 0;
-                    if (seh_read_ptr(meta_entry + 0x00, &mname_ptr) && mname_ptr) {
-                        const char* mname = nullptr;
-                        if (seh_read_string(mname_ptr, &mname) && mname && mname[0]) {
-                            sf.metadata.push_back(mname);
-                        }
-                    }
-                }
-            }
+            // Static field metadata at +0x14 (count) and +0x18 (ptr)
+            // Note: +0x14 overlaps with upper bytes of m_pInstance on 64-bit.
+            // Metadata for static fields is uncommon; skip to avoid reading garbage.
 
             out.static_fields.push_back(sf);
         }
@@ -407,8 +412,10 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
 //   +0x20  m_pEnumerators (SchemaEnumeratorInfoData_t*)
 //
 // SchemaEnumeratorInfoData_t (0x20 bytes each):
-//   +0x00  m_nValue (union, 64-bit)
-//   +0x08  m_pszName (const char*)
+//   +0x00  m_pszName (const char*) — name FIRST
+//   +0x08  m_nValue (union { int64, uint64 }) — value SECOND
+//   +0x10  m_pMetadata (SchemaMetadataEntryData_t*)
+//   +0x18  (padding/reserved)
 // ============================================================================
 
 static bool resolve_enum(void* enum_info, const char* module_name, RuntimeEnum& out) {
@@ -446,13 +453,13 @@ static bool resolve_enum(void* enum_info, const char* module_name, RuntimeEnum& 
 
             RuntimeEnumerator enumerator = {};
 
-            // Value at +0x00 (int64)
-            if (!seh_read_i64(entry_addr + 0x00, &enumerator.value)) continue;
-
-            // Name at +0x08 -> const char*
+            // Name at +0x00 -> const char*
             uintptr_t ename_ptr = 0;
-            if (!seh_read_ptr(entry_addr + 0x08, &ename_ptr) || !ename_ptr) continue;
+            if (!seh_read_ptr(entry_addr + 0x00, &ename_ptr) || !ename_ptr) continue;
             if (!seh_read_string(ename_ptr, &enumerator.name) || !enumerator.name) continue;
+
+            // Value at +0x08 (int64)
+            if (!seh_read_i64(entry_addr + 0x08, &enumerator.value)) continue;
 
             out.values.push_back(enumerator);
         }
@@ -499,9 +506,21 @@ void* SchemaManager::get_class_info(const char* module, const char* class_name) 
     return find_declared_class(scope, class_name);
 }
 
-void SchemaManager::load_rtti(uintptr_t module_base, size_t module_size) {
-    m_rtti_map = build_rtti_hierarchy(module_base, module_size);
-    LOG_I("RTTI hierarchy loaded: %d classes", (int)m_rtti_map.size());
+void SchemaManager::load_rtti(uintptr_t module_base, size_t module_size, const char* module_name) {
+    auto map = build_rtti_hierarchy(module_base, module_size);
+
+    // Tag each entry with source module and merge into global map
+    std::string mod_str = module_name ? module_name : "";
+    int added = 0;
+    for (auto& [name, info] : map) {
+        info.source_module = mod_str;
+        // Only insert if not already present (first module wins for duplicates)
+        if (m_rtti_map.find(name) == m_rtti_map.end()) {
+            m_rtti_map[name] = std::move(info);
+            added++;
+        }
+    }
+    LOG_I("RTTI hierarchy: +%d from %s (%d total)", added, mod_str.c_str(), (int)m_rtti_map.size());
 }
 
 const InheritanceInfo* SchemaManager::get_inheritance(const char* class_name) const {
@@ -869,34 +888,47 @@ bool SchemaManager::enumerate_enums(void* type_scope, const char* module_name) {
     }
 
     // Not found via known offsets — do a broader scan
-    // Scan from +0x0580 to +0x0D00 in 8-byte steps (after class hash at +0x0560)
-    for (int off = 0x0580; off <= 0x0D00; off += 8) {
-        uintptr_t candidate = scope + off;
+    // Scan the entire TypeScope structure (up to 0x2000) in 8-byte steps
+    // The class hash is at +0x0560 so enums should be after it, but be thorough
+    {
+        int pools_found = 0;
+        for (int off = 0x0560; off <= 0x2000; off += 8) {
+            // Skip the class hash itself (already used by enumerate_scope)
+            if (off == 0x0560) continue;
 
-        int32_t bs = 0, bpb = 0, ba = 0;
-        if (!seh_read_i32(candidate + 0x00, &bs)) continue;
-        if (!seh_read_i32(candidate + 0x04, &bpb)) continue;
-        if (!seh_read_i32(candidate + 0x0C, &ba)) continue;
+            uintptr_t candidate = scope + off;
 
-        if (bs >= 16 && bs <= 256 && bpb > 0 && bpb <= 4096 && ba > 0 && ba <= 100000) {
-            uintptr_t blob_head = 0;
-            if (!seh_read_ptr(candidate + 0x20, &blob_head) || !blob_head) continue;
+            int32_t bs = 0, bpb = 0, ba = 0;
+            if (!seh_read_i32(candidate + 0x00, &bs)) continue;
+            if (!seh_read_i32(candidate + 0x04, &bpb)) continue;
+            if (!seh_read_i32(candidate + 0x0C, &ba)) continue;
 
-            for (int d : { 0x10, 0x18, 0x20 }) {
-                if (seh_probe_enum_hash_entry(blob_head + d)) {
-                    pool_base = candidate;
-                    block_size = bs;
-                    blocks_per_blob = bpb;
-                    blocks_allocated = ba;
-                    LOG_I("enum CUtlTSHash discovered at scope+0x%X (block_size=%d, per_blob=%d, allocated=%d)",
-                          off, bs, bpb, ba);
-                    goto found_enum_pool;
+            if (bs >= 16 && bs <= 256 && bpb > 0 && bpb <= 4096 && ba > 0 && ba <= 100000) {
+                uintptr_t blob_head = 0;
+                if (!seh_read_ptr(candidate + 0x20, &blob_head) || !blob_head) continue;
+
+                pools_found++;
+
+                for (int d : { 0x10, 0x18, 0x20 }) {
+                    if (seh_probe_enum_hash_entry(blob_head + d)) {
+                        pool_base = candidate;
+                        block_size = bs;
+                        blocks_per_blob = bpb;
+                        blocks_allocated = ba;
+                        LOG_I("enum CUtlTSHash discovered at scope+0x%X (block_size=%d, per_blob=%d, allocated=%d)",
+                              off, bs, bpb, ba);
+                        goto found_enum_pool;
+                    }
                 }
+
+                // Log pools that look valid but don't have enum entries (diagnostic)
+                LOG_D("pool at scope+0x%X (bs=%d, bpb=%d, ba=%d) — no enum entries", off, bs, bpb, ba);
             }
         }
-    }
 
-    LOG_W("enum CUtlTSHash not found for %s (probed offsets 0x0580-0x0D00)", module_name);
+        LOG_W("enum CUtlTSHash not found for %s (scanned 0x0560-0x2000, found %d non-enum pools)",
+              module_name, pools_found);
+    }
     return false;
 
 found_enum_pool:

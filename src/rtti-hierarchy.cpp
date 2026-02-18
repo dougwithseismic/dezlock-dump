@@ -18,6 +18,7 @@
 
 #include <Windows.h>
 #include <cstring>
+#include <unordered_set>
 
 namespace schema {
 
@@ -210,6 +211,128 @@ build_rtti_hierarchy(uintptr_t base, size_t size) {
     }
 
     LOG_I("pass 3: built inheritance map for %d classes", (int)result.size());
+
+    // ========================================================================
+    // Pass 4: Discover vtables by scanning .rdata for COL pointers.
+    //
+    // MSVC x64: vtable[-1] = pointer to CompleteObjectLocator.
+    //           vtable[0]  = first virtual function pointer.
+    //
+    // Strategy: Build set of all COL absolute addresses, then do one linear
+    // scan of .rdata checking each 8-byte value against the set. O(rdata/8).
+    // ========================================================================
+
+    // Parse PE section table to find .text and .rdata boundaries
+    uintptr_t text_start = 0, text_end = 0;
+    uintptr_t rdata_start = 0, rdata_end = 0;
+
+    {
+        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                auto* sec = IMAGE_FIRST_SECTION(nt);
+                for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                    uintptr_t sec_start = base + sec[i].VirtualAddress;
+                    uintptr_t sec_size = sec[i].Misc.VirtualSize;
+                    if (memcmp(sec[i].Name, ".text", 5) == 0) {
+                        text_start = sec_start;
+                        text_end = sec_start + sec_size;
+                    } else if (memcmp(sec[i].Name, ".rdata", 6) == 0) {
+                        rdata_start = sec_start;
+                        rdata_end = sec_start + sec_size;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!text_start || !rdata_start) {
+        LOG_W("pass 4: could not find .text/.rdata sections, skipping vtable scan");
+        return result;
+    }
+
+    LOG_I("pass 4: .text [%p - %p], .rdata [%p - %p]",
+          (void*)text_start, (void*)text_end,
+          (void*)rdata_start, (void*)rdata_end);
+
+    // Build COL absolute address set. We re-scan Pass 2 COLs because we need
+    // the COL's own offset (self_rva) which wasn't stored in the COLEntry struct.
+    struct COLVtableEntry {
+        std::string class_name;
+        uintptr_t col_abs;     // absolute address of COL in memory
+    };
+    std::vector<COLVtableEntry> col_vtable_entries;
+    std::unordered_set<uintptr_t> col_abs_set;
+
+    for (size_t i = 0; i + sizeof(RTTICompleteObjectLocator) <= size; i += 4) {
+        auto* col = reinterpret_cast<const RTTICompleteObjectLocator*>(mem + i);
+
+        if (col->signature != 1) continue;
+        if (col->self_rva != static_cast<int32_t>(i)) continue;
+
+        auto it = rva_to_name.find(col->type_desc_rva);
+        if (it == rva_to_name.end()) continue;
+
+        // Only process primary vtable (offset == 0, first COL for this class)
+        if (col->offset != 0) continue;
+
+        uintptr_t abs_addr = base + i;
+        col_abs_set.insert(abs_addr);
+        col_vtable_entries.push_back({it->second, abs_addr});
+    }
+
+    // Reverse map: COL absolute addr -> index into col_vtable_entries
+    std::unordered_map<uintptr_t, size_t> col_abs_to_idx;
+    for (size_t i = 0; i < col_vtable_entries.size(); i++) {
+        col_abs_to_idx[col_vtable_entries[i].col_abs] = i;
+    }
+
+    // Single linear scan of .rdata: find 8-byte pointers that match a COL address
+    // These are vtable[-1] entries, so vtable[0] starts at found + 8
+    int vtable_count = 0;
+
+    for (uintptr_t addr = rdata_start; addr + 8 <= rdata_end; addr += 8) {
+        uintptr_t val = *reinterpret_cast<const uintptr_t*>(addr);
+
+        auto it = col_abs_to_idx.find(val);
+        if (it == col_abs_to_idx.end()) continue;
+
+        auto& entry = col_vtable_entries[it->second];
+        const std::string& class_name = entry.class_name;
+
+        // vtable[0] starts at addr + 8
+        uintptr_t vtable_start = addr + 8;
+        uint32_t vtable_rva = static_cast<uint32_t>(vtable_start - base);
+
+        // Read consecutive entries that point into .text
+        std::vector<uint32_t> func_rvas;
+        constexpr int MAX_VTABLE_ENTRIES = 512;
+
+        for (int idx = 0; idx < MAX_VTABLE_ENTRIES; idx++) {
+            uintptr_t slot_addr = vtable_start + idx * 8;
+            if (slot_addr + 8 > rdata_end) break;
+
+            uintptr_t fn_ptr = *reinterpret_cast<const uintptr_t*>(slot_addr);
+
+            // Must point into .text section
+            if (fn_ptr < text_start || fn_ptr >= text_end) break;
+
+            func_rvas.push_back(static_cast<uint32_t>(fn_ptr - base));
+        }
+
+        if (func_rvas.empty()) continue;
+
+        // Store in the InheritanceInfo for this class (if it exists in result)
+        auto res_it = result.find(class_name);
+        if (res_it != result.end() && res_it->second.vtable_rva == 0) {
+            res_it->second.vtable_rva = vtable_rva;
+            res_it->second.vtable_func_rvas = std::move(func_rvas);
+            vtable_count++;
+        }
+    }
+
+    LOG_I("pass 4: discovered %d vtables", vtable_count);
 
     return result;
 }

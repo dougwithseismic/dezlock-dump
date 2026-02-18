@@ -112,7 +112,8 @@ public:
     const std::unordered_map<std::string, RuntimeClass>& cache() const { return m_cache; }
 
     // RTTI-backed inheritance (call after init, before any lookups)
-    void load_rtti(uintptr_t module_base, size_t module_size);
+    // module_name is the DLL name (e.g. "client.dll") — stored in each InheritanceInfo
+    void load_rtti(uintptr_t module_base, size_t module_size, const char* module_name = nullptr);
     const InheritanceInfo* get_inheritance(const char* class_name) const;
     int rtti_class_count() const { return static_cast<int>(m_rtti_map.size()); }
     const std::unordered_map<std::string, InheritanceInfo>& rtti_map() const { return m_rtti_map; }
