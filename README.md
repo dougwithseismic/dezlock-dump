@@ -157,6 +157,23 @@ static_assert(sizeof(C_BaseEntity) == 0xF60, "C_BaseEntity size");
 static_assert(offsetof(C_BaseEntity, m_iHealth) == 0x354, "m_iHealth");
 ```
 
+### Type Resolution (~96%)
+
+The type resolver maps schema types to proper C++ types across 10 categories:
+
+| Category | Description | Example |
+|----------|-------------|---------|
+| primitive | Built-in types | `int32` → `int32_t` |
+| alias | Known Source 2 types (~100) | `Vector` → `float[3]`, `GameTime_t` → `float` |
+| template | Container types (~25) | `CUtlVector<T>` → sized blob with type comment |
+| embedded | Nested schema classes | Sized blob, class name in comment |
+| handle | Entity handles | `CHandle<T>` → `uint32_t` |
+| enum | Enum-typed fields | Resolved to sized integer from JSON |
+| pointer | Pointer types | `T*` → `void*` |
+| array | Fixed-size arrays | `int32[6]` → `int32_t[6]` |
+| bitfield | Bit fields (size=0) | Emitted as comments |
+| unresolved | Remaining (~3%) | Sized blob fallback (sizes always correct) |
+
 ## What Gets Captured
 
 | Data | Source | Example Count |

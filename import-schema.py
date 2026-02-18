@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-import-schema.py — Import dezlock-dump JSON export into s2-framework generated SDK
+import-schema.py — Import dezlock-dump JSON export into compilable C++ SDK headers
 
 Reads dezlock-dump's all-modules.json and generates:
-  games/{game}/sdk/generated/
+  generated/
     _all-offsets.hpp     — Master offset constants for every class
     _all-enums.hpp       — All enums as enum class
+    _all-vtables.hpp     — VTable RVAs and virtual function indices
     {module}/
       {ClassName}.hpp    — Padded struct with static_asserts
 
 Usage:
-  python tools/import-schema.py --game deadlock --json path/to/dezlock-export.json
-  python tools/import-schema.py --game deadlock --dir path/to/schema-dump/
-  python tools/import-schema.py --game deadlock  # auto-detect from %TEMP%
+  python import-schema.py --game deadlock                              # auto-detect JSON from bin/
+  python import-schema.py --game deadlock --json path/to/all-modules.json
+  python import-schema.py --game deadlock --output ./my-sdk/
 """
 
 import argparse
@@ -42,52 +43,339 @@ PRIMITIVE_MAP = {
     "float64": ("double", 8),
 }
 
-KNOWN_TYPES = {
-    "CUtlString": ("void*", 8),
-    "CUtlSymbolLarge": ("void*", 8),
-    "Color": ("uint32_t", 4),
-    "GameTime_t": ("float", 4),
-    "GameTick_t": ("int32_t", 4),
-    "QAngle": ("float[3]", 12),
-    "Vector": ("float[3]", 12),
-    "Vector2D": ("float[2]", 8),
-    "Vector4D": ("float[4]", 16),
+# ALIAS_TABLE: schema type -> (cpp_type_or_None, size)
+# cpp_type=None means emit as uint8_t blob of the given size (preserves sizeof)
+ALIAS_TABLE = {
+    # String / symbol types (opaque blobs — internal layout is engine-private)
+    "CUtlString":           ("void*", 8),
+    "CUtlSymbolLarge":      ("void*", 8),
+    "CGlobalSymbol":        (None, 8),
+    "CUtlStringToken":      ("uint32_t", 4),
+    "CKV3MemberNameWithStorage": (None, 24),
+
+    # Math types
+    "Color":                ("uint32_t", 4),
+    "QAngle":               ("float[3]", 12),
+    "Vector":               ("float[3]", 12),
+    "Vector2D":             ("float[2]", 8),
+    "Vector4D":             ("float[4]", 16),
+    "VectorWS":             ("float[3]", 12),   # world-space Vector
+    "VectorAligned":        ("float[4]", 16),   # 16-byte aligned Vector
+    "Quaternion":           ("float[4]", 16),
+    "QuaternionStorage":    ("float[4]", 16),
+    "RotationVector":       ("float[3]", 12),
+    "matrix3x4_t":          ("float[12]", 48),
+    "matrix3x4a_t":         ("float[12]", 48),
+    "CTransform":           (None, 32),         # pos + quat
+
+    # Game time / tick types
+    "GameTime_t":           ("float", 4),
+    "GameTick_t":           ("int32_t", 4),
+    "AnimationTimeFloat":   ("float", 4),
+
+    # Handle types (all are uint32 handles under the hood)
+    "AttachmentHandle_t":   ("uint8_t", 1),
+    "CAnimParamHandle":     ("uint16_t", 2),
+    "CAnimParamHandleMap":  (None, 2),
+    "ModelConfigHandle_t":  ("uint16_t", 2),
+    "HitGroup_t":           ("int32_t", 4),
+    "RenderPrimitiveType_t": ("int32_t", 4),
+    "MoveType_t":           ("uint8_t", 1),
+    "MoveCollide_t":        ("uint8_t", 1),
+    "SolidType_t":          ("uint8_t", 1),
+    "SurroundingBoundsType_t": ("uint8_t", 1),
+    "RenderMode_t":         ("uint8_t", 1),
+    "RenderFx_t":           ("uint8_t", 1),
+    "EntityDisolveType_t":  ("int32_t", 4),
+    "NPC_STATE":            ("int32_t", 4),
+    "Hull_t":               ("int32_t", 4),
+    "Activity":             ("int32_t", 4),
+
+    # Resource / sound types (opaque blobs)
+    "CSoundEventName":      (None, 16),
+    "CFootstepTableHandle": (None, 8),
+    "CBodyComponent":       (None, 8),
+
+    # Anim types
+    "AnimValueSource":      ("int32_t", 4),
+    "AnimParamID":          ("uint32_t", 4),
+    "AnimScriptHandle":     ("uint16_t", 2),
+    "AnimNodeID":           ("uint32_t", 4),
+    "AnimNodeOutputID":     ("uint32_t", 4),
+    "AnimStateID":          ("uint32_t", 4),
+    "AnimComponentID":      ("uint32_t", 4),
+    "AnimTagID":            ("uint32_t", 4),
+    "BlendKeyType":         ("int32_t", 4),
+    "BinaryNodeTiming":     ("int32_t", 4),
+    "BinaryNodeChildOption": ("int32_t", 4),
+    "DampingSpeedFunction": ("int32_t", 4),
+
+    # Physics
+    "CPhysicsComponent":    (None, 8),
+    "CRenderComponent":     (None, 8),
+
+    # Commonly-seen opaque structs (fixed sizes from dezlock-dump)
+    "CPiecewiseCurve":      (None, 64),
+    "CAnimGraphTagOptionalRef": (None, 32),
+    "CAnimGraphTagRef":     (None, 32),
+    "CitadelCameraOperationsSequence_t": (None, 136),
+    "PulseSymbol_t":        (None, 16),
+    "CNetworkVarChainer":   (None, 40),
+    "CPanoramaImageName":   (None, 16),
+    "CBufferString":        (None, 16),
+    "KeyValues3":           (None, 16),
+    "CPulseValueFullType":  (None, 24),
+    "PulseRegisterMap_t":   (None, 48),
+
+    # Small integer-like types
+    "HeroID_t":             ("int32_t", 4),
+    "HSequence":            ("int32_t", 4),
+    "CPlayerSlot":          ("int32_t", 4),
+    "WorldGroupId_t":       ("int32_t", 4),
+    "PulseDocNodeID_t":     ("int32_t", 4),
+    "PulseRuntimeChunkIndex_t": ("int32_t", 4),
+    "ParticleTraceSet_t":   ("int32_t", 4),
+    "ParticleColorBlendType_t": ("int32_t", 4),
+    "EventTypeSelection_t": ("int32_t", 4),
+    "ThreeState_t":         ("int32_t", 4),
+    "ParticleAttachment_t": ("int32_t", 4),
+    "EModifierValue":       ("int32_t", 4),
+    "ParticleOutputBlendMode_t": ("int32_t", 4),
+    "Detail2Combo_t":       ("int32_t", 4),
+    "ParticleFalloffFunction_t": ("int32_t", 4),
+    "ParticleHitboxBiasType_t":  ("int32_t", 4),
+    "ParticleEndcapMode_t": ("int32_t", 4),
+    "ParticleLightingQuality_t": ("int32_t", 4),
+    "ParticleSelection_t":  ("int32_t", 4),
+    "SpriteCardPerParticleScale_t": ("int32_t", 4),
+    "ParticleAlphaReferenceType_t": ("int32_t", 4),
+    "ParticleSequenceCropOverride_t": ("int32_t", 4),
+    "ParticleLightTypeChoiceList_t": ("int32_t", 4),
+    "ParticleDepthFeatheringMode_t": ("int32_t", 4),
+    "ParticleFogType_t":    ("int32_t", 4),
+    "ParticleOmni2LightTypeChoiceList_t": ("int32_t", 4),
+    "ParticleSortingChoiceList_t": ("int32_t", 4),
+    "ParticleOrientationChoiceList_t": ("int32_t", 4),
+    "TextureRepetitionMode_t": ("int32_t", 4),
+    "SpriteCardShaderType_t": ("int32_t", 4),
+    "ParticleDirectionNoiseType_t": ("int32_t", 4),
+    "ParticleRotationLockType_t": ("int32_t", 4),
+    "ParticlePostProcessPriorityGroup_t": ("int32_t", 4),
+    "InheritableBoolType_t": ("int32_t", 4),
+    "ClosestPointTestType_t": ("int32_t", 4),
+    "ParticleColorBlendMode_t": ("int32_t", 4),
+    "ParticleTopology_t":   ("int32_t", 4),
+    "PFuncVisualizationType_t": ("int32_t", 4),
+    "ParticleVRHandChoiceList_t": ("int32_t", 4),
+    "StandardLightingAttenuationStyle_t": ("int32_t", 4),
+    "SnapshotIndexType_t":  ("int32_t", 4),
+    "PFNoiseType_t":        ("int32_t", 4),
+    "PFNoiseTurbulence_t":  ("int32_t", 4),
+    "PFNoiseModifier_t":    ("int32_t", 4),
+    "AnimVRHandMotionRange_t": ("int32_t", 4),
+    "AnimVRFinger_t":       ("int32_t", 4),
+    "IKSolverType":         ("int32_t", 4),
+    "IKTargetSource":       ("int32_t", 4),
+    "JiggleBoneSimSpace":   ("int32_t", 4),
+    "AnimPoseControl":      ("int32_t", 4),
+    "FacingMode":           ("int32_t", 4),
+    "FieldNetworkOption":   ("int32_t", 4),
+    "StanceOverrideMode":   ("int32_t", 4),
+    "AimMatrixBlendMode":   ("int32_t", 4),
+    "SolveIKChainAnimNodeDebugSetting": ("int32_t", 4),
+    "AnimNodeNetworkMode":  ("int32_t", 4),
+    "ChoiceMethod":         ("int32_t", 4),
+    "ChoiceBlendMethod":    ("int32_t", 4),
+    "ChoiceChangeMethod":   ("int32_t", 4),
+    "FootFallTagFoot_t":    ("int32_t", 4),
+    "MatterialAttributeTagType_t": ("int32_t", 4),
+    "FootPinningTimingSource": ("int32_t", 4),
+    "StepPhase":            ("int32_t", 4),
+    "FootLockSubVisualization": ("int32_t", 4),
+    "ResetCycleOption":     ("int32_t", 4),
+    "IkEndEffectorType":    ("int32_t", 4),
+    "IkTargetType":         ("int32_t", 4),
+    "Comparison_t":         ("int32_t", 4),
+    "ComparisonValueType":  ("int32_t", 4),
+    "ConditionLogicOp":     ("int32_t", 4),
+    "EDemoBoneSelectionMode": ("int32_t", 4),
+    "StateActionBehavior":  ("int32_t", 4),
+    "SeqPoseSetting_t":     ("int32_t", 4),
+    "StateComparisonValueType": ("int32_t", 4),
+    "SelectionSource_t":    ("int32_t", 4),
+    "MoodType_t":           ("int32_t", 4),
+    "AnimParamButton_t":    ("int32_t", 4),
+    "AnimParamNetworkSetting": ("int32_t", 4),
+    "CGroundIKSolverSettings": (None, 48),
+    "CAnimParamHandleMap":  (None, 2),
+}
+
+# CONTAINER_SIZES: template container outer name -> fixed size (or None = use field's size)
+CONTAINER_SIZES = {
+    "CUtlVector":                   24,
+    "CNetworkUtlVectorBase":        24,
+    "C_NetworkUtlVectorBase":       24,
+    "CUtlVectorEmbeddedNetworkVar": 24,
+    "CUtlLeanVector":               16,
+    "CUtlOrderedMap":               40,
+    "CUtlHashtable":                40,
+    "CResourceNameTyped":           None,  # variable size, use field["size"]
+    "CEmbeddedSubclass":            16,
+    "CStrongHandle":                8,
+    "CWeakHandle":                  8,
+    "CStrongHandleCopyable":        8,
+    "CSmartPtr":                    8,
+    "CSmartPropPtr":                8,
+    "CAnimGraphParamRef":           None,  # variable size
+    "CEntityOutputTemplate":        None,  # variable size
+    "CEntityIOOutput":              None,
+    "CAnimInputDamping":            None,
+    "CRemapFloat":                  None,
+    "CPerParticleFloatInput":       None,
+    "CPerParticleVecInput":         None,
+    "CParticleCollectionFloatInput": None,
+    "CParticleCollectionVecInput":  None,
+    "CParticleTransformInput":      None,
+    "CParticleModelInput":          None,
+    "CParticleRemapFloatInput":     None,
+    "CRandomNumberGeneratorParameters": None,
+    "CAnimGraph2ParamOptionalRef":  None,  # variable size
+    "CAnimGraph2ParamRef":          None,
+    "CModifierHandleTyped":         None,
+    "CSubclassName":                None,
+    "CSubclassNameBase":            16,
 }
 
 
-def schema_to_cpp_type(schema_type: str, size: int) -> tuple[str, bool]:
-    """Returns (cpp_type, is_known). Empty string means use byte array."""
+# Resolution statistics tracker
+class ResolveStats:
+    def __init__(self):
+        self.counts = {
+            "primitive": 0,
+            "alias": 0,
+            "template": 0,
+            "embedded": 0,
+            "handle": 0,
+            "enum": 0,
+            "pointer": 0,
+            "array": 0,
+            "bitfield": 0,
+            "unresolved": 0,
+        }
+        self.total = 0
+
+    def record(self, category: str):
+        self.counts[category] = self.counts.get(category, 0) + 1
+        self.total += 1
+
+    def print_summary(self):
+        resolved = self.total - self.counts["unresolved"]
+        pct = (resolved / self.total * 100) if self.total > 0 else 0
+        print(f"\nType resolution: {resolved} / {self.total} ({pct:.1f}%)")
+        for cat in ["primitive", "alias", "template", "embedded", "handle",
+                     "enum", "pointer", "array", "bitfield", "unresolved"]:
+            c = self.counts.get(cat, 0)
+            if c > 0:
+                label = "  (blob fallback, sizes correct)" if cat == "unresolved" else ""
+                print(f"  {cat + ':':14s}{c:>5d}{label}")
+
+
+# Global stats instance — set in main() before generation
+_stats = ResolveStats()
+_all_enums: dict[str, int] = {}   # enum_name -> size
+_all_classes: set[str] = set()    # known class names
+
+
+def schema_to_cpp_type(schema_type: str, size: int) -> tuple[str | None, str]:
+    """Resolve a schema type to a C++ type string.
+
+    Returns (cpp_type, category).
+    - cpp_type is the C++ type string, or None to emit a sized blob.
+    - category is the resolution category for stats tracking.
+    - For blobs, caller emits uint8_t name[size] with a comment.
+    """
+    # 1. Primitives
     if schema_type in PRIMITIVE_MAP:
-        return PRIMITIVE_MAP[schema_type][0], True
-    if schema_type in KNOWN_TYPES:
-        return KNOWN_TYPES[schema_type][0], True
+        return PRIMITIVE_MAP[schema_type][0], "primitive"
 
-    # CHandle<T>, CEntityHandle<T>
-    if "CHandle" in schema_type or "CEntityHandle" in schema_type:
-        return "uint32_t", True
+    # 2. Alias table
+    if schema_type in ALIAS_TABLE:
+        cpp, _ = ALIAS_TABLE[schema_type]
+        return cpp, "alias"
 
-    # Pointers
-    if "*" in schema_type:
-        return "void*", True
+    # 3. CHandle<T> / CEntityHandle (always uint32)
+    if schema_type.startswith("CHandle<") or schema_type.startswith("CEntityHandle"):
+        return "uint32_t", "handle"
 
-    # char[N] arrays
+    # 4. Pointers
+    if schema_type.endswith("*"):
+        return "void*", "pointer"
+
+    # 5. Bitfields (size=0, type like "bitfield:3")
+    if schema_type.startswith("bitfield:"):
+        return None, "bitfield"
+
+    # 6. char[N] arrays
     m = re.match(r"char\[(\d+)\]", schema_type)
     if m:
-        return f"char[{m.group(1)}]", True
+        return f"char[{m.group(1)}]", "array"
 
-    # Fixed-size arrays of known types (e.g. int32[6])
-    m = re.match(r"(\w+)\[(\d+)\]", schema_type)
+    # 7. Fixed-size arrays of known types (e.g. int32[6], Vector[2], GameTime_t[4])
+    m = re.match(r"([\w:]+)\[(\d+)\]", schema_type)
     if m:
         base_type = m.group(1)
         count = m.group(2)
         if base_type in PRIMITIVE_MAP:
-            return f"{PRIMITIVE_MAP[base_type][0]}[{count}]", True
-        if base_type == "GameTime_t":
-            return f"float[{count}]", True
-        if base_type == "GameTick_t":
-            return f"int32_t[{count}]", True
+            return f"{PRIMITIVE_MAP[base_type][0]}[{count}]", "array"
+        if base_type in ALIAS_TABLE:
+            alias_cpp, alias_sz = ALIAS_TABLE[base_type]
+            if alias_cpp is not None:
+                # Known concrete type — emit typed array
+                bracket = alias_cpp.find("[")
+                if bracket == -1:
+                    return f"{alias_cpp}[{count}]", "array"
+                # alias is already an array (e.g. float[3]) — flatten
+                # Vector[2] → float[3][2] won't compile, use blob
+                return None, "array"
+            # alias is a blob — emit blob with correct total size
+            return None, "array"
+        # CHandle arrays
+        if base_type.startswith("CHandle"):
+            return f"uint32_t[{count}]", "array"
+        # Enum arrays
+        if base_type in _all_enums:
+            enum_sz = _all_enums[base_type]
+            int_type = {1: "uint8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
+                enum_sz, "int32_t"
+            )
+            return f"{int_type}[{count}]", "array"
+        # Unknown base type array — blob with comment
+        return None, "array"
 
-    return "", False
+    # 8. Template containers (CUtlVector<T>, CResourceNameTyped<...>, etc.)
+    lt = schema_type.find("<")
+    if lt != -1:
+        outer = schema_type[:lt]
+        if outer in CONTAINER_SIZES:
+            return None, "template"
+        # CHandle inside template
+        if outer == "CHandle":
+            return "uint32_t", "handle"
+
+    # 9. Enum-typed fields
+    if schema_type in _all_enums:
+        enum_sz = _all_enums[schema_type]
+        int_type = {1: "uint8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
+            enum_sz, "int32_t"
+        )
+        return int_type, "enum"
+
+    # 10. Embedded schema classes (blob is correct, just categorize)
+    if schema_type in _all_classes:
+        return None, "embedded"
+
+    # 11. Unresolved — fallback to blob
+    return None, "unresolved"
 
 
 # ============================================================================
@@ -202,14 +490,23 @@ def emit_field(f: dict, cursor: int, lines: list[str]) -> int:
         gap = offset - cursor
         lines.append(f"    uint8_t _pad{cursor:04X}[0x{gap:X}];")
 
-    cpp_type, known = schema_to_cpp_type(schema_type, size)
+    cpp_type, category = schema_to_cpp_type(schema_type, size)
+    _stats.record(category)
+
     meta = f.get("metadata", [])
     meta_str = " ".join(f"[{m}]" for m in meta) if meta else ""
     comment = f"// 0x{offset:X} ({schema_type}, {size})"
     if meta_str:
         comment += f" {meta_str}"
 
-    if known and cpp_type:
+    # Bitfields (size=0): emit as comment only
+    if category == "bitfield":
+        m = re.match(r"bitfield:(\d+)", schema_type)
+        bits = m.group(1) if m else "?"
+        lines.append(f"    // bitfield {name} : {bits}; {comment}")
+        return cursor  # don't advance
+
+    if cpp_type is not None:
         bracket = cpp_type.find("[")
         if bracket != -1:
             base = cpp_type[:bracket]
@@ -220,7 +517,7 @@ def emit_field(f: dict, cursor: int, lines: list[str]) -> int:
     elif size > 0:
         lines.append(f"    uint8_t {name}[0x{size:X}]; {comment}")
     else:
-        lines.append(f"    // 0x{offset:X} {name} ({schema_type}) — unknown size")
+        lines.append(f"    // 0x{offset:X} {name} ({schema_type}) — zero size")
         return cursor  # don't advance
 
     return offset + size if size > 0 else offset
@@ -501,22 +798,30 @@ def find_json_path(args) -> str:
         print(f"ERROR: No JSON found in {args.dir}")
         sys.exit(1)
 
-    # Auto-detect from %TEMP%
+    # Auto-detect from bin/schema-dump/ next to this script
+    script_dir = Path(__file__).parent
+    for subdir in ["bin/schema-dump", "bin", "."]:
+        candidate = script_dir / subdir / "all-modules.json"
+        if candidate.exists():
+            return str(candidate)
+
+    # Try %TEMP%
     temp = os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))
     candidate = os.path.join(temp, "dezlock-export.json")
     if os.path.exists(candidate):
         return candidate
 
-    print("ERROR: No JSON path specified and no dezlock-export.json in %TEMP%")
-    print("Usage: python tools/import-schema.py --game deadlock --json path/to/export.json")
+    print("ERROR: No JSON found. Searched bin/schema-dump/, bin/, and %TEMP%")
+    print("Usage: python import-schema.py --game deadlock --json path/to/all-modules.json")
     sys.exit(1)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Import dezlock-dump schema into s2-framework")
+    parser = argparse.ArgumentParser(description="Import dezlock-dump schema into compilable C++ SDK")
     parser.add_argument("--game", required=True, help="Game name (e.g. deadlock)")
     parser.add_argument("--json", help="Path to dezlock-export.json or all-modules.json")
-    parser.add_argument("--dir", help="Path to schema-dump directory containing all-modules.json")
+    parser.add_argument("--dir", help="Path to directory containing all-modules.json")
+    parser.add_argument("--output", help="Output directory (default: ./generated/)")
     parser.add_argument("--modules", help="Comma-separated module filter (e.g. client,server)")
     args = parser.parse_args()
 
@@ -540,9 +845,11 @@ def main():
             if m["name"] in allowed or m["name"].replace(".dll", "") in allowed
         ]
 
-    # Resolve output directory relative to this script
-    script_dir = Path(__file__).parent.parent  # internal-v2/
-    out_dir = script_dir / "shared" / "sdk" / "generated"
+    # Resolve output directory
+    if args.output:
+        out_dir = Path(args.output)
+    else:
+        out_dir = Path(__file__).parent / "generated"
 
     print(f"Output: {out_dir}")
     print(f"Modules: {len(modules)}")
@@ -559,6 +866,19 @@ def main():
     for mod in modules:
         for cls in mod.get("classes", []):
             global_lookup[cls["name"]] = cls
+
+    # Build enum lookup for type resolution (Step 3: enum-typed fields)
+    global _all_enums, _all_classes, _stats
+    _all_enums = {}
+    for mod in modules:
+        for en in mod.get("enums", []):
+            _all_enums[en["name"]] = en.get("size", 4)
+
+    # Build class name set for embedded class categorization (Step 4)
+    _all_classes = set(global_lookup.keys())
+
+    # Reset stats tracker
+    _stats = ResolveStats()
 
     # Generate per-module struct headers
     total_structs = 0
@@ -613,6 +933,9 @@ def main():
     vtable_count = vtables_content.count("constexpr uint32_t vtable_rva")
     vtable_func_count = vtables_content.count("constexpr int idx_")
     print(f"  _all-vtables.hpp: {vtable_count} vtables, {vtable_func_count} functions")
+
+    # Print type resolution statistics
+    _stats.print_summary()
 
     print(f"\nDone! {total_structs} struct headers generated.")
     print(f"Output: {out_dir}")

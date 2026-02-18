@@ -8,6 +8,7 @@ bin/*.lib
 
 # Output
 schema-dump/
+generated/
 
 # VS temp
 *.suo
