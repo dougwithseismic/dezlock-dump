@@ -24,6 +24,7 @@ struct InheritanceInfo {
     std::string source_module;           // DLL this class was found in (e.g. "client.dll")
     uint32_t vtable_rva = 0;             // RVA of vtable[0] in module (0 if not found)
     std::vector<uint32_t> vtable_func_rvas; // function RVAs for each vtable index
+    std::vector<std::vector<uint8_t>> vtable_func_bytes; // first N bytes of each function
 };
 
 // Build inheritance map from RTTI data in a loaded module.

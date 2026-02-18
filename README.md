@@ -1,10 +1,10 @@
 # dezlock-dump
 
-Runtime schema + RTTI + vtable extraction tool for Deadlock (Source 2). Injects a minimal worker DLL into a running Deadlock process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, and **every virtual function table**.
+Runtime schema + RTTI + vtable + signature extraction tool for Deadlock (Source 2). Injects a minimal worker DLL into a running Deadlock process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, **every virtual function table**, and **pattern signatures** for all virtual functions.
 
 No source2gen required — reads directly from the game's `SchemaSystem` and MSVC x64 RTTI at runtime.
 
-**Auto-discovers all modules** — walks every loaded DLL for schema data (client.dll, server.dll, engine2.dll, animationsystem.dll, etc).
+**Scans every loaded DLL** — walks all modules for schema data (client.dll, server.dll, engine2.dll, etc.) and RTTI vtables (panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, and 50+ more).
 
 ## Output
 
@@ -18,7 +18,14 @@ For each module with schema data (e.g. `client.dll` → `client`):
 | `schema-dump/<module>/hierarchy/` | Tree | Per-class files organized by inheritance |
 | `schema-dump/all-modules.json` | JSON | Full structured export for tooling (all modules) |
 
-Additionally, `%TEMP%\dezlock-export.json` contains the complete JSON export with vtable data.
+For signature generation (all modules with vtables):
+
+| File | Format | Description |
+|------|--------|-------------|
+| `bin/schema-dump/signatures/<module>.txt` | Greppable text | Pattern signatures per function |
+| `bin/schema-dump/signatures/_all-signatures.json` | JSON | Structured signatures for tooling |
+
+Additionally, `%TEMP%\dezlock-export.json` contains the complete JSON export with vtable data and function bytes.
 
 ## Quick Start
 
@@ -29,10 +36,10 @@ Additionally, `%TEMP%\dezlock-export.json` contains the complete JSON export wit
 3. Run as administrator:
 
 ```
-dezlock-dump.exe
+dezlock-dump.exe --all
 ```
 
-Output lands in `schema-dump/` next to the exe.
+This dumps schema + generates SDK headers + pattern signatures in one shot. Output lands in `schema-dump/` next to the exe.
 
 ### Build from Source
 
@@ -47,13 +54,16 @@ Produces `bin/dezlock-dump.exe` and `bin/dezlock-worker.dll`.
 ## Usage
 
 ```
-dezlock-dump.exe [--output <dir>] [--wait <seconds>]
+dezlock-dump.exe [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--output <dir>` | `schema-dump/` next to exe | Output directory |
 | `--wait <seconds>` | `30` | Max time to wait for worker DLL |
+| `--headers` | off | Generate C++ SDK headers (structs, enums, offsets) |
+| `--signatures` | off | Generate byte pattern signatures (requires Python 3) |
+| `--all` | off | Enable all generators (headers + signatures) |
 
 ### Requirements
 
@@ -87,6 +97,93 @@ grep -r m_iHealth schema-dump/*.txt
 
 # Get the full class layout
 cat schema-dump/hierarchy/C_BaseEntity/C_CitadelPlayerPawn.txt
+
+# Generate pattern signatures
+python generate-signatures.py --json bin/schema-dump/all-modules.json
+
+# Find a signature for a specific class
+grep CCitadelInput bin/schema-dump/signatures/client.txt
+```
+
+## Signature Generation
+
+`generate-signatures.py` converts vtable function bytes into masked pattern signatures suitable for runtime pattern scanning. Signatures survive game patches where RVAs shift but instruction sequences stay the same.
+
+### How It Works
+
+Each vtable function's first **64 bytes** are captured at dump time (SEH-protected for safety). The script then:
+
+1. **Masks relocatable bytes** that change between builds:
+   - `E8/E9 xx xx xx xx` — relative CALL/JMP targets
+   - `0F 8x xx xx xx xx` — conditional jumps (near)
+   - RIP-relative addressing (`[RIP+disp32]`) — LEA, MOV, CMP, MOVSS, etc.
+
+2. **Finds the shortest unique prefix** for each function within its module. A function unique at 12 bytes doesn't need all 64 — signatures are trimmed to the minimum length that uniquely identifies them.
+
+3. **Marks duplicates** — genuinely identical functions (stubs like `ret`, `xor al,al; ret`) are flagged `[DUP]` since no byte count can differentiate them.
+
+### Usage
+
+```bash
+# Generate signatures for all modules (58+ DLLs)
+python generate-signatures.py --json bin/schema-dump/all-modules.json
+
+# Filter to a specific class
+python generate-signatures.py --json bin/schema-dump/all-modules.json --class CCitadelInput
+
+# Filter to a specific module
+python generate-signatures.py --json bin/schema-dump/all-modules.json --module client.dll
+
+# Require longer patterns (default: 6 bytes minimum)
+python generate-signatures.py --json bin/schema-dump/all-modules.json --min-length 8
+```
+
+### Output
+
+| File | Format | Description |
+|------|--------|-------------|
+| `bin/schema-dump/signatures/<module>.txt` | Greppable text | `ClassName::idx_N  48 89 5C 24 ? ...` |
+| `bin/schema-dump/signatures/_all-signatures.json` | JSON | Structured with pattern, uniqueness, and length |
+
+Signatures are trimmed to the shortest unique prefix. Patterns marked `[DUP]` are genuinely identical function bodies (stubs, trivial accessors) that can't be uniquely identified by bytes alone — use vtable index for these.
+
+### Key Hookable Classes with Signatures
+
+| Class | Module | Functions | Unique | Notes |
+|-------|--------|-----------|--------|-------|
+| `CSource2Client` | client.dll | 202 | **197** | FrameStageNotify, LevelInit, etc. |
+| `CInputSystem` | inputsystem.dll | 107 | **97** | Input processing, key events |
+| `CNetworkSystem` | networksystem.dll | 55 | **48** | Network layer |
+| `CCitadelGameRules` | server.dll | 128 | **41** | Game rules |
+| `CSchemaSystem` | schemasystem.dll | 40 | **31** | Schema type scopes, class lookup |
+| `CGameEntitySystem` | server.dll | 24 | **20** | Entity add/remove |
+| `CPanoramaUIEngine` | panorama.dll | 18 | **15** | RunScript, panel management |
+| `ClientModeCitadelNormal` | client.dll | 40 | **10** | Client mode hooks |
+| `CCitadelInput` | client.dll | 30 | **5** | CreateMove (idx_5), input processing |
+
+### Example
+
+```
+# --- CSource2Client (202 functions, 197 unique) ---
+CSource2Client::idx_0  40 53 56 57 48 81
+CSource2Client::idx_14  48 89 5C 24 18 56 48 83 EC 70 8B
+
+# --- CPanoramaUIEngine (18 functions, 15 unique) ---
+CPanoramaUIEngine::idx_0  48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 48
+CPanoramaUIEngine::idx_11  40 53 48 83 EC 20 48 8B D9 E8
+
+# --- CSchemaSystem (40 functions, 31 unique) ---
+CSchemaSystem::idx_0  40 53 48 83 EC 20 48 8B D9 C6
+CSchemaSystem::idx_12  48 89 5C 24 10 55 56 57 48
+```
+
+Use in your pattern scanner:
+```cpp
+// Find CSource2Client vtable function by signature
+auto addr = pattern_scan(client_dll, "40 53 56 57 48 81");
+
+// Find CPanoramaUIEngine function in panorama.dll
+auto addr = pattern_scan(panorama_dll, "48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 48");
 ```
 
 ## SDK Header Generation
@@ -181,35 +278,55 @@ The type resolver maps schema types to proper C++ types across 10 categories:
 | Classes | SchemaSystem CUtlTSHash | ~5,000 |
 | Fields | SchemaClassFieldData_t | ~21,000 |
 | Enums | SchemaEnumInfoData_t | ~24 |
-| RTTI classes | MSVC x64 TypeDescriptor | ~8,500 |
-| Vtables | RTTI COL → .rdata scan | ~12,500 |
-| Virtual functions | .text pointer entries | ~688,000 |
+| RTTI classes | MSVC x64 TypeDescriptor (all DLLs) | ~23,000 |
+| Vtables | RTTI COL → .rdata scan (58 DLLs) | ~23,000 |
+| Virtual functions | .text pointer entries | ~839,000 |
+| Function bytes | 64 bytes per function prologue | ~839,000 |
+| Unique signatures | After masking + prefix trimming | ~52,000 |
 
-### Vtable Counts by Module
+### Vtable Counts by Module (Top 20)
 
-| Module | Vtables | Functions |
-|--------|---------|-----------|
-| client.dll | 2,459 | 128,443 |
-| server.dll | 7,323 | 515,909 |
-| engine2.dll | 876 | 10,525 |
-| animationsystem.dll | 1,102 | 16,211 |
-| particles.dll | 793 | 16,496 |
-| worldrenderer.dll | 26 | 341 |
+| Module | Vtables | Functions | Unique Sigs |
+|--------|---------|-----------|-------------|
+| server.dll | 7,323 | 515,909 | 18,410 |
+| client.dll | 2,459 | 128,443 | 6,474 |
+| steamclient64.dll | 5,182 | 85,325 | 8,334 |
+| animationsystem.dll | 1,102 | 16,211 | 2,193 |
+| particles.dll | 793 | 16,496 | 1,908 |
+| v8.dll | 1,861 | 15,640 | 1,070 |
+| soundsystem.dll | 736 | 15,060 | 1,685 |
+| engine2.dll | 876 | 10,525 | 2,505 |
+| nvcuda64.dll | 91 | 5,231 | 275 |
+| vphysics2.dll | 179 | 3,297 | 1,449 |
+| scenesystem.dll | 175 | 3,257 | 1,209 |
+| steamnetworkingsockets.dll | 157 | 2,544 | 500 |
+| panorama.dll | 81 | 1,677 | 766 |
+| rendersystemdx11.dll | 73 | 1,703 | 399 |
+| tier0.dll | 84 | 951 | 331 |
+| inputsystem.dll | 2 | 137 | 118 |
+| networksystem.dll | 39 | 484 | 290 |
+| schemasystem.dll | 17 | 282 | 105 |
+| materialsystem2.dll | 40 | 462 | 274 |
+| panoramauiclient.dll | 9 | 218 | 45 |
 
-This includes **RTTI-only classes** that have no schema entry — things like `CCitadelInput`, `CInput`, `CGameTraceManager`. These are often the most important for hooking.
+This includes **RTTI-only classes** that have no schema entry — things like `CCitadelInput`, `CPanoramaUIEngine`, `CInputSystem`, `CNetworkSystem`, `CSchemaSystem`. These are often the most important for hooking.
 
 ## How It Works
 
 1. Finds `deadlock.exe` process
 2. Injects `dezlock-worker.dll` via `CreateRemoteThread` + `LoadLibraryA`
 3. Worker auto-discovers all loaded modules with schema data via `EnumProcessModules`
-4. For each module, walks `SchemaSystem_001` — enumerates classes (CUtlTSHash at +0x0560) and enums (+0x0BE8)
+4. For each schema module, walks `SchemaSystem_001` — enumerates classes (CUtlTSHash at +0x0560) and enums (+0x0BE8)
 5. Reads field metadata, class metadata, and static fields from each class
-6. Walks RTTI (`_TypeDescriptor` + `_RTTICompleteObjectLocator`) in each module
-7. **Pass 4 — Vtable discovery**: scans `.rdata` for pointers to COL structures (vtable[-1]), reads consecutive `.text`-pointing entries as virtual function addresses
-8. Exports JSON to `%TEMP%`, signals completion via marker file
-9. Main exe reads JSON and generates all output formats per module
-10. Worker auto-unloads via `FreeLibraryAndExitThread`
+6. Walks RTTI (`_TypeDescriptor` + `_RTTICompleteObjectLocator`) in schema modules
+7. **Full DLL scan**: enumerates ALL loaded DLLs and RTTI-scans any not already covered (catches panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, etc. — skips Windows system DLLs)
+8. **Pass 4 — Vtable discovery**: scans `.rdata` for pointers to COL structures (vtable[-1]), reads consecutive `.text`-pointing entries as virtual function addresses
+9. **Function bytes**: reads 64 bytes from each function's prologue (SEH-protected) for signature generation
+10. Exports JSON to `%TEMP%`, signals completion via marker file
+11. Main exe reads JSON and generates all output formats per module
+12. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
+13. **Optional**: `--headers` generates C++ SDK headers with padded structs
+14. Worker auto-unloads via `FreeLibraryAndExitThread`
 
 ### Vtable Discovery Detail
 
@@ -222,7 +339,7 @@ Single linear scan of .rdata section:
   → Check each 8-byte value against COL hashset
   → Match = vtable[-1], so vtable[0] starts at match + 8
   → Read entries while they point into .text section (max 512)
-  → Store as RVAs (module_base subtracted, portable across sessions)
+  → Store RVAs + first 64 bytes of each function
 ```
 
 ## Output Format
@@ -269,7 +386,7 @@ CEntityComponent (0x8, 0 fields)
             `-- C_CitadelPlayerPawn (0x1800, 31 fields)
 ```
 
-### JSON vtables (`dezlock-export.json`)
+### JSON (`all-modules.json`)
 
 ```json
 {
@@ -279,17 +396,34 @@ CEntityComponent (0x8, 0 fields)
       "class": "CCitadelInput",
       "vtable_rva": "0x22A4A58",
       "functions": [
-        {"index": 0, "rva": "0x508F10"},
-        {"index": 5, "rva": "0x15AF360"}
+        {"index": 0, "rva": "0x508F10", "bytes": "48895C240857484883EC20488BD9E8..."},
+        {"index": 5, "rva": "0x15AF360", "bytes": "85D20F85..."}
       ]
     }]
   }]
 }
 ```
 
+The `bytes` field contains 64 hex-encoded bytes from each function's prologue — used by `generate-signatures.py` to produce masked pattern signatures.
+
+### Signature text (`signatures/client.txt`)
+
+```
+# --- CSource2Client (202 functions, 197 unique) ---
+CSource2Client::idx_0  40 53 56 57 48 81
+CSource2Client::idx_14  48 89 5C 24 18 56 48 83 EC 70 8B
+
+# --- CCitadelInput (30 functions, 5 unique) ---
+CCitadelInput::idx_4  E9 ? ? ? ? CC CC CC CC CC CC CC CC CC CC CC 40 55 53 57 48
+CCitadelInput::idx_17  40 55 53 57 48 8D 6C 24 B9 48 81 EC C0
+CCitadelInput::idx_5  85 D2 0F 85 ? ? ? ? 48 8B C4 44 88 40 18 ... [DUP]
+```
+
+`?` = masked byte (relocation target). `[DUP]` = identical function body, not uniquely signable. Signatures are trimmed to the shortest unique prefix.
+
 ## Why Not source2gen?
 
-source2gen works great but requires building and injecting a separate loader, generates thousands of SDK header files you then have to parse, and doesn't give you vtables or RTTI inheritance. dezlock-dump gives you one JSON file with everything — schema + RTTI + vtables — in ~2 seconds. Use whatever fits your workflow.
+source2gen works great but requires building and injecting a separate loader, generates thousands of SDK header files you then have to parse, and doesn't give you vtables or RTTI inheritance. dezlock-dump gives you one JSON file with everything — schema + RTTI + vtables + signatures — in ~2 seconds. Use whatever fits your workflow.
 
 ## Contributing
 

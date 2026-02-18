@@ -58,6 +58,17 @@ struct RTTIBaseClassDescriptor {
 // Helpers
 // ============================================================================
 
+// SEH-safe memcpy for reading function bytes at potentially-invalid addresses.
+// Isolated in its own function because __try cannot coexist with C++ destructors.
+static size_t safe_memcpy(void* dst, const void* src, size_t len) {
+    __try {
+        memcpy(dst, src, len);
+        return len;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 // Extract clean class name from mangled RTTI name.
 // ".?AVC_BaseEntity@@" -> "C_BaseEntity"
 // ".?AVCEntityInstance@@" -> "CEntityInstance"
@@ -307,7 +318,9 @@ build_rtti_hierarchy(uintptr_t base, size_t size) {
 
         // Read consecutive entries that point into .text
         std::vector<uint32_t> func_rvas;
+        std::vector<std::vector<uint8_t>> func_bytes;
         constexpr int MAX_VTABLE_ENTRIES = 512;
+        constexpr int FUNC_BYTES_SIZE = 64;
 
         for (int idx = 0; idx < MAX_VTABLE_ENTRIES; idx++) {
             uintptr_t slot_addr = vtable_start + idx * 8;
@@ -319,6 +332,14 @@ build_rtti_hierarchy(uintptr_t base, size_t size) {
             if (fn_ptr < text_start || fn_ptr >= text_end) break;
 
             func_rvas.push_back(static_cast<uint32_t>(fn_ptr - base));
+
+            // Read first N bytes of the function for signature generation.
+            // safe_memcpy uses SEH in case function is at edge of a mapped page.
+            std::vector<uint8_t> bytes(FUNC_BYTES_SIZE, 0);
+            size_t avail = text_end - fn_ptr;
+            size_t to_read = (avail < FUNC_BYTES_SIZE) ? avail : FUNC_BYTES_SIZE;
+            safe_memcpy(bytes.data(), reinterpret_cast<const void*>(fn_ptr), to_read);
+            func_bytes.push_back(std::move(bytes));
         }
 
         if (func_rvas.empty()) continue;
@@ -328,6 +349,7 @@ build_rtti_hierarchy(uintptr_t base, size_t size) {
         if (res_it != result.end() && res_it->second.vtable_rva == 0) {
             res_it->second.vtable_rva = vtable_rva;
             res_it->second.vtable_func_rvas = std::move(func_rvas);
+            res_it->second.vtable_func_bytes = std::move(func_bytes);
             vtable_count++;
         }
     }

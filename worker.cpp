@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <ctime>
 #include <thread>
+#include <unordered_set>
 
 namespace {
 
@@ -121,7 +122,18 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
     fprintf(fp, "  \"total_enums\": %d,\n", mgr.enum_count());
     fprintf(fp, "  \"total_enumerators\": %d,\n", mgr.total_enumerator_count());
 
-    const auto& modules = mgr.dumped_modules();
+    // Build complete module list: schema modules + RTTI-only modules
+    std::vector<std::string> modules = mgr.dumped_modules();
+    {
+        std::unordered_set<std::string> known(modules.begin(), modules.end());
+        for (const auto& [name, info] : mgr.rtti_map()) {
+            if (!info.source_module.empty() && !known.count(info.source_module)) {
+                known.insert(info.source_module);
+                modules.push_back(info.source_module);
+            }
+        }
+    }
+
     const auto& cache = mgr.cache();
     const auto& ecache = mgr.enum_cache();
 
@@ -274,8 +286,17 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
                 fprintf(fp, "          \"functions\": [");
                 for (size_t fi = 0; fi < info.vtable_func_rvas.size(); fi++) {
                     if (fi > 0) fprintf(fp, ",");
-                    fprintf(fp, "\n            {\"index\": %d, \"rva\": \"0x%X\"}",
+                    fprintf(fp, "\n            {\"index\": %d, \"rva\": \"0x%X\"",
                             (int)fi, info.vtable_func_rvas[fi]);
+                    // Emit prologue bytes for signature generation
+                    if (fi < info.vtable_func_bytes.size() && !info.vtable_func_bytes[fi].empty()) {
+                        fprintf(fp, ", \"bytes\": \"");
+                        for (uint8_t b : info.vtable_func_bytes[fi]) {
+                            fprintf(fp, "%02X", b);
+                        }
+                        fprintf(fp, "\"");
+                    }
+                    fprintf(fp, "}");
                 }
                 fprintf(fp, "\n          ]\n");
                 fprintf(fp, "        }");
@@ -362,7 +383,8 @@ void worker_thread(HMODULE hModule) {
         }
 
         // Walk RTTI hierarchy from all modules that have schema data
-        LOG_I("Walking RTTI hierarchies...");
+        LOG_I("Walking RTTI hierarchies (schema modules)...");
+        std::unordered_set<HMODULE> scanned_modules;
         for (const auto& mod_name : mgr.dumped_modules()) {
             HMODULE hmod = GetModuleHandleA(mod_name.c_str());
             if (!hmod) continue;
@@ -370,7 +392,51 @@ void worker_thread(HMODULE hModule) {
             MODULEINFO mi = {};
             if (GetModuleInformation(GetCurrentProcess(), hmod, &mi, sizeof(mi))) {
                 mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage, mod_name.c_str());
+                scanned_modules.insert(hmod);
                 LOG_I("  RTTI %s: %d classes total", mod_name.c_str(), mgr.rtti_class_count());
+            }
+        }
+
+        // Walk RTTI from ALL loaded DLLs (catches panorama.dll, tier0.dll, etc.)
+        // These have vtables but no SchemaSystem type scopes.
+        LOG_I("Walking RTTI hierarchies (all loaded DLLs)...");
+        {
+            HMODULE modules_arr[512];
+            DWORD needed = 0;
+            if (EnumProcessModules(GetCurrentProcess(), modules_arr, sizeof(modules_arr), &needed)) {
+                int extra_count = 0;
+                int mod_count = needed / sizeof(HMODULE);
+                for (int i = 0; i < mod_count; i++) {
+                    if (scanned_modules.count(modules_arr[i])) continue;
+
+                    char mod_path[MAX_PATH];
+                    if (!GetModuleFileNameA(modules_arr[i], mod_path, MAX_PATH)) continue;
+
+                    // Extract just the filename
+                    const char* slash = strrchr(mod_path, '\\');
+                    const char* mod_name = slash ? slash + 1 : mod_path;
+
+                    // Skip system DLLs (ntdll, kernel32, etc.) — only scan .dll in game dirs
+                    // Quick heuristic: skip anything in Windows\System32 or WinSxS
+                    if (strstr(mod_path, "\\Windows\\") || strstr(mod_path, "\\windows\\"))
+                        continue;
+
+                    MODULEINFO mi = {};
+                    if (!GetModuleInformation(GetCurrentProcess(), modules_arr[i], &mi, sizeof(mi)))
+                        continue;
+
+                    // Skip tiny modules (unlikely to have meaningful RTTI)
+                    if (mi.SizeOfImage < 0x10000) continue;
+
+                    int before = mgr.rtti_class_count();
+                    mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage, mod_name);
+                    int found = mgr.rtti_class_count() - before;
+                    if (found > 0) {
+                        LOG_I("  RTTI %s: +%d classes (%d total)", mod_name, found, mgr.rtti_class_count());
+                        extra_count += found;
+                    }
+                }
+                LOG_I("Extra RTTI scan: +%d classes from non-schema DLLs", extra_count);
             }
         }
 

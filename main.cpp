@@ -1024,6 +1024,52 @@ static bool is_elevated() {
 }
 
 // ============================================================================
+// Python script runner
+// ============================================================================
+
+// Find Python executable (tries python, python3, py in PATH)
+static bool find_python(char* out_path, size_t out_size) {
+    const char* candidates[] = {"python", "python3", "py"};
+    for (const char* name : candidates) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "where %s > nul 2>&1", name);
+        if (system(cmd) == 0) {
+            snprintf(out_path, out_size, "%s", name);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Run a Python script with arguments. Returns true on success (exit code 0).
+static bool run_python_script(const char* python, const char* script_path,
+                               const char* args) {
+    char cmdline[2048];
+    snprintf(cmdline, sizeof(cmdline), "\"%s\" \"%s\" %s", python, script_path, args);
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    // Inherit our console so Python output is visible
+    si.dwFlags = 0;
+
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessA(nullptr, cmdline, nullptr, nullptr, TRUE,
+                        0, nullptr, nullptr, &si, &pi)) {
+        con_fail("CreateProcess failed (err=%lu): %s", GetLastError(), cmdline);
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, 120000); // 2 min timeout
+
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    return exit_code == 0;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1049,6 +1095,8 @@ int main(int argc, char* argv[]) {
     std::string output_dir;
     int timeout_sec = 30;
     bool gen_headers = false;
+    bool gen_signatures = false;
+    bool gen_all = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
@@ -1057,14 +1105,26 @@ int main(int argc, char* argv[]) {
             timeout_sec = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--headers") == 0) {
             gen_headers = true;
+        } else if (strcmp(argv[i], "--signatures") == 0) {
+            gen_signatures = true;
+        } else if (strcmp(argv[i], "--all") == 0) {
+            gen_all = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            con_print("Usage: dezlock-dump.exe [--output <dir>] [--wait <seconds>] [--headers]\n\n");
-            con_print("  --output   Output directory (default: schema-dump/ next to exe)\n");
-            con_print("  --wait     Max wait time for worker DLL (default: 30s)\n");
-            con_print("  --headers  Generate C++ SDK headers (structs, enums, offsets)\n");
+            con_print("Usage: dezlock-dump.exe [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]\n\n");
+            con_print("  --output      Output directory (default: schema-dump/ next to exe)\n");
+            con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
+            con_print("  --headers     Generate C++ SDK headers (structs, enums, offsets)\n");
+            con_print("  --signatures  Generate byte pattern signatures from vtable functions\n");
+            con_print("  --all         Enable all generators (headers + signatures)\n");
             wait_for_keypress();
             return 0;
         }
+    }
+
+    // --all enables everything
+    if (gen_all) {
+        gen_headers = true;
+        gen_signatures = true;
     }
 
     // Default output dir: schema-dump/ next to the exe
@@ -1280,6 +1340,80 @@ int main(int argc, char* argv[]) {
     std::string json_out = output_dir + "\\all-modules.json";
     CopyFileA(json_path, json_out.c_str(), FALSE);
 
+    // ---- Signature generation (optional) ----
+    int sig_unique = 0, sig_total = 0;
+    if (gen_signatures) {
+        con_print("\n");
+        con_step("SIG", "Generating byte pattern signatures...");
+
+        // Find Python
+        char python[256] = {};
+        if (!find_python(python, sizeof(python))) {
+            con_fail("Python not found in PATH. Install Python 3.x to use --signatures.");
+            con_info("You can still run manually: python generate-signatures.py --json %s",
+                     json_out.c_str());
+        } else {
+            // Find generate-signatures.py: check next to exe, then parent dir
+            char script_path[MAX_PATH];
+            snprintf(script_path, MAX_PATH, "%sgenerate-signatures.py", exe_path);
+
+            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
+                // Try parent directory (exe in bin/, script in repo root)
+                char parent_path[MAX_PATH];
+                snprintf(parent_path, MAX_PATH, "%s..\\generate-signatures.py", exe_path);
+                char resolved[MAX_PATH];
+                if (GetFullPathNameA(parent_path, MAX_PATH, resolved, nullptr) > 0 &&
+                    GetFileAttributesA(resolved) != INVALID_FILE_ATTRIBUTES) {
+                    snprintf(script_path, MAX_PATH, "%s", resolved);
+                }
+            }
+
+            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
+                con_fail("generate-signatures.py not found.");
+                con_info("Searched: %sgenerate-signatures.py", exe_path);
+                con_info("Searched: %s..\\generate-signatures.py", exe_path);
+            } else {
+                std::string sig_output = output_dir + "\\signatures";
+                char args[2048];
+                snprintf(args, sizeof(args), "--json \"%s\" --output \"%s\"",
+                         json_out.c_str(), sig_output.c_str());
+
+                con_info("Running: %s %s %s", python, script_path, args);
+                if (run_python_script(python, script_path, args)) {
+                    con_ok("Signatures generated -> %s\\", sig_output.c_str());
+
+                    // Try to read the summary JSON for stats
+                    std::string sig_json = sig_output + "\\_all-signatures.json";
+                    FILE* sfp = fopen(sig_json.c_str(), "rb");
+                    if (sfp) {
+                        fseek(sfp, 0, SEEK_END);
+                        long ssize = ftell(sfp);
+                        fseek(sfp, 0, SEEK_SET);
+                        std::string sbuf(ssize, '\0');
+                        fread(&sbuf[0], 1, ssize, sfp);
+                        fclose(sfp);
+
+                        try {
+                            auto sdata = json::parse(sbuf);
+                            if (sdata.contains("modules")) {
+                                for (const auto& [mod_name, mod_sigs] : sdata["modules"].items()) {
+                                    for (const auto& [cls_name, funcs] : mod_sigs.items()) {
+                                        for (const auto& f : funcs) {
+                                            sig_total++;
+                                            if (f.value("unique", false)) sig_unique++;
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (...) {}
+                    }
+                } else {
+                    con_fail("Signature generation failed. Check output above.");
+                }
+            }
+        }
+    }
+
     // Clean up temp files
     DeleteFileA(done_path);
     DeleteFileA(inject_path);
@@ -1295,6 +1429,9 @@ int main(int argc, char* argv[]) {
     con_print("  %-20s %d\n", "Enums:", total_enums);
     con_print("  %-20s %d\n", "RTTI hierarchies:", rtti_count);
     con_print("  %-20s %d\n", "Static fields:", total_static);
+    if (sig_total > 0) {
+        con_print("  %-20s %d (%d unique)\n", "Signatures:", sig_total, sig_unique);
+    }
     con_print("\n");
 
     con_color(CLR_OK);
@@ -1307,9 +1444,22 @@ int main(int argc, char* argv[]) {
     con_print("    grep m_iHealth %s\\client.txt\n", output_dir.c_str());
     con_print("    grep MNetworkEnable %s\\client.txt\n", output_dir.c_str());
     con_print("    grep EAbilitySlots %s\\client-enums.txt\n", output_dir.c_str());
-    if (!gen_headers) {
+    if (gen_signatures && sig_total > 0) {
+        con_print("    grep CCitadelInput %s\\signatures\\client.txt\n", output_dir.c_str());
+    }
+
+    // Show tips for unused features
+    std::vector<std::string> tips;
+    if (!gen_headers) tips.push_back("--headers     Generate C++ SDK headers");
+    if (!gen_signatures) tips.push_back("--signatures  Generate byte pattern signatures");
+    if (!gen_all && (!gen_headers || !gen_signatures)) tips.push_back("--all         Enable all generators");
+
+    if (!tips.empty()) {
         con_print("\n");
-        con_print("  Tip: Run with --headers to generate C++ SDK headers\n");
+        con_print("  Tip: Run with additional flags for more output:\n");
+        for (const auto& tip : tips) {
+            con_print("    %s\n", tip.c_str());
+        }
     }
     con_color(CLR_DEFAULT);
 
