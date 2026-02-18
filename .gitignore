@@ -18,3 +18,4 @@ schema-dump/
 
 # Temp files
 *.log
+bin/

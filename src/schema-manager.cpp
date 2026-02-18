@@ -829,24 +829,78 @@ bool SchemaManager::enumerate_enums(void* type_scope, const char* module_name) {
 
     uintptr_t scope = reinterpret_cast<uintptr_t>(type_scope);
 
-    // CUtlTSHash for enums is at TypeScope + 0x0BE8
-    uintptr_t pool_base = scope + 0x0BE8;
+    // The enum CUtlTSHash location varies between builds.
+    // Known offsets: 0x0BE8 (older), but can shift.
+    // Strategy: try known offsets, then probe around the class hash (+0x0560)
+    // looking for a valid CUtlMemoryPool with enum-like entries.
+    static const int enum_offsets[] = { 0x0BE8, 0x0C00, 0x0C08, 0x0C10, 0x0C18, 0x0C20,
+                                        0x0BD0, 0x0BD8, 0x0BE0, 0x0BF0, 0x0BF8 };
 
-    // Read CUtlMemoryPool header
+    uintptr_t pool_base = 0;
     int32_t block_size = 0, blocks_per_blob = 0, blocks_allocated = 0;
-    seh_read_i32(pool_base + 0x00, &block_size);
-    seh_read_i32(pool_base + 0x04, &blocks_per_blob);
-    seh_read_i32(pool_base + 0x0C, &blocks_allocated);
 
-    LOG_I("enum CUtlMemoryPool: block_size=%d, blocks_per_blob=%d, allocated=%d",
-          block_size, blocks_per_blob, blocks_allocated);
+    for (int candidate_offset : enum_offsets) {
+        uintptr_t candidate = scope + candidate_offset;
 
-    // Validate pool parameters
-    if (block_size < 16 || block_size > 256 || blocks_per_blob <= 0 ||
-        blocks_per_blob > 4096 || blocks_allocated <= 0 || blocks_allocated > 100000) {
-        LOG_W("enum pool parameters look invalid (offset 0x0BE8 may be wrong for this build)");
-        return false;
+        int32_t bs = 0, bpb = 0, ba = 0;
+        if (!seh_read_i32(candidate + 0x00, &bs)) continue;
+        if (!seh_read_i32(candidate + 0x04, &bpb)) continue;
+        if (!seh_read_i32(candidate + 0x0C, &ba)) continue;
+
+        // Valid pool: block_size 16-256, blocks_per_blob 1-4096, allocated > 0
+        if (bs >= 16 && bs <= 256 && bpb > 0 && bpb <= 4096 && ba > 0 && ba <= 100000) {
+            // Extra validation: check blob head pointer exists
+            uintptr_t blob_head = 0;
+            if (!seh_read_ptr(candidate + 0x20, &blob_head) || !blob_head) continue;
+
+            // Try to probe for an enum entry in the first blob
+            for (int d : { 0x10, 0x18, 0x20 }) {
+                if (seh_probe_enum_hash_entry(blob_head + d)) {
+                    pool_base = candidate;
+                    block_size = bs;
+                    blocks_per_blob = bpb;
+                    blocks_allocated = ba;
+                    LOG_I("enum CUtlTSHash found at scope+0x%X (block_size=%d, per_blob=%d, allocated=%d)",
+                          candidate_offset, bs, bpb, ba);
+                    goto found_enum_pool;
+                }
+            }
+        }
     }
+
+    // Not found via known offsets — do a broader scan
+    // Scan from +0x0580 to +0x0D00 in 8-byte steps (after class hash at +0x0560)
+    for (int off = 0x0580; off <= 0x0D00; off += 8) {
+        uintptr_t candidate = scope + off;
+
+        int32_t bs = 0, bpb = 0, ba = 0;
+        if (!seh_read_i32(candidate + 0x00, &bs)) continue;
+        if (!seh_read_i32(candidate + 0x04, &bpb)) continue;
+        if (!seh_read_i32(candidate + 0x0C, &ba)) continue;
+
+        if (bs >= 16 && bs <= 256 && bpb > 0 && bpb <= 4096 && ba > 0 && ba <= 100000) {
+            uintptr_t blob_head = 0;
+            if (!seh_read_ptr(candidate + 0x20, &blob_head) || !blob_head) continue;
+
+            for (int d : { 0x10, 0x18, 0x20 }) {
+                if (seh_probe_enum_hash_entry(blob_head + d)) {
+                    pool_base = candidate;
+                    block_size = bs;
+                    blocks_per_blob = bpb;
+                    blocks_allocated = ba;
+                    LOG_I("enum CUtlTSHash discovered at scope+0x%X (block_size=%d, per_blob=%d, allocated=%d)",
+                          off, bs, bpb, ba);
+                    goto found_enum_pool;
+                }
+            }
+        }
+    }
+
+    LOG_W("enum CUtlTSHash not found for %s (probed offsets 0x0580-0x0D00)", module_name);
+    return false;
+
+found_enum_pool:
+    if (!pool_base) return false;
 
     // Read blob head pointer at pool+0x20
     uintptr_t first_blob = 0;
@@ -1013,6 +1067,17 @@ int SchemaManager::dump_all_modules() {
         // Try to find a type scope for this module
         void* scope = find_type_scope(mod_name);
         if (!scope) continue;
+
+        // Validate: the scope at +0x08 has a 256-byte name buffer.
+        // If it doesn't contain our module name, FindTypeScopeForModule
+        // returned a default/shared scope — skip it.
+        uintptr_t scope_addr = reinterpret_cast<uintptr_t>(scope);
+        const char* scope_name = nullptr;
+        if (!seh_read_string(scope_addr + 0x08, &scope_name) || !scope_name || !scope_name[0])
+            continue;
+        // Check the scope name contains our module name (case-insensitive)
+        if (_stricmp(scope_name, mod_name) != 0)
+            continue;
 
         LOG_I("found schema scope for: %s", mod_name);
 

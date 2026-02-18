@@ -623,18 +623,150 @@ void generate_hierarchy(const std::vector<ClassInfo>& classes,
 // Main
 // ============================================================================
 
-int main(int argc, char* argv[]) {
-    // Log to file when run elevated (stdout not visible in UAC process)
+// ============================================================================
+// Console helpers
+// ============================================================================
+
+static HANDLE g_console = INVALID_HANDLE_VALUE;
+static FILE* g_log_fp = nullptr;
+
+// Ensure we have a visible console window (even when launched elevated via UAC)
+static void ensure_console() {
+    g_console = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (g_console == INVALID_HANDLE_VALUE || g_console == nullptr) {
+        AllocConsole();
+        g_console = GetStdHandle(STD_OUTPUT_HANDLE);
+    }
+    // Also open a log file for diagnostics
     char log_path[MAX_PATH];
     GetTempPathA(MAX_PATH, log_path);
     strcat_s(log_path, "dezlock-dump.log");
-    freopen(log_path, "w", stdout);
-    setvbuf(stdout, nullptr, _IONBF, 0);
+    g_log_fp = fopen(log_path, "w");
+}
 
-    printf("==================================================\n");
-    printf("  Dezlock Dump Tool\n");
-    printf("  Runtime schema + RTTI extraction for Deadlock\n");
-    printf("==================================================\n\n");
+// Print to both console and log file
+static void con_print(const char* fmt, ...) {
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (len <= 0) return;
+
+    // Write to console
+    DWORD written = 0;
+    if (g_console != INVALID_HANDLE_VALUE)
+        WriteConsoleA(g_console, buf, (DWORD)len, &written, nullptr);
+
+    // Write to log
+    if (g_log_fp) { fwrite(buf, 1, len, g_log_fp); fflush(g_log_fp); }
+}
+
+// Set console text color
+static void con_color(WORD attr) {
+    if (g_console != INVALID_HANDLE_VALUE)
+        SetConsoleTextAttribute(g_console, attr);
+}
+
+static constexpr WORD CLR_DEFAULT = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+static constexpr WORD CLR_TITLE   = FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+static constexpr WORD CLR_OK      = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+static constexpr WORD CLR_WARN    = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+static constexpr WORD CLR_ERR     = FOREGROUND_RED | FOREGROUND_INTENSITY;
+static constexpr WORD CLR_DIM     = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+static constexpr WORD CLR_STEP    = FOREGROUND_GREEN | FOREGROUND_BLUE;
+
+static void con_step(const char* step, const char* msg) {
+    con_color(CLR_STEP);
+    con_print("[%s] ", step);
+    con_color(CLR_DEFAULT);
+    con_print("%s\n", msg);
+}
+
+static void con_ok(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    con_color(CLR_OK);
+    con_print("  OK  ");
+    con_color(CLR_DEFAULT);
+    con_print("%s\n", buf);
+}
+
+static void con_fail(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    con_color(CLR_ERR);
+    con_print("  ERR ");
+    con_color(CLR_DEFAULT);
+    con_print("%s\n", buf);
+}
+
+static void con_info(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    con_color(CLR_DIM);
+    con_print("      %s\n", buf);
+    con_color(CLR_DEFAULT);
+}
+
+static void wait_for_keypress() {
+    con_print("\nPress any key to exit...\n");
+    HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
+    if (hInput != INVALID_HANDLE_VALUE) {
+        FlushConsoleInputBuffer(hInput);
+        INPUT_RECORD ir;
+        DWORD read;
+        while (ReadConsoleInputA(hInput, &ir, 1, &read)) {
+            if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown)
+                break;
+        }
+    }
+}
+
+// Check if running with admin privileges
+static bool is_elevated() {
+    BOOL elevated = FALSE;
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        TOKEN_ELEVATION elev = {};
+        DWORD size = 0;
+        if (GetTokenInformation(token, TokenElevation, &elev, sizeof(elev), &size))
+            elevated = elev.TokenIsElevated;
+        CloseHandle(token);
+    }
+    return elevated != FALSE;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    ensure_console();
+
+    // Set console title
+    SetConsoleTitleA("dezlock-dump - Deadlock Schema Extractor");
+
+    con_print("\n");
+    con_color(CLR_TITLE);
+    con_print("  dezlock-dump");
+    con_color(CLR_DIM);
+    con_print("  v1.0.0\n");
+    con_color(CLR_DEFAULT);
+    con_print("  Runtime schema + RTTI extraction for Deadlock (Source 2)\n");
+    con_color(CLR_DIM);
+    con_print("  https://github.com/dougwithseismic/dezlock-dump\n");
+    con_color(CLR_DEFAULT);
+    con_print("\n");
 
     // Parse args
     std::string output_dir;
@@ -646,9 +778,10 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
             timeout_sec = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: dezlock-dump.exe [--output <dir>] [--wait <seconds>]\n");
-            printf("  --output  Output directory (default: schema-dump/ next to exe)\n");
-            printf("  --wait    Max wait time for worker DLL (default: 30s)\n");
+            con_print("Usage: dezlock-dump.exe [--output <dir>] [--wait <seconds>]\n\n");
+            con_print("  --output  Output directory (default: schema-dump/ next to exe)\n");
+            con_print("  --wait    Max wait time for worker DLL (default: 30s)\n");
+            wait_for_keypress();
             return 0;
         }
     }
@@ -656,9 +789,7 @@ int main(int argc, char* argv[]) {
     // Default output dir: schema-dump/ next to the exe
     if (output_dir.empty()) {
         char exe_dir[MAX_PATH];
-        // Use GetModuleFileName for our own exe (not cmd.exe when launched via Start-Process)
         GetModuleFileNameA(GetModuleHandleA(nullptr), exe_dir, MAX_PATH);
-        // Resolve to full path in case of relative path
         char full_path[MAX_PATH];
         GetFullPathNameA(exe_dir, MAX_PATH, full_path, nullptr);
         char* last_slash = strrchr(full_path, '\\');
@@ -666,17 +797,64 @@ int main(int argc, char* argv[]) {
         output_dir = std::string(full_path) + "schema-dump";
     }
 
-    // Step 1: Find Deadlock
-    printf("[1/5] Finding Deadlock process...\n");
-    DWORD pid = find_process(L"deadlock.exe");
-    if (!pid) {
-        printf("  ERROR: deadlock.exe not found. Is the game running?\n");
+    // ---- Pre-flight checks ----
+
+    // Check 1: Admin privileges
+    con_step("1/5", "Checking prerequisites...");
+
+    if (!is_elevated()) {
+        con_fail("Not running as administrator.");
+        con_print("\n");
+        con_color(CLR_WARN);
+        con_print("  This tool needs admin privileges to read Deadlock's memory.\n");
+        con_print("  Right-click dezlock-dump.exe -> Run as administrator\n");
+        con_color(CLR_DEFAULT);
+        wait_for_keypress();
         return 1;
     }
-    printf("  -> PID: %lu\n", pid);
+    con_ok("Running as administrator");
 
-    // Step 2: Resolve worker DLL path
-    printf("[2/5] Preparing worker DLL...\n");
+    // Check 2: Deadlock is running
+    DWORD pid = find_process(L"deadlock.exe");
+    if (!pid) {
+        con_fail("Deadlock is not running.");
+        con_print("\n");
+        con_color(CLR_WARN);
+        con_print("  Please launch Deadlock first, then run this tool.\n");
+        con_print("  The game needs to be fully loaded (main menu or in a match).\n");
+        con_color(CLR_DEFAULT);
+        con_print("\n");
+        con_info("Waiting for Deadlock to start...");
+
+        // Wait for deadlock with a spinner
+        const char* spinner = "|/-\\";
+        int spin = 0;
+        int wait_count = 0;
+        while (!pid) {
+            Sleep(500);
+            pid = find_process(L"deadlock.exe");
+            wait_count++;
+
+            // Update spinner
+            char spin_buf[64];
+            snprintf(spin_buf, sizeof(spin_buf), "  %c Waiting... (%ds)\r",
+                     spinner[spin % 4], wait_count / 2);
+            con_print("%s", spin_buf);
+            spin++;
+
+            // Give up after 5 minutes
+            if (wait_count > 600) {
+                con_print("\n");
+                con_fail("Timed out waiting for Deadlock (5 min). Exiting.");
+                wait_for_keypress();
+                return 1;
+            }
+        }
+        con_print("\n");
+    }
+    con_ok("Deadlock found (PID: %lu)", pid);
+
+    // Check 3: Worker DLL exists
     char exe_path[MAX_PATH];
     GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
     char* slash = strrchr(exe_path, '\\');
@@ -686,63 +864,87 @@ int main(int argc, char* argv[]) {
     snprintf(dll_path, MAX_PATH, "%sdezlock-worker.dll", exe_path);
 
     if (GetFileAttributesA(dll_path) == INVALID_FILE_ATTRIBUTES) {
-        printf("  ERROR: %s not found\n", dll_path);
-        printf("  Build with: build.bat\n");
+        con_fail("dezlock-worker.dll not found next to this exe.");
+        con_info("Make sure both files are in the same folder:");
+        con_info("  dezlock-dump.exe");
+        con_info("  dezlock-worker.dll");
+        wait_for_keypress();
         return 1;
     }
+    con_ok("Worker DLL found");
 
-    // Copy DLL to unique temp path (avoids stale module handle from previous run)
+    // ---- Injection ----
+    con_step("2/5", "Preparing worker...");
+
     char temp_dir[MAX_PATH];
     GetTempPathA(MAX_PATH, temp_dir);
 
     char inject_path[MAX_PATH];
     snprintf(inject_path, MAX_PATH, "%sdezlock-worker-%lu.dll", temp_dir, GetTickCount());
     CopyFileA(dll_path, inject_path, FALSE);
-    printf("  -> %s (temp copy)\n", inject_path);
 
-    // Clean up stale files
     char json_path[MAX_PATH], done_path[MAX_PATH];
     snprintf(json_path, MAX_PATH, "%sdezlock-export.json", temp_dir);
     snprintf(done_path, MAX_PATH, "%sdezlock-done", temp_dir);
     DeleteFileA(done_path);
     DeleteFileA(json_path);
 
-    // Step 3: Inject
-    printf("[3/5] Injecting worker into Deadlock...\n");
+    con_step("3/5", "Extracting schema from Deadlock...");
+    con_info("This reads class layouts and field offsets from the game's memory.");
+    con_info("Deadlock will not be modified. This is read-only.");
+
     if (!inject_dll(pid, inject_path)) {
-        printf("  ERROR: Injection failed. Run as administrator.\n");
+        con_fail("Could not connect to Deadlock process.");
+        con_info("Make sure the game is fully loaded (not still on splash screen).");
+        con_info("If the problem persists, try restarting Deadlock.");
+        wait_for_keypress();
         return 1;
     }
-    printf("  -> Injected successfully\n");
+    con_ok("Connected to Deadlock");
 
-    // Step 4: Wait for completion
-    printf("[4/5] Waiting for schema dump (max %ds)...\n", timeout_sec);
+    // ---- Wait for completion ----
+    con_step("4/5", "Dumping schema data...");
+
+    const char* spinner = "|/-\\";
     int waited = 0;
+    int spin = 0;
     while (waited < timeout_sec * 10) {
-        if (GetFileAttributesA(done_path) != INVALID_FILE_ATTRIBUTES) {
+        if (GetFileAttributesA(done_path) != INVALID_FILE_ATTRIBUTES)
             break;
-        }
         Sleep(100);
         waited++;
-        if (waited % 20 == 0) {
-            printf("  ... %ds\n", waited / 10);
+
+        // Spinner every 200ms
+        if (waited % 2 == 0) {
+            char spin_buf[64];
+            snprintf(spin_buf, sizeof(spin_buf), "  %c Working... (%ds)\r",
+                     spinner[spin % 4], waited / 10);
+            con_print("%s", spin_buf);
+            spin++;
         }
     }
+    con_print("                              \r"); // clear spinner line
 
     if (GetFileAttributesA(done_path) == INVALID_FILE_ATTRIBUTES) {
-        printf("  ERROR: Worker timed out after %ds\n", timeout_sec);
-        printf("  Check %%TEMP%%\\dezlock-worker.txt for worker log\n");
+        con_fail("Schema dump timed out after %ds.", timeout_sec);
+        con_info("The game might not be fully loaded yet. Try again in a match.");
+
+        char worker_log[MAX_PATH];
+        snprintf(worker_log, MAX_PATH, "%sdezlock-worker.txt", temp_dir);
+        con_info("Worker log: %s", worker_log);
+
+        wait_for_keypress();
         return 1;
     }
-    printf("  -> Done (%.1fs)\n", waited / 10.0f);
+    con_ok("Schema extracted (%.1fs)", waited / 10.0f);
 
-    // Step 5: Process output
-    printf("[5/5] Generating output files...\n");
+    // ---- Generate output ----
+    con_step("5/5", "Generating output files...");
 
-    // Load JSON
     FILE* fp = fopen(json_path, "rb");
     if (!fp) {
-        printf("  ERROR: Cannot read %s\n", json_path);
+        con_fail("Cannot read export data.");
+        wait_for_keypress();
         return 1;
     }
     fseek(fp, 0, SEEK_END);
@@ -756,7 +958,8 @@ int main(int argc, char* argv[]) {
     try {
         data = json::parse(json_str);
     } catch (const std::exception& e) {
-        printf("  ERROR: JSON parse failed: %s\n", e.what());
+        con_fail("Failed to parse export data: %s", e.what());
+        wait_for_keypress();
         return 1;
     }
 
@@ -764,27 +967,17 @@ int main(int argc, char* argv[]) {
     int total_enums = data.value("total_enums", data.value("enum_count", 0));
     int rtti_count = data.value("rtti_classes", 0);
     int total_static = data.value("total_static_fields", 0);
-    printf("  -> Loaded: %d classes, %d enums, %d RTTI, %d static fields\n",
-           total_classes, total_enums, rtti_count, total_static);
 
-    // Parse into per-module structs
     auto modules = parse_modules(data);
-    printf("  -> %d module(s)\n", (int)modules.size());
 
-    // Create output directory
     CreateDirectoryA(output_dir.c_str(), nullptr);
 
-    // Generate files for each module
     for (auto& mod : modules) {
-        // Strip .dll suffix for clean file names
         std::string module_name = mod.name;
         {
             auto pos = module_name.rfind(".dll");
             if (pos != std::string::npos) module_name = module_name.substr(0, pos);
         }
-
-        printf("\n  [%s] %d classes, %d enums\n",
-               mod.name.c_str(), (int)mod.classes.size(), (int)mod.enums.size());
 
         std::sort(mod.classes.begin(), mod.classes.end(),
                   [](const ClassInfo& a, const ClassInfo& b) { return a.name < b.name; });
@@ -795,29 +988,45 @@ int main(int argc, char* argv[]) {
         generate_flat(mod.classes, output_dir, module_name);
         generate_hierarchy(mod.classes, output_dir, module_name);
         generate_enums(mod.enums, output_dir, module_name);
+
+        con_ok("%-20s  %4d classes, %4d enums", mod.name.c_str(),
+               (int)mod.classes.size(), (int)mod.enums.size());
     }
 
-    // Copy full JSON
     std::string json_out = output_dir + "\\all-modules.json";
     CopyFileA(json_path, json_out.c_str(), FALSE);
-    printf("  -> %s\n", json_out.c_str());
 
     // Clean up temp files
     DeleteFileA(done_path);
-    DeleteFileA(inject_path);  // temp DLL copy
+    DeleteFileA(inject_path);
 
-    printf("\n==================================================\n");
-    printf("  Schema dump complete!\n");
-    printf("  %d module(s), %d classes, %d enums, %d RTTI hierarchies\n",
-           (int)modules.size(), total_classes, total_enums, rtti_count);
-    printf("  Output: %s\\\n", output_dir.c_str());
-    printf("==================================================\n");
+    // ---- Summary ----
+    con_print("\n");
+    con_color(CLR_TITLE);
+    con_print("  Done!\n\n");
+    con_color(CLR_DEFAULT);
 
-    printf("\nUsage:\n");
-    printf("  grep m_iHealth %s\\client.txt\n", output_dir.c_str());
-    printf("  grep \"C_CitadelPlayerPawn\\.\" %s\\client-flat.txt\n", output_dir.c_str());
-    printf("  grep EAbilitySlots %s\\client-enums.txt\n", output_dir.c_str());
-    printf("  grep -r MNetworkEnable %s\\*.txt\n", output_dir.c_str());
+    con_print("  %-20s %d\n", "Modules:", (int)modules.size());
+    con_print("  %-20s %d\n", "Classes:", total_classes);
+    con_print("  %-20s %d\n", "Enums:", total_enums);
+    con_print("  %-20s %d\n", "RTTI hierarchies:", rtti_count);
+    con_print("  %-20s %d\n", "Static fields:", total_static);
+    con_print("\n");
 
+    con_color(CLR_OK);
+    con_print("  Output: ");
+    con_color(CLR_DEFAULT);
+    con_print("%s\\\n\n", output_dir.c_str());
+
+    con_color(CLR_DIM);
+    con_print("  Quick start:\n");
+    con_print("    grep m_iHealth %s\\client.txt\n", output_dir.c_str());
+    con_print("    grep MNetworkEnable %s\\client.txt\n", output_dir.c_str());
+    con_print("    grep EAbilitySlots %s\\client-enums.txt\n", output_dir.c_str());
+    con_color(CLR_DEFAULT);
+
+    if (g_log_fp) fclose(g_log_fp);
+
+    wait_for_keypress();
     return 0;
 }
