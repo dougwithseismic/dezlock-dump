@@ -1,6 +1,14 @@
 # dezlock-dump
 
-Runtime schema + RTTI + vtable + signature extraction tool for Deadlock (Source 2). Injects a minimal worker DLL into a running Deadlock process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, **every virtual function table**, and **pattern signatures** for all virtual functions.
+[![Discord](https://img.shields.io/discord/1469694564683088168?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sjcsVkE8ur)
+
+> **Join the community!** Got questions, want to share your setups, or just hang out? Jump into our Discord:
+>
+> **[discord.gg/sjcsVkE8ur](https://discord.gg/sjcsVkE8ur)**
+
+---
+
+Runtime schema + RTTI + vtable + signature extraction tool for Source 2 games (Deadlock, CS2, Dota 2). Injects a minimal worker DLL into a running game process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, **every virtual function table**, and **pattern signatures** for all virtual functions.
 
 No source2gen required — reads directly from the game's `SchemaSystem` and MSVC x64 RTTI at runtime.
 
@@ -32,11 +40,18 @@ Additionally, `%TEMP%\dezlock-export.json` contains the complete JSON export wit
 ### Pre-built (Releases)
 
 1. Download `dezlock-dump.zip` from [Releases](../../releases)
-2. Launch Deadlock and enter a match or lobby
+2. Launch your Source 2 game and enter a match or lobby
 3. Run as administrator:
 
-```
+```bash
+# Deadlock (default)
 dezlock-dump.exe --all
+
+# CS2
+dezlock-dump.exe --process cs2.exe --all
+
+# Dota 2
+dezlock-dump.exe --process dota2.exe --all
 ```
 
 This dumps schema + generates SDK headers + pattern signatures in one shot. Output lands in `schema-dump/` next to the exe.
@@ -54,11 +69,12 @@ Produces `bin/dezlock-dump.exe` and `bin/dezlock-worker.dll`.
 ## Usage
 
 ```
-dezlock-dump.exe [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]
+dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--process <name>` | `deadlock.exe` | Target process (e.g. `cs2.exe`, `dota2.exe`) |
 | `--output <dir>` | `schema-dump/` next to exe | Output directory |
 | `--wait <seconds>` | `30` | Max time to wait for worker DLL |
 | `--headers` | off | Generate C++ SDK headers (structs, enums, offsets) |
@@ -68,7 +84,7 @@ dezlock-dump.exe [--output <dir>] [--wait <seconds>] [--headers] [--signatures] 
 ### Requirements
 
 - Windows 10/11 (x64)
-- Deadlock must be running (with `client.dll` loaded)
+- Target Source 2 game must be running (with `client.dll` loaded)
 - Run as **administrator** (required for process injection)
 
 ### Example Workflow
@@ -313,7 +329,7 @@ This includes **RTTI-only classes** that have no schema entry — things like `C
 
 ## How It Works
 
-1. Finds `deadlock.exe` process
+1. Finds target process (default: `deadlock.exe`, configurable via `--process`)
 2. Injects `dezlock-worker.dll` via `CreateRemoteThread` + `LoadLibraryA`
 3. Worker auto-discovers all loaded modules with schema data via `EnumProcessModules`
 4. For each schema module, walks `SchemaSystem_001` — enumerates classes (CUtlTSHash at +0x0560) and enums (+0x0BE8)
