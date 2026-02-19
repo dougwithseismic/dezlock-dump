@@ -681,6 +681,78 @@ def find_include_module(class_name: str, class_to_module: dict) -> str | None:
     return class_to_module.get(class_name)
 
 
+def is_entity_class(cls_name: str, class_lookup: dict) -> bool:
+    """Check if a class inherits from CEntityInstance (entity hierarchy)."""
+    current = cls_name
+    seen = set()
+    while current and current in class_lookup and current not in seen:
+        if current == "CEntityInstance":
+            return True
+        seen.add(current)
+        current = class_lookup[current].get("parent")
+    return False
+
+
+# Maps class name -> subfolder within its module ("entities" or "structs")
+_class_subfolder: dict[str, str] = {}
+
+
+def get_class_subfolder(cls_name: str) -> str:
+    """Get the subfolder for a class within its module directory."""
+    return _class_subfolder.get(cls_name, "")
+
+
+def compute_include_path(from_class: str, to_class: str,
+                          class_to_module: dict) -> str:
+    """Compute the relative #include path from one class file to another.
+
+    Both classes may be in different modules and different subfolders.
+    """
+    from_module = class_to_module.get(from_class, "")
+    to_module = class_to_module.get(to_class, "")
+    from_sub = get_class_subfolder(from_class)
+    to_sub = get_class_subfolder(to_class)
+    to_safe = safe_class_name(to_class)
+
+    same_module = from_module == to_module
+
+    if same_module and from_sub == to_sub:
+        # Same folder
+        return f'"{to_safe}.hpp"'
+
+    if same_module:
+        # Different subfolder within same module
+        if from_sub and to_sub:
+            return f'"../{to_sub}/{to_safe}.hpp"'
+        elif from_sub:
+            # from entities/ or structs/ -> module root (shouldn't happen but handle it)
+            return f'"../{to_safe}.hpp"'
+        else:
+            # from module root -> subfolder
+            return f'"{to_sub}/{to_safe}.hpp"'
+
+    # Different module
+    if from_sub:
+        # from module/subfolder/ -> need ../../other_module/[subfolder/]
+        prefix = f'"../../{to_module}'
+    else:
+        # from module/ -> need ../other_module/[subfolder/]
+        prefix = f'"../{to_module}'
+
+    if to_sub:
+        return f'{prefix}/{to_sub}/{to_safe}.hpp"'
+    else:
+        return f'{prefix}/{to_safe}.hpp"'
+
+
+def compute_types_include(cls_name: str) -> str:
+    """Compute relative path to types.hpp from a class file's location."""
+    sub = get_class_subfolder(cls_name)
+    if sub:
+        return '"../../types.hpp"'
+    return '"../types.hpp"'
+
+
 def generate_struct_header(cls: dict, module_name: str, class_lookup: dict,
                            class_to_module: dict, timestamp: str) -> str:
     """Generate a complete .hpp file for one class."""
@@ -711,18 +783,11 @@ def generate_struct_header(cls: dict, module_name: str, class_lookup: dict,
     # Include types.hpp if any field uses rich types
     use_types = needs_types_include(fields)
     if use_types:
-        # Calculate relative path to types.hpp (up from module/ to sdk/)
-        lines.append(f'#include "../types.hpp"')
+        lines.append(f'#include {compute_types_include(name)}')
 
     if has_parent:
-        parent_safe = safe_class_name(parent)
-        parent_module = find_include_module(parent, class_to_module)
-        mod_clean = module_name.replace(".dll", "")
-        if parent_module and parent_module != mod_clean:
-            # Cross-module parent — include from sibling module dir
-            lines.append(f'#include "../{parent_module}/{parent_safe}.hpp"')
-        else:
-            lines.append(f'#include "{parent_safe}.hpp"')
+        inc_path = compute_include_path(name, parent, class_to_module)
+        lines.append(f'#include {inc_path}')
 
     lines.append(f"")
 
@@ -1116,6 +1181,29 @@ def main():
     # Reset stats tracker
     _stats = ResolveStats()
 
+    # Pre-compute subfolder assignments for ALL classes before generating headers.
+    # Entity classes (CEntityInstance tree) go in entities/, others in structs/.
+    # Modules with NO entity classes skip subfolders entirely (everything at root).
+    global _class_subfolder
+    _class_subfolder = {}
+
+    for mod in modules:
+        useful = [c for c in mod.get("classes", []) if c["size"] > 0 and c.get("fields")]
+        entities = [c for c in useful if is_entity_class(c["name"], global_lookup)]
+        non_entities = [c for c in useful if not is_entity_class(c["name"], global_lookup)]
+
+        if entities and non_entities:
+            # Mixed module — split into entities/ and structs/
+            for c in entities:
+                _class_subfolder[c["name"]] = "entities"
+            for c in non_entities:
+                _class_subfolder[c["name"]] = "structs"
+        elif entities:
+            # All entities — put in entities/ for clarity
+            for c in entities:
+                _class_subfolder[c["name"]] = "entities"
+        # else: all structs or empty — no subfolder (stay at module root)
+
     # 1. Generate types.hpp
     types_content = generate_types_hpp(timestamp)
     types_path = out_dir / "types.hpp"
@@ -1140,9 +1228,15 @@ def main():
 
         module_names.append(mod_name)
 
-        # Create module directory only when there's actual content
+        # Create module directory
         mod_dir = out_dir / mod_name
         mod_dir.mkdir(exist_ok=True)
+
+        # Create subdirectories if needed
+        subfolders_used = set(get_class_subfolder(c["name"]) for c in useful_classes)
+        subfolders_used.discard("")
+        for sub in subfolders_used:
+            (mod_dir / sub).mkdir(exist_ok=True)
 
         # Per-module offset constants (only if classes have fields)
         if useful_classes:
@@ -1156,20 +1250,40 @@ def main():
             enums_path = mod_dir / "_enums.hpp"
             enums_path.write_text(enums_content, encoding="utf-8")
 
-        # Per-class struct headers
+        # Per-class struct headers — write to correct subfolder
         mod_count = 0
+        entity_count = 0
+        struct_count = 0
         for cls in sorted(useful_classes, key=lambda c: c["name"]):
             header = generate_struct_header(
                 cls, mod["name"], global_lookup, class_to_module, timestamp
             )
             safe_name = safe_class_name(cls["name"])
-            filepath = mod_dir / f"{safe_name}.hpp"
+            sub = get_class_subfolder(cls["name"])
+            if sub:
+                filepath = mod_dir / sub / f"{safe_name}.hpp"
+                if sub == "entities":
+                    entity_count += 1
+                else:
+                    struct_count += 1
+            else:
+                filepath = mod_dir / f"{safe_name}.hpp"
+                struct_count += 1
             filepath.write_text(header, encoding="utf-8")
             mod_count += 1
 
         total_structs += mod_count
 
-        print(f"  {mod['name']:30s}  {mod_count:4d} structs, {len(enums):4d} enums")
+        # Show breakdown
+        parts = []
+        if entity_count:
+            parts.append(f"{entity_count} entities")
+        if struct_count:
+            parts.append(f"{struct_count} structs")
+        enum_count = len(enums) if enums else 0
+        if enum_count:
+            parts.append(f"{enum_count} enums")
+        print(f"  {mod['name']:30s}  {', '.join(parts)}")
 
     # 3. Consolidated includes
     if module_names:

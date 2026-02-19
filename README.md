@@ -117,7 +117,7 @@ dezlock-dump.exe --process dota2.exe --all
 
 This dumps schema + generates SDK headers + cherry-pickable SDK + pattern signatures in one shot. Output lands in `schema-dump/<game>/` next to the exe (e.g. `schema-dump/deadlock/`, `schema-dump/cs2/`).
 
-> **Note:** The schema dump itself finishes in seconds, but SDK generation (`--sdk`), header generation (`--headers`), and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions (128 bytes each) across 58+ DLLs. Let it run, don't close the window early.
+> **Note:** The schema dump itself finishes in seconds, but SDK generation (`--sdk`) and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions (128 bytes each) across 58+ DLLs. Let it run, don't close the window early.
 
 ### Build from Source
 
@@ -132,7 +132,7 @@ Produces `bin/dezlock-dump.exe` and `bin/dezlock-worker.dll`.
 ## Usage
 
 ```
-dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--sdk] [--all]
+dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--signatures] [--sdk] [--all]
 ```
 
 | Flag | Default | Description |
@@ -140,10 +140,9 @@ dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--heade
 | `--process <name>` | `deadlock.exe` | Target process (e.g. `cs2.exe`, `dota2.exe`) |
 | `--output <dir>` | `schema-dump/<game>/` next to exe | Output directory (auto per-game) |
 | `--wait <seconds>` | `30` | Max time to wait for worker DLL |
-| `--headers` | off | Generate C++ SDK headers (structs, enums, offsets) |
 | `--signatures` | off | Generate byte pattern signatures (requires Python 3) |
-| `--sdk` | off | Generate cherry-pickable C++ SDK (v2-quality structs, requires Python 3) |
-| `--all` | off | Enable all generators (headers + signatures + sdk) |
+| `--sdk` | off | Generate cherry-pickable C++ SDK with v2-quality structs (requires Python 3) |
+| `--all` | off | Enable all generators (signatures + sdk) |
 
 ### Requirements
 
@@ -467,41 +466,6 @@ namespace C_BaseEntity {
 | bitfield | Bit fields (size=0) | Emitted as comments |
 | unresolved | Remaining (~3%) | Sized blob fallback (sizes always correct) |
 
-## Legacy SDK Header Generation (`--headers`)
-
-The `--headers` flag generates a simpler set of C++ headers without the v2-style type system or `namespace sdk` wrapping. Still useful for quick offset lookups.
-
-```bash
-dezlock-dump.exe --headers
-python import-schema.py --game deadlock  # standalone
-```
-
-### Generated Files
-
-| File | Contents |
-|------|----------|
-| `_all-vtables.hpp` | Per-class vtable RVAs and function indices |
-| `_all-offsets.hpp` | All field offsets as `constexpr uint32_t` |
-| `_all-enums.hpp` | All enums as `enum class` |
-| `<module>/<ClassName>.hpp` | Padded struct with `static_assert` validation |
-
-### Vtable Header
-
-```cpp
-namespace deadlock::generated::vtables {
-namespace CCitadelInput {
-    constexpr uint32_t vtable_rva = 0x22A4A58;
-    constexpr int entry_count = 30;
-    namespace fn {
-        constexpr int idx_0 = 0;  // rva=0x508F10
-        constexpr int idx_5 = 5;  // rva=0x15AF360 (CreateMove)
-    }
-}
-}
-```
-
-Vtable indices are ABI-stable — they don't change across patches. Only the RVAs shift. Hook by index, resolve the vtable at runtime with `module_base + vtable_rva`.
-
 ## What Gets Captured
 
 | Data | Source | Example Count |
@@ -559,8 +523,7 @@ This includes **RTTI-only classes** that have no schema entry — things like `C
 12. Exports JSON to `%TEMP%`, signals completion via marker file
 13. Main exe reads JSON and generates consolidated `<module>.txt` (classes + flattened + enums), `_globals.txt` (all globals + recursive field trees), `_access-paths.txt` (schema globals only), and `_entity-paths.txt` (every entity class with full field trees)
 14. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
-15. **Optional**: `--headers` generates C++ SDK headers with padded structs
-16. **Optional**: `--sdk` invokes `import-schema.py` to generate cherry-pickable C++ SDK with v2-quality types
+15. **Optional**: `--sdk` invokes `import-schema.py` to generate cherry-pickable C++ SDK with v2-quality types
 16. Worker auto-unloads via `FreeLibraryAndExitThread`
 
 ### Vtable Discovery Detail

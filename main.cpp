@@ -1453,7 +1453,6 @@ int main(int argc, char* argv[]) {
     std::string output_dir;
     std::string target_process;  // empty = interactive selection
     int timeout_sec = 180;
-    bool gen_headers = false;
     bool gen_signatures = false;
     bool gen_sdk = false;
     bool gen_all = false;
@@ -1466,7 +1465,8 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
             timeout_sec = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--headers") == 0) {
-            gen_headers = true;
+            // Legacy alias — now handled by --sdk
+            gen_sdk = true;
         } else if (strcmp(argv[i], "--signatures") == 0) {
             gen_signatures = true;
         } else if (strcmp(argv[i], "--sdk") == 0) {
@@ -1474,15 +1474,14 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--all") == 0) {
             gen_all = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--sdk] [--all]\n\n");
+            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--sdk] [--signatures] [--all]\n\n");
             con_print("  --process     Target process name (skips game selection menu)\n");
             con_print("                Examples: --process cs2.exe, --process dota2.exe\n");
             con_print("  --output      Output directory (default: schema-dump/<game>/ next to exe)\n");
             con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
-            con_print("  --headers     Generate C++ SDK headers (structs, enums, offsets)\n");
-            con_print("  --signatures  Generate byte pattern signatures from vtable functions\n");
-            con_print("  --sdk         Generate cherry-pickable C++ SDK (v2-quality structs)\n");
-            con_print("  --all         Enable all generators (headers + signatures + sdk)\n");
+            con_print("  --sdk         Generate cherry-pickable C++ SDK (requires Python 3)\n");
+            con_print("  --signatures  Generate byte pattern signatures (requires Python 3)\n");
+            con_print("  --all         Enable all generators (sdk + signatures)\n");
             wait_for_keypress();
             return 0;
         }
@@ -1625,7 +1624,6 @@ int main(int argc, char* argv[]) {
 
     // --all enables everything
     if (gen_all) {
-        gen_headers = true;
         gen_signatures = true;
         gen_sdk = true;
     }
@@ -1867,9 +1865,6 @@ int main(int argc, char* argv[]) {
 
         generate_module_txt(mod.classes, mod.enums, data, output_dir, module_name, global_class_lookup);
         generate_hierarchy(mod.classes, output_dir, module_name, global_class_lookup);
-        if (gen_headers) {
-            generate_headers(mod.classes, mod.enums, output_dir, module_name);
-        }
 
         con_ok("%-20s  %4d classes, %4d enums", mod.name.c_str(),
                (int)mod.classes.size(), (int)mod.enums.size());
@@ -2576,10 +2571,9 @@ int main(int argc, char* argv[]) {
 
     // Show tips for unused features
     std::vector<std::string> tips;
-    if (!gen_headers) tips.push_back("--headers     Generate C++ SDK headers");
     if (!gen_signatures) tips.push_back("--signatures  Generate byte pattern signatures");
     if (!gen_sdk) tips.push_back("--sdk         Generate cherry-pickable C++ SDK");
-    if (!gen_all && (!gen_headers || !gen_signatures || !gen_sdk)) tips.push_back("--all         Enable all generators");
+    if (!gen_all && (!gen_signatures || !gen_sdk)) tips.push_back("--all         Enable all generators");
 
     if (!tips.empty()) {
         con_print("\n");
