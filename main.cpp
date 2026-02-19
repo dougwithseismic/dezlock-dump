@@ -7,9 +7,11 @@
  * 2. Injects dezlock-worker.dll via manual-map (PE mapping + shellcode)
  * 3. Waits for the worker to finish (writes JSON to %TEMP%)
  * 4. Reads JSON and generates output files:
- *    - schema-dump/client.txt      (greppable text)
- *    - schema-dump/client-flat.txt (flattened with inherited fields)
- *    - schema-dump/client.json     (full JSON)
+ *    - schema-dump/client.txt       (classes + flattened + enums in one file)
+ *    - schema-dump/_globals.txt     (global singletons with recursive field trees)
+ *    - schema-dump/_access-paths.txt (schema globals only — full offset access guide)
+ *    - schema-dump/_entity-paths.txt (every entity class with full field trees)
+ *    - schema-dump/_all-modules.json (full JSON)
  *
  * Requires: admin elevation (for process injection)
  * Requires: Target Source 2 game must be running
@@ -869,33 +871,11 @@ void generate_headers(const std::vector<ClassInfo>& classes,
     }
 }
 
-void generate_enums(const std::vector<EnumInfo>& enums,
-                    const std::string& output_dir, const std::string& module_name) {
-    std::string path = output_dir + "\\" + module_name + "-enums.txt";
-    FILE* fp = fopen(path.c_str(), "w");
-    if (!fp) return;
-
-    fprintf(fp, "# Dezlock Enum Dump - %s.dll\n", module_name.c_str());
-    fprintf(fp, "# Format: enum_name::VALUE_NAME = value\n");
-    fprintf(fp, "# %d enums\n\n", (int)enums.size());
-
-    int total_values = 0;
-    for (const auto& en : enums) {
-        fprintf(fp, "# --- %s (size=%d byte%s, %d values)\n",
-                en.name.c_str(), en.size, en.size != 1 ? "s" : "",
-                (int)en.values.size());
-        for (const auto& v : en.values) {
-            fprintf(fp, "%s::%s = %lld\n", en.name.c_str(), v.name.c_str(), v.value);
-            total_values++;
-        }
-        fprintf(fp, "\n");
-    }
-    fclose(fp);
-    printf("  -> %s (%d enums, %d values)\n", path.c_str(), (int)enums.size(), total_values);
-}
-
-void generate_text(const std::vector<ClassInfo>& classes, const json& data,
-                   const std::string& output_dir, const std::string& module_name) {
+// Consolidated module text output: classes + flattened + enums in one file
+void generate_module_txt(const std::vector<ClassInfo>& classes,
+                         const std::vector<EnumInfo>& enums,
+                         const json& data,
+                         const std::string& output_dir, const std::string& module_name) {
     std::string txt_path = output_dir + "\\" + module_name + ".txt";
     FILE* fp = fopen(txt_path.c_str(), "w");
     if (!fp) {
@@ -905,7 +885,20 @@ void generate_text(const std::vector<ClassInfo>& classes, const json& data,
 
     fprintf(fp, "# Dezlock Schema Dump - %s\n", module_name.c_str());
     fprintf(fp, "# Generated: %s\n", data.value("timestamp", "?").c_str());
-    fprintf(fp, "# Format: class_name.field_name = 0xOFFSET (type, size) [metadata...]\n#\n\n");
+    fprintf(fp, "#\n");
+    fprintf(fp, "# Sections:\n");
+    fprintf(fp, "#   CLASSES    - Each class with its own fields\n");
+    fprintf(fp, "#   FLATTENED  - Full memory layout (own + inherited fields)\n");
+    fprintf(fp, "#   ENUMS      - Enum definitions and values\n");
+    fprintf(fp, "#\n\n");
+
+    // ================================================================
+    // Section 1: CLASSES (own fields only)
+    // ================================================================
+    fprintf(fp, "# ================================================================\n");
+    fprintf(fp, "# CLASSES — own fields per class\n");
+    fprintf(fp, "# Format: class_name.field_name = 0xOFFSET (type, size) [metadata...]\n");
+    fprintf(fp, "# ================================================================\n\n");
 
     int total_fields = 0;
     for (const auto& cls : classes) {
@@ -913,7 +906,6 @@ void generate_text(const std::vector<ClassInfo>& classes, const json& data,
         if (!cls.parent.empty()) fprintf(fp, ", parent=%s", cls.parent.c_str());
         fprintf(fp, ")\n");
 
-        // Class metadata
         if (!cls.metadata.empty()) {
             fprintf(fp, "#     metadata:");
             for (const auto& m : cls.metadata) fprintf(fp, " [%s]", m.c_str());
@@ -945,7 +937,6 @@ void generate_text(const std::vector<ClassInfo>& classes, const json& data,
             total_fields++;
         }
 
-        // Static fields
         if (!cls.static_fields.empty()) {
             for (const auto& sf : cls.static_fields) {
                 fprintf(fp, "%s.%s = static (%s, %d)",
@@ -957,17 +948,19 @@ void generate_text(const std::vector<ClassInfo>& classes, const json& data,
 
         fprintf(fp, "\n");
     }
-    fclose(fp);
-    printf("  -> %s (%d classes, %d fields)\n", txt_path.c_str(), (int)classes.size(), total_fields);
-}
 
-void generate_flat(const std::vector<ClassInfo>& classes,
-                   const std::string& output_dir, const std::string& module_name) {
+    // ================================================================
+    // Section 2: FLATTENED (all inherited fields, sorted by offset)
+    // ================================================================
+    fprintf(fp, "\n# ================================================================\n");
+    fprintf(fp, "# FLATTENED — full memory layout (own + inherited fields)\n");
+    fprintf(fp, "# Format: class_name.field_name = 0xOFFSET (type, size, defined_in)\n");
+    fprintf(fp, "# ================================================================\n\n");
+
     // Build lookup
     std::unordered_map<std::string, const ClassInfo*> by_name;
     for (const auto& c : classes) by_name[c.name] = &c;
 
-    // Recursive field collector
     struct Collector {
         const std::unordered_map<std::string, const ClassInfo*>& lookup;
         std::vector<Field> result;
@@ -975,10 +968,8 @@ void generate_flat(const std::vector<ClassInfo>& classes,
         void collect(const std::string& name, std::unordered_set<std::string>& visited) {
             if (visited.count(name)) return;
             visited.insert(name);
-
             auto it = lookup.find(name);
             if (it == lookup.end()) return;
-
             const auto* cls = it->second;
             for (const auto& f : cls->fields) {
                 Field ff = f;
@@ -991,22 +982,12 @@ void generate_flat(const std::vector<ClassInfo>& classes,
         }
     };
 
-    std::string flat_path = output_dir + "\\" + module_name + "-flat.txt";
-    FILE* fp = fopen(flat_path.c_str(), "w");
-    if (!fp) return;
-
-    fprintf(fp, "# Dezlock Flattened Offset Index - %s.dll\n", module_name.c_str());
-    fprintf(fp, "# All fields including inherited, sorted by offset\n");
-    fprintf(fp, "# Format: class_name.field_name = 0xOFFSET (type, size, defined_in)\n\n");
-
-    // Only flatten entity classes with 3+ inheritance depth
     for (const auto& cls : classes) {
         if (cls.inheritance.size() < 3) continue;
 
         Collector col{by_name, {}};
         std::unordered_set<std::string> visited;
         col.collect(cls.name, visited);
-
         if (col.result.empty()) continue;
 
         std::sort(col.result.begin(), col.result.end(),
@@ -1030,8 +1011,29 @@ void generate_flat(const std::vector<ClassInfo>& classes,
         fprintf(fp, "\n");
     }
 
+    // ================================================================
+    // Section 3: ENUMS
+    // ================================================================
+    fprintf(fp, "\n# ================================================================\n");
+    fprintf(fp, "# ENUMS — %d enum definitions\n", (int)enums.size());
+    fprintf(fp, "# Format: enum_name::VALUE_NAME = value\n");
+    fprintf(fp, "# ================================================================\n\n");
+
+    int total_values = 0;
+    for (const auto& en : enums) {
+        fprintf(fp, "# --- %s (size=%d byte%s, %d values)\n",
+                en.name.c_str(), en.size, en.size != 1 ? "s" : "",
+                (int)en.values.size());
+        for (const auto& v : en.values) {
+            fprintf(fp, "%s::%s = %lld\n", en.name.c_str(), v.name.c_str(), v.value);
+            total_values++;
+        }
+        fprintf(fp, "\n");
+    }
+
     fclose(fp);
-    printf("  -> %s\n", flat_path.c_str());
+    printf("  -> %s (%d classes, %d fields, %d enums)\n",
+           txt_path.c_str(), (int)classes.size(), total_fields, (int)enums.size());
 }
 
 void generate_hierarchy(const std::vector<ClassInfo>& classes,
@@ -1420,7 +1422,7 @@ int main(int argc, char* argv[]) {
     // Parse args (early pass — need process name for banner)
     std::string output_dir;
     std::string target_process;  // empty = interactive selection
-    int timeout_sec = 30;
+    int timeout_sec = 180;
     bool gen_headers = false;
     bool gen_signatures = false;
     bool gen_all = false;
@@ -1739,9 +1741,18 @@ int main(int argc, char* argv[]) {
 
         // Spinner every 200ms
         if (waited % 2 == 0) {
-            char spin_buf[64];
-            snprintf(spin_buf, sizeof(spin_buf), "  %c Working... (%ds)\r",
-                     spinner[spin % 4], waited / 10);
+            int secs = waited / 10;
+            char spin_buf[128];
+            if (secs < 30) {
+                snprintf(spin_buf, sizeof(spin_buf), "  %c Working... (%ds)\r",
+                         spinner[spin % 4], secs);
+            } else if (secs < 60) {
+                snprintf(spin_buf, sizeof(spin_buf), "  %c Working... (%ds) — scanning modules + globals\r",
+                         spinner[spin % 4], secs);
+            } else {
+                snprintf(spin_buf, sizeof(spin_buf), "  %c Working... (%ds) — writing export (large JSON)\r",
+                         spinner[spin % 4], secs);
+            }
             con_print("%s", spin_buf);
             spin++;
         }
@@ -1807,10 +1818,8 @@ int main(int argc, char* argv[]) {
         std::sort(mod.enums.begin(), mod.enums.end(),
                   [](const EnumInfo& a, const EnumInfo& b) { return a.name < b.name; });
 
-        generate_text(mod.classes, data, output_dir, module_name);
-        generate_flat(mod.classes, output_dir, module_name);
+        generate_module_txt(mod.classes, mod.enums, data, output_dir, module_name);
         generate_hierarchy(mod.classes, output_dir, module_name);
-        generate_enums(mod.enums, output_dir, module_name);
         if (gen_headers) {
             generate_headers(mod.classes, mod.enums, output_dir, module_name);
         }
@@ -1819,54 +1828,224 @@ int main(int argc, char* argv[]) {
                (int)mod.classes.size(), (int)mod.enums.size());
     }
 
-    std::string json_out = output_dir + "\\all-modules.json";
+    std::string json_out = output_dir + "\\_all-modules.json";
     CopyFileA(json_path, json_out.c_str(), FALSE);
 
-    // ---- Globals text output ----
+    // ---- Globals text output (with recursive field expansion) ----
     if (data.contains("globals")) {
-        std::string globals_path = output_dir + "\\globals.txt";
+        // Build global class lookup from all parsed modules
+        std::unordered_map<std::string, const ClassInfo*> all_classes;
+        for (const auto& mod : modules) {
+            for (const auto& cls : mod.classes) {
+                all_classes[cls.name] = &cls;
+            }
+        }
+
+        // Recursive field collector that includes inherited fields
+        struct FlatCollector {
+            const std::unordered_map<std::string, const ClassInfo*>& lookup;
+            std::vector<Field> result;
+
+            void collect(const std::string& name, std::unordered_set<std::string>& visited) {
+                if (visited.count(name)) return;
+                visited.insert(name);
+                auto it = lookup.find(name);
+                if (it == lookup.end()) return;
+                const auto* cls = it->second;
+                for (const auto& f : cls->fields) {
+                    Field ff = f;
+                    ff.defined_in = name;
+                    result.push_back(ff);
+                }
+                if (!cls->parent.empty()) {
+                    collect(cls->parent, visited);
+                }
+            }
+        };
+
+        // Write recursive field tree for a class
+        // depth_limit prevents infinite expansion
+        struct TreeWriter {
+            FILE* fp;
+            const std::unordered_map<std::string, const ClassInfo*>& lookup;
+            int max_depth;
+
+            // Returns true if type is a pointer (dereference needed)
+            bool is_ptr(const std::string& type) {
+                std::string t = type;
+                while (!t.empty() && t.back() == ' ') t.pop_back();
+                return !t.empty() && t.back() == '*';
+            }
+
+            bool is_handle(const std::string& type) {
+                return type.rfind("CHandle<", 0) == 0 || type.rfind("CHandle <", 0) == 0;
+            }
+
+            std::string extract_type(const std::string& type) {
+                std::string t = type;
+                while (!t.empty() && t.back() == '*') t.pop_back();
+                while (!t.empty() && t.back() == ' ') t.pop_back();
+                if (t.rfind("CHandle<", 0) == 0 || t.rfind("CHandle <", 0) == 0) {
+                    auto open = t.find('<');
+                    auto close = t.rfind('>');
+                    if (open != std::string::npos && close != std::string::npos) {
+                        std::string inner = t.substr(open + 1, close - open - 1);
+                        while (!inner.empty() && inner.front() == ' ') inner.erase(inner.begin());
+                        while (!inner.empty() && inner.back() == ' ') inner.pop_back();
+                        return inner;
+                    }
+                }
+                return t;
+            }
+
+            void write(const std::string& class_name, int depth,
+                       std::unordered_set<std::string>& expanded) {
+                if (depth > max_depth) return;
+
+                // Collect all fields (own + inherited)
+                FlatCollector col{lookup, {}};
+                std::unordered_set<std::string> visited;
+                col.collect(class_name, visited);
+                if (col.result.empty()) return;
+
+                std::sort(col.result.begin(), col.result.end(),
+                          [](const Field& a, const Field& b) { return a.offset < b.offset; });
+
+                std::string indent(depth * 10, ' ');
+
+                for (const auto& f : col.result) {
+                    std::string base_type = extract_type(f.type);
+                    bool expandable = lookup.count(base_type) > 0 &&
+                                      !expanded.count(base_type) &&
+                                      base_type != class_name;
+
+                    if (is_ptr(f.type)) {
+                        if (expandable) {
+                            fprintf(fp, "%s  +0x%-4X %-30s -> %s\n",
+                                    indent.c_str(), f.offset, f.name.c_str(), f.type.c_str());
+                            expanded.insert(base_type);
+                            write(base_type, depth + 1, expanded);
+                        } else {
+                            fprintf(fp, "%s  +0x%-4X %-30s (%s)\n",
+                                    indent.c_str(), f.offset, f.name.c_str(), f.type.c_str());
+                        }
+                    } else if (is_handle(f.type)) {
+                        fprintf(fp, "%s  +0x%-4X %-30s [handle -> %s]\n",
+                                indent.c_str(), f.offset, f.name.c_str(), base_type.c_str());
+                    } else {
+                        // Check if it's an embedded struct we can expand
+                        bool is_embedded = lookup.count(f.type) > 0 &&
+                                           !expanded.count(f.type) &&
+                                           f.type != class_name;
+                        if (is_embedded) {
+                            fprintf(fp, "%s  +0x%-4X %-30s [embedded %s, +0x%X]\n",
+                                    indent.c_str(), f.offset, f.name.c_str(),
+                                    f.type.c_str(), f.offset);
+                            expanded.insert(f.type);
+                            write(f.type, depth + 1, expanded);
+                        } else {
+                            // Show which parent defined this field
+                            if (!f.defined_in.empty() && f.defined_in != class_name) {
+                                fprintf(fp, "%s  +0x%-4X %-30s (%s, %s)\n",
+                                        indent.c_str(), f.offset, f.name.c_str(),
+                                        f.type.c_str(), f.defined_in.c_str());
+                            } else {
+                                fprintf(fp, "%s  +0x%-4X %-30s (%s)\n",
+                                        indent.c_str(), f.offset, f.name.c_str(),
+                                        f.type.c_str());
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        int total_written = 0;
+        int schema_expanded = 0;
+
+        std::string globals_path = output_dir + "\\_globals.txt";
         FILE* gfp = fopen(globals_path.c_str(), "w");
         if (gfp) {
-            fprintf(gfp, "# Dezlock Global Singleton Discovery\n");
+            fprintf(gfp, "# Dezlock Global Singleton Access Guide\n");
             fprintf(gfp, "# Auto-discovered by scanning .data sections against RTTI vtable catalog\n");
-            fprintf(gfp, "# Format: module::ClassName = 0xRVA (type) [schema]\n");
-            fprintf(gfp, "# [schema] = class has SchemaSystem fields (known layout, useful for modding)\n");
+            fprintf(gfp, "#\n");
+            fprintf(gfp, "# [schema] globals are expanded with full field trees:\n");
+            fprintf(gfp, "#   ->  pointer dereference (follow pointer, then read sub-fields)\n");
+            fprintf(gfp, "#   [embedded X, +0xN]  struct is inline at that offset (add offsets)\n");
+            fprintf(gfp, "#   [handle -> X]  CHandle entity reference (resolve via entity list)\n");
+            fprintf(gfp, "#   (type, DefinedIn)  shows which parent class defines the field\n");
             fprintf(gfp, "#\n\n");
 
-            int total_written = 0;
             for (const auto& [mod_name, mod_globals] : data["globals"].items()) {
                 if (!mod_globals.is_array() || mod_globals.empty()) continue;
 
-                // Count schema vs total for this module
                 int mod_schema = 0;
                 for (const auto& g : mod_globals) {
                     if (g.value("has_schema", false)) mod_schema++;
                 }
-                fprintf(gfp, "# --- %s (%d globals, %d with schema) ---\n\n",
-                        mod_name.c_str(), (int)mod_globals.size(), mod_schema);
+                fprintf(gfp, "# ================================================================\n");
+                fprintf(gfp, "# %s (%d globals, %d with schema)\n", mod_name.c_str(),
+                        (int)mod_globals.size(), mod_schema);
+                fprintf(gfp, "# ================================================================\n\n");
 
-                // Schema globals first, then the rest
-                for (int pass = 0; pass < 2; pass++) {
-                    for (const auto& g : mod_globals) {
-                        bool has_schema = g.value("has_schema", false);
-                        if (pass == 0 && !has_schema) continue;
-                        if (pass == 1 && has_schema) continue;
+                // Pass 1: Schema globals with field expansion
+                for (const auto& g : mod_globals) {
+                    if (!g.value("has_schema", false)) continue;
 
-                        fprintf(gfp, "%s::%s = %s (%s)%s\n",
-                                mod_name.c_str(),
-                                g.value("class", "?").c_str(),
-                                g.value("rva", "?").c_str(),
-                                g.value("type", "?").c_str(),
-                                has_schema ? " [schema]" : "");
-                        total_written++;
+                    std::string cls_name = g.value("class", "?");
+                    std::string rva = g.value("rva", "?");
+                    std::string type = g.value("type", "?");
+
+                    fprintf(gfp, "# %s @ %s+%s (%s) [schema]\n",
+                            cls_name.c_str(), mod_name.c_str(), rva.c_str(), type.c_str());
+
+                    // Print inheritance chain
+                    auto cit = all_classes.find(cls_name);
+                    if (cit != all_classes.end() && !cit->second->inheritance.empty()) {
+                        fprintf(gfp, "# chain:");
+                        for (size_t i = 0; i < cit->second->inheritance.size(); i++) {
+                            fprintf(gfp, "%s%s", i ? " -> " : " ",
+                                    cit->second->inheritance[i].c_str());
+                        }
+                        fprintf(gfp, "\n");
                     }
+
+                    // Expand field tree
+                    if (cit != all_classes.end()) {
+                        TreeWriter tw{gfp, all_classes, 2};
+                        std::unordered_set<std::string> expanded;
+                        expanded.insert(cls_name);
+                        tw.write(cls_name, 0, expanded);
+                        schema_expanded++;
+                    }
+
+                    fprintf(gfp, "\n");
+                    total_written++;
                 }
-                fprintf(gfp, "\n");
+
+                // Pass 2: Non-schema globals (simple listing)
+                bool has_non_schema = false;
+                for (const auto& g : mod_globals) {
+                    if (g.value("has_schema", false)) continue;
+                    if (!has_non_schema) {
+                        fprintf(gfp, "# --- other globals (no schema fields) ---\n");
+                        has_non_schema = true;
+                    }
+                    fprintf(gfp, "%s::%s = %s (%s)\n",
+                            mod_name.c_str(),
+                            g.value("class", "?").c_str(),
+                            g.value("rva", "?").c_str(),
+                            g.value("type", "?").c_str());
+                    total_written++;
+                }
+                if (has_non_schema) fprintf(gfp, "\n");
             }
 
             // Pattern globals section
             if (data.contains("pattern_globals")) {
-                fprintf(gfp, "# === Pattern-scanned globals (from patterns.json) ===\n\n");
+                fprintf(gfp, "# ================================================================\n");
+                fprintf(gfp, "# Pattern-scanned globals (from patterns.json)\n");
+                fprintf(gfp, "# ================================================================\n\n");
                 for (const auto& [mod_name, mod_pats] : data["pattern_globals"].items()) {
                     if (!mod_pats.is_object()) continue;
                     for (const auto& [name, rva] : mod_pats.items()) {
@@ -1880,7 +2059,267 @@ int main(int argc, char* argv[]) {
             }
 
             fclose(gfp);
-            printf("  -> %s (%d entries)\n", globals_path.c_str(), total_written);
+            printf("  -> %s (%d entries, %d expanded with field trees)\n",
+                   globals_path.c_str(), total_written, schema_expanded);
+        }
+
+        // ---- access-paths.txt: schema globals only (the quick-reference) ----
+        if (schema_expanded > 0) {
+            std::string ap_path = output_dir + "\\_access-paths.txt";
+            FILE* apfp = fopen(ap_path.c_str(), "w");
+            if (apfp) {
+                fprintf(apfp, "# Dezlock Access Paths — Schema Global Offset Guide\n");
+                fprintf(apfp, "# Only globals with known schema classes, fully expanded.\n");
+                fprintf(apfp, "#\n");
+                fprintf(apfp, "# Legend:\n");
+                fprintf(apfp, "#   ->  pointer dereference (follow pointer, then read field)\n");
+                fprintf(apfp, "#   [embedded X, +0xN]  inline struct at that offset (add offsets)\n");
+                fprintf(apfp, "#   [handle -> X]  CHandle entity reference (resolve via entity list)\n");
+                fprintf(apfp, "#   (type, ClassName)  which parent class defines the field\n");
+                fprintf(apfp, "#\n");
+                fprintf(apfp, "# Quick grep examples:\n");
+                fprintf(apfp, "#   grep m_iHealth access-paths.txt\n");
+                fprintf(apfp, "#   grep m_vecAbsOrigin access-paths.txt\n");
+                fprintf(apfp, "#   grep \"CGameSceneNode\" access-paths.txt\n");
+                fprintf(apfp, "#\n\n");
+
+                int ap_count = 0;
+                for (const auto& [mod_name, mod_globals] : data["globals"].items()) {
+                    if (!mod_globals.is_array()) continue;
+
+                    bool has_schema = false;
+                    for (const auto& g : mod_globals) {
+                        if (!g.value("has_schema", false)) continue;
+
+                        if (!has_schema) {
+                            fprintf(apfp, "# ================================================================\n");
+                            fprintf(apfp, "# %s\n", mod_name.c_str());
+                            fprintf(apfp, "# ================================================================\n\n");
+                            has_schema = true;
+                        }
+
+                        std::string cls_name = g.value("class", "?");
+                        std::string rva = g.value("rva", "?");
+                        std::string type = g.value("type", "?");
+
+                        fprintf(apfp, "# %s @ %s+%s (%s)\n",
+                                cls_name.c_str(), mod_name.c_str(), rva.c_str(), type.c_str());
+
+                        auto cit = all_classes.find(cls_name);
+                        if (cit != all_classes.end() && !cit->second->inheritance.empty()) {
+                            fprintf(apfp, "# chain:");
+                            for (size_t i = 0; i < cit->second->inheritance.size(); i++) {
+                                fprintf(apfp, "%s%s", i ? " -> " : " ",
+                                        cit->second->inheritance[i].c_str());
+                            }
+                            fprintf(apfp, "\n");
+                        }
+
+                        if (cit != all_classes.end()) {
+                            TreeWriter tw{apfp, all_classes, 2};
+                            std::unordered_set<std::string> expanded;
+                            expanded.insert(cls_name);
+                            tw.write(cls_name, 0, expanded);
+                        }
+
+                        fprintf(apfp, "\n");
+                        ap_count++;
+                    }
+                }
+
+                fclose(apfp);
+                printf("  -> %s (%d schema globals with full field trees)\n",
+                       ap_path.c_str(), ap_count);
+            }
+        }
+    }
+
+    // ---- Entity field trees (_entity-paths.txt) ----
+    // Generate recursive field trees for all entity classes (anything inheriting
+    // CEntityInstance / C_BaseEntity / CBaseEntity). Same tree format as access-paths
+    // but covers every entity class the schema knows about.
+    {
+        // Collect entity classes grouped by module
+        struct EntityClass {
+            std::string module_name;
+            const ClassInfo* cls;
+        };
+        std::vector<EntityClass> entity_classes;
+
+        for (const auto& mod : modules) {
+            for (const auto& cls : mod.classes) {
+                // Check if this class inherits from any entity base
+                for (const auto& parent : cls.inheritance) {
+                    if (parent == "CEntityInstance" || parent == "C_BaseEntity" ||
+                        parent == "CBaseEntity" || parent == "CBasePlayerPawn" ||
+                        parent == "C_BasePlayerPawn") {
+                        entity_classes.push_back({mod.name, &cls});
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!entity_classes.empty()) {
+            // Build class lookup if not already done (reuse all_classes from globals section)
+            // all_classes may not exist if globals section was skipped
+            std::unordered_map<std::string, const ClassInfo*> ent_lookup;
+            for (const auto& mod : modules) {
+                for (const auto& cls : mod.classes) {
+                    ent_lookup[cls.name] = &cls;
+                }
+            }
+
+            std::string ep_path = output_dir + "\\_entity-paths.txt";
+            FILE* epfp = fopen(ep_path.c_str(), "w");
+            if (epfp) {
+                fprintf(epfp, "# Dezlock Entity Paths — Full Field Trees for Entity Classes\n");
+                fprintf(epfp, "# Every class inheriting CEntityInstance / C_BaseEntity, fully expanded.\n");
+                fprintf(epfp, "#\n");
+                fprintf(epfp, "# Legend:\n");
+                fprintf(epfp, "#   ->  pointer dereference (follow pointer, then read field)\n");
+                fprintf(epfp, "#   [embedded X, +0xN]  inline struct at that offset (add offsets)\n");
+                fprintf(epfp, "#   [handle -> X]  CHandle entity reference (resolve via entity list)\n");
+                fprintf(epfp, "#   (type, ClassName)  which parent class defines the field\n");
+                fprintf(epfp, "#\n");
+                fprintf(epfp, "# Example: grep C_CitadelPlayerPawn _entity-paths.txt\n");
+                fprintf(epfp, "#          grep m_iHealth _entity-paths.txt\n");
+                fprintf(epfp, "#          grep m_vecAbilities _entity-paths.txt\n");
+                fprintf(epfp, "#\n\n");
+
+                // Sort by module then class name
+                std::sort(entity_classes.begin(), entity_classes.end(),
+                    [](const EntityClass& a, const EntityClass& b) {
+                        if (a.module_name != b.module_name) return a.module_name < b.module_name;
+                        return a.cls->name < b.cls->name;
+                    });
+
+                std::string cur_module;
+                int ep_count = 0;
+
+                for (const auto& ec : entity_classes) {
+                    if (ec.module_name != cur_module) {
+                        cur_module = ec.module_name;
+                        fprintf(epfp, "# ================================================================\n");
+                        fprintf(epfp, "# %s\n", cur_module.c_str());
+                        fprintf(epfp, "# ================================================================\n\n");
+                    }
+
+                    const auto* cls = ec.cls;
+                    fprintf(epfp, "# %s (size=0x%X)\n", cls->name.c_str(), cls->size);
+
+                    if (!cls->inheritance.empty()) {
+                        fprintf(epfp, "# chain:");
+                        for (size_t i = 0; i < cls->inheritance.size(); i++) {
+                            fprintf(epfp, "%s%s", i ? " -> " : " ",
+                                    cls->inheritance[i].c_str());
+                        }
+                        fprintf(epfp, "\n");
+                    }
+
+                    // Reuse TreeWriter/FlatCollector from globals section
+                    // (they're local structs, so we redefine minimal versions here)
+                    struct FC {
+                        const std::unordered_map<std::string, const ClassInfo*>& lookup;
+                        std::vector<Field> result;
+                        void collect(const std::string& name, std::unordered_set<std::string>& visited) {
+                            if (visited.count(name)) return;
+                            visited.insert(name);
+                            auto it = lookup.find(name);
+                            if (it == lookup.end()) return;
+                            for (const auto& f : it->second->fields) {
+                                Field ff = f; ff.defined_in = name; result.push_back(ff);
+                            }
+                            if (!it->second->parent.empty()) collect(it->second->parent, visited);
+                        }
+                    };
+
+                    struct TW {
+                        FILE* fp;
+                        const std::unordered_map<std::string, const ClassInfo*>& lookup;
+                        int max_depth;
+                        bool is_ptr(const std::string& t) {
+                            std::string s = t;
+                            while (!s.empty() && s.back() == ' ') s.pop_back();
+                            return !s.empty() && s.back() == '*';
+                        }
+                        bool is_handle(const std::string& t) {
+                            return t.rfind("CHandle<", 0) == 0 || t.rfind("CHandle <", 0) == 0;
+                        }
+                        std::string extract_type(const std::string& t) {
+                            std::string s = t;
+                            while (!s.empty() && s.back() == '*') s.pop_back();
+                            while (!s.empty() && s.back() == ' ') s.pop_back();
+                            if (s.rfind("CHandle<", 0) == 0 || s.rfind("CHandle <", 0) == 0) {
+                                auto o = s.find('<'); auto c = s.rfind('>');
+                                if (o != std::string::npos && c != std::string::npos) {
+                                    std::string inner = s.substr(o+1, c-o-1);
+                                    while (!inner.empty() && inner.front() == ' ') inner.erase(inner.begin());
+                                    while (!inner.empty() && inner.back() == ' ') inner.pop_back();
+                                    return inner;
+                                }
+                            }
+                            return s;
+                        }
+                        void write(const std::string& class_name, int depth,
+                                   std::unordered_set<std::string>& expanded) {
+                            if (depth > max_depth) return;
+                            FC col{lookup, {}};
+                            std::unordered_set<std::string> visited;
+                            col.collect(class_name, visited);
+                            if (col.result.empty()) return;
+                            std::sort(col.result.begin(), col.result.end(),
+                                [](const Field& a, const Field& b) { return a.offset < b.offset; });
+                            std::string indent(depth * 10, ' ');
+                            for (const auto& f : col.result) {
+                                std::string bt = extract_type(f.type);
+                                bool expandable = lookup.count(bt) > 0 && !expanded.count(bt) && bt != class_name;
+                                if (is_ptr(f.type)) {
+                                    if (expandable) {
+                                        fprintf(fp, "%s  +0x%-4X %-30s -> %s\n",
+                                                indent.c_str(), f.offset, f.name.c_str(), f.type.c_str());
+                                        expanded.insert(bt);
+                                        write(bt, depth + 1, expanded);
+                                    } else {
+                                        fprintf(fp, "%s  +0x%-4X %-30s (%s)\n",
+                                                indent.c_str(), f.offset, f.name.c_str(), f.type.c_str());
+                                    }
+                                } else if (is_handle(f.type)) {
+                                    fprintf(fp, "%s  +0x%-4X %-30s [handle -> %s]\n",
+                                            indent.c_str(), f.offset, f.name.c_str(), bt.c_str());
+                                } else {
+                                    bool is_emb = lookup.count(f.type) > 0 && !expanded.count(f.type) && f.type != class_name;
+                                    if (is_emb) {
+                                        fprintf(fp, "%s  +0x%-4X %-30s [embedded %s, +0x%X]\n",
+                                                indent.c_str(), f.offset, f.name.c_str(), f.type.c_str(), f.offset);
+                                        expanded.insert(f.type);
+                                        write(f.type, depth + 1, expanded);
+                                    } else {
+                                        if (!f.defined_in.empty() && f.defined_in != class_name) {
+                                            fprintf(fp, "%s  +0x%-4X %-30s (%s, %s)\n",
+                                                    indent.c_str(), f.offset, f.name.c_str(), f.type.c_str(), f.defined_in.c_str());
+                                        } else {
+                                            fprintf(fp, "%s  +0x%-4X %-30s (%s)\n",
+                                                    indent.c_str(), f.offset, f.name.c_str(), f.type.c_str());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    TW tw{epfp, ent_lookup, 2};
+                    std::unordered_set<std::string> expanded;
+                    expanded.insert(cls->name);
+                    tw.write(cls->name, 0, expanded);
+                    fprintf(epfp, "\n");
+                    ep_count++;
+                }
+
+                fclose(epfp);
+                printf("  -> %s (%d entity classes with full field trees)\n",
+                       ep_path.c_str(), ep_count);
+            }
         }
     }
 
@@ -2006,8 +2445,8 @@ int main(int argc, char* argv[]) {
     con_color(CLR_DIM);
     con_print("  Quick start:\n");
     con_print("    grep m_iHealth %s\\client.txt\n", output_dir.c_str());
-    con_print("    grep MNetworkEnable %s\\client.txt\n", output_dir.c_str());
-    con_print("    grep EAbilitySlots %s\\client-enums.txt\n", output_dir.c_str());
+    con_print("    grep FLATTENED %s\\client.txt\n", output_dir.c_str());
+    con_print("    grep EAbilitySlots %s\\client.txt\n", output_dir.c_str());
     if (gen_signatures && sig_total > 0) {
         con_print("    grep CCitadelInput %s\\signatures\\client.txt\n", output_dir.c_str());
     }

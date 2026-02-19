@@ -22,12 +22,12 @@ For each module with schema data (e.g. `client.dll` → `client`), output is org
 
 | File | Format | Description |
 |------|--------|-------------|
-| `schema-dump/<game>/<module>.txt` | Greppable text | Every class + field with offsets and metadata |
-| `schema-dump/<game>/<module>-flat.txt` | Flattened text | Inherited fields resolved per entity class |
-| `schema-dump/<game>/<module>-enums.txt` | Greppable text | Every enum + enumerator values |
+| `schema-dump/<game>/<module>.txt` | Greppable text | Classes + flattened inherited fields + enums (all in one file) |
 | `schema-dump/<game>/<module>/hierarchy/` | Tree | Per-class files organized by inheritance |
-| `schema-dump/<game>/globals.txt` | Greppable text | Auto-discovered global singletons with `[schema]` tags |
-| `schema-dump/<game>/all-modules.json` | JSON | Full structured export for tooling (all modules) |
+| `schema-dump/<game>/_globals.txt` | Access guide | Global singletons with recursive field trees and pointer chains |
+| `schema-dump/<game>/_access-paths.txt` | Quick ref | Schema globals only — full offset paths for every field (the important stuff) |
+| `schema-dump/<game>/_entity-paths.txt` | Quick ref | Every entity class with full recursive field trees (C_CitadelPlayerPawn, etc.) |
+| `schema-dump/<game>/_all-modules.json` | JSON | Full structured export for tooling (all modules) |
 
 For signature generation (all modules with vtables):
 
@@ -101,11 +101,11 @@ dezlock-dump.exe
 # Find a field offset
 grep m_iHealth schema-dump/client.txt
 
-# Find all fields on a class (including inherited)
-grep "C_CitadelPlayerPawn\." schema-dump/client-flat.txt
+# Find all fields on a class (including inherited — in FLATTENED section)
+grep "C_CitadelPlayerPawn\." schema-dump/client.txt
 
-# Find an enum and its values
-grep EAbilitySlots schema-dump/client-enums.txt
+# Find an enum and its values (in ENUMS section)
+grep EAbilitySlots schema-dump/client.txt
 
 # Find networked fields
 grep MNetworkEnable schema-dump/client.txt
@@ -116,17 +116,17 @@ grep "= static" schema-dump/client.txt
 # Search across all modules
 grep -r m_iHealth schema-dump/*.txt
 
-# Find global singletons (schema-tagged = known field layouts)
-grep "\[schema\]" schema-dump/globals.txt
+# Quick offset lookup (schema globals with full field trees only)
+grep m_iHealth schema-dump/_access-paths.txt
 
 # Find a specific system's global pointer
-grep CGameEntitySystem schema-dump/globals.txt
+grep CGameEntitySystem schema-dump/_globals.txt
 
 # Get the full class layout
 cat schema-dump/hierarchy/C_BaseEntity/C_CitadelPlayerPawn.txt
 
 # Generate pattern signatures
-python generate-signatures.py --json bin/schema-dump/all-modules.json
+python generate-signatures.py --json bin/schema-dump/_all-modules.json
 
 # Find a signature for a specific class
 grep CCitadelInput bin/schema-dump/signatures/client.txt
@@ -146,23 +146,36 @@ dezlock-dump automatically finds global singleton instances by scanning `.data` 
 
 ### Output
 
-`globals.txt` — greppable, `[schema]`-tagged entries sorted first per module:
+`_globals.txt` — a complete access guide. Schema-tagged globals get **recursive field trees** showing every field you can reach, with pointer chains expanded up to 3 levels deep:
 
 ```
-# --- client.dll (898 globals, 10 with schema) ---
-
-client.dll::C_CSGameRules = 0x2308DA0 (pointer) [schema]
-client.dll::C_CSPlayerPawn = 0x2064AE0 (pointer) [schema]
-client.dll::C_CSPlayerResource = 0x22EA6D0 (pointer) [schema]
-client.dll::C_CSTeam = 0x1FC7248 (pointer) [schema]
-client.dll::C_World = 0x22FE478 (pointer) [schema]
-client.dll::CGamePortraitWorldSystem = 0x1F9D2E0 (pointer)
-client.dll::CUIRootGameSystem = 0x1F9D400 (pointer)
+# C_CSPlayerPawn @ client.dll+0x2064AE0 (pointer) [schema]
+# chain: C_CSPlayerPawn -> C_CSPlayerPawnBase -> ... -> C_BaseEntity -> CEntityInstance
+  +0x10   m_pEntity                      -> CEntityIdentity*
+            +0x18   m_name                         (CUtlSymbolLarge)
+            +0x20   m_designerName                 (CUtlSymbolLarge)
+  +0x38   m_CBodyComponent               -> CBodyComponent*
+            +0x8    m_pSceneNode                   -> CGameSceneNode*
+                      +0xC8   m_vecAbsOrigin                 (VectorWS)
+                      +0x10B  m_bDormant                     (bool)
+  +0x2D8  m_iHealth                      (int32, CBaseEntity)
+  +0x344  m_iTeamNum                     (uint8, CBaseEntity)
+  +0x3D8  m_pCollision                   -> CCollisionProperty*
+            +0x40   m_vecMins                      (Vector)
+            +0x4C   m_vecMaxs                      (Vector)
 ```
 
-`[schema]` = class exists in SchemaSystem with known field layouts — these are the globals modders can read useful data from. Non-schema globals are still listed for completeness.
+Legend:
+- `->` = pointer dereference (follow pointer, then read sub-fields at shown offsets)
+- `[embedded X, +0xN]` = struct is inline at that offset (add offsets together)
+- `[handle -> X]` = CHandle entity reference (resolve via entity list)
+- `(type, ClassName)` = which parent class defines the field
 
-The JSON export (`all-modules.json`) includes the full globals section:
+Non-schema globals are still listed as simple entries in `_globals.txt` for completeness.
+
+**`_access-paths.txt`** — the same schema globals with field trees, but *nothing else*. No non-schema noise, no module clutter. Open this file when you just want to grep an offset path fast.
+
+The JSON export (`_all-modules.json`) includes the full globals section:
 
 ```json
 "globals": {
@@ -202,16 +215,16 @@ Each vtable function's first **128 bytes** are captured at dump time (SEH-protec
 
 ```bash
 # Generate signatures for all modules (58+ DLLs)
-python generate-signatures.py --json bin/schema-dump/all-modules.json
+python generate-signatures.py --json bin/schema-dump/_all-modules.json
 
 # Filter to a specific class
-python generate-signatures.py --json bin/schema-dump/all-modules.json --class CCitadelInput
+python generate-signatures.py --json bin/schema-dump/_all-modules.json --class CCitadelInput
 
 # Filter to a specific module
-python generate-signatures.py --json bin/schema-dump/all-modules.json --module client.dll
+python generate-signatures.py --json bin/schema-dump/_all-modules.json --module client.dll
 
 # Require longer patterns (default: 6 bytes minimum)
-python generate-signatures.py --json bin/schema-dump/all-modules.json --min-length 8
+python generate-signatures.py --json bin/schema-dump/_all-modules.json --min-length 8
 ```
 
 ### Output
@@ -269,8 +282,8 @@ auto addr = pattern_scan(panorama_dll, "48 89 5C 24 08 57 48 83 EC 20 48 8B DA 4
 ```bash
 # After running dezlock-dump.exe
 python import-schema.py --game deadlock
-python import-schema.py --game cs2 --json path/to/all-modules.json
-python import-schema.py --game dota2 --json path/to/all-modules.json
+python import-schema.py --game cs2 --json path/to/_all-modules.json
+python import-schema.py --game dota2 --json path/to/_all-modules.json
 ```
 
 Output goes to `generated/<game>/` by default (e.g. `generated/deadlock/`, `generated/cs2/`).
@@ -406,7 +419,7 @@ This includes **RTTI-only classes** that have no schema entry — things like `C
 10. **Pass 5 — Global discovery**: scans writable `.data` sections of every module, cross-references 8-byte values against the vtable catalog (direct match = static object, indirect dereference = pointer to heap singleton), tags results with `has_schema`
 11. **Optional**: supplementary pattern scan from `patterns.json` for untyped globals (dwViewMatrix, etc.)
 12. Exports JSON to `%TEMP%`, signals completion via marker file
-13. Main exe reads JSON and generates all output formats per module, including `globals.txt`
+13. Main exe reads JSON and generates consolidated `<module>.txt` (classes + flattened + enums), `_globals.txt` (all globals + recursive field trees), `_access-paths.txt` (schema globals only), and `_entity-paths.txt` (every entity class with full field trees)
 14. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
 15. **Optional**: `--headers` generates C++ SDK headers with padded structs
 16. Worker auto-unloads via `FreeLibraryAndExitThread`
@@ -427,36 +440,35 @@ Single linear scan of .rdata section:
 
 ## Output Format
 
-### Greppable text (`client.txt`)
+### Module text (`client.txt`)
+
+One file per module with three sections — classes, flattened, and enums:
 
 ```
+# ================================================================
+# CLASSES — own fields per class
+# ================================================================
+
 # --- C_BaseEntity (size=0x560, parent=CEntityInstance)
-#     metadata: [MNetworkVarNames]
 #     chain: C_BaseEntity -> CEntityInstance -> CEntityComponent
 C_BaseEntity.m_iHealth = 0x354 (int32, 4) [MNetworkEnable] [MNetworkChangeCallback]
 C_BaseEntity.m_iMaxHealth = 0x350 (int32, 4) [MNetworkEnable]
-C_BaseEntity.m_iTeamNum = 0x3F3 (uint8, 1) [MNetworkEnable]
-C_BaseEntity.s_bDebugPrint = static (bool, 1)
-```
 
-### Flattened (`client-flat.txt`)
+# ================================================================
+# FLATTENED — full memory layout (own + inherited fields)
+# ================================================================
 
-Shows all fields on entity classes with their defining parent class:
-
-```
 # === C_CitadelPlayerPawn (size=0x1800, 156 total fields) ===
 C_CitadelPlayerPawn.m_iHealth = 0x354 (int32, 4, C_BaseEntity)
 C_CitadelPlayerPawn.m_hPawn = 0x6BC (CHandle, 4, CBasePlayerController)
-```
 
-### Enums (`client-enums.txt`)
+# ================================================================
+# ENUMS — 4 enum definitions
+# ================================================================
 
-```
 # --- EAbilitySlots_t (size=4 bytes, 23 values)
 EAbilitySlots_t::ESlot_Signature_1 = 0
 EAbilitySlots_t::ESlot_Signature_2 = 1
-EAbilitySlots_t::ESlot_Signature_3 = 2
-EAbilitySlots_t::ESlot_Signature_4 = 3
 ```
 
 ### Hierarchy tree (`hierarchy/_index.txt`)
@@ -469,7 +481,7 @@ CEntityComponent (0x8, 0 fields)
             `-- C_CitadelPlayerPawn (0x1800, 31 fields)
 ```
 
-### JSON (`all-modules.json`)
+### JSON (`_all-modules.json`)
 
 ```json
 {
