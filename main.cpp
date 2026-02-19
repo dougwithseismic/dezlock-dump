@@ -3,7 +3,7 @@
  *
  * Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>]
  *
- * 1. Finds target Source 2 process (default: deadlock.exe)
+ * 1. Interactive game selection (or --process to skip menu)
  * 2. Injects dezlock-worker.dll via manual-map (PE mapping + shellcode)
  * 3. Waits for the worker to finish (writes JSON to %TEMP%)
  * 4. Reads JSON and generates output files:
@@ -1419,7 +1419,7 @@ int main(int argc, char* argv[]) {
 
     // Parse args (early pass — need process name for banner)
     std::string output_dir;
-    std::string target_process = "deadlock.exe";
+    std::string target_process;  // empty = interactive selection
     int timeout_sec = 30;
     bool gen_headers = false;
     bool gen_signatures = false;
@@ -1440,15 +1440,136 @@ int main(int argc, char* argv[]) {
             gen_all = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]\n\n");
-            con_print("  --process     Target process name (default: deadlock.exe)\n");
+            con_print("  --process     Target process name (skips game selection menu)\n");
             con_print("                Examples: --process cs2.exe, --process dota2.exe\n");
-            con_print("  --output      Output directory (default: schema-dump/ next to exe)\n");
+            con_print("  --output      Output directory (default: schema-dump/<game>/ next to exe)\n");
             con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
             con_print("  --headers     Generate C++ SDK headers (structs, enums, offsets)\n");
             con_print("  --signatures  Generate byte pattern signatures from vtable functions\n");
             con_print("  --all         Enable all generators (headers + signatures)\n");
             wait_for_keypress();
             return 0;
+        }
+    }
+
+    // Banner (shown before game selection)
+    SetConsoleTitleA("dezlock-dump - Source 2 Schema Extractor");
+
+    con_print("\n");
+    con_color(CLR_TITLE);
+    con_print("  dezlock-dump");
+    con_color(CLR_DIM);
+    con_print("  v1.2.0\n");
+    con_color(CLR_DEFAULT);
+    con_print("  Runtime schema + RTTI extraction for Source 2 games\n");
+    con_color(CLR_DIM);
+    con_print("  https://github.com/dougwithseismic/dezlock-dump\n");
+    con_color(CLR_DEFAULT);
+    con_print("\n");
+
+    // ---- Interactive game selection (when --process not provided) ----
+    if (target_process.empty()) {
+        struct GameOption {
+            const char* label;
+            const char* process;
+            const wchar_t* process_w;
+        };
+        GameOption known_games[] = {
+            {"Deadlock",  "deadlock.exe", L"deadlock.exe"},
+            {"CS2",       "cs2.exe",      L"cs2.exe"},
+            {"Dota 2",    "dota2.exe",    L"dota2.exe"},
+        };
+        constexpr int NUM_KNOWN = 3;
+
+        // Auto-detect which games are running
+        bool running[NUM_KNOWN] = {};
+        int auto_pick = -1;
+        int running_count = 0;
+        for (int i = 0; i < NUM_KNOWN; i++) {
+            if (find_process(known_games[i].process_w)) {
+                running[i] = true;
+                auto_pick = i;
+                running_count++;
+            }
+        }
+
+        // If exactly one game is running, auto-select it
+        if (running_count == 1) {
+            target_process = known_games[auto_pick].process;
+            con_color(CLR_OK);
+            con_print("  AUTO ");
+            con_color(CLR_DEFAULT);
+            con_print("Detected %s running — auto-selecting.\n\n", known_games[auto_pick].label);
+        } else {
+            // Show menu
+            con_print("  Select a game to dump:\n\n");
+
+            for (int i = 0; i < NUM_KNOWN; i++) {
+                con_color(CLR_TITLE);
+                con_print("    [%d] ", i + 1);
+                con_color(CLR_DEFAULT);
+                con_print("%-12s", known_games[i].label);
+                if (running[i]) {
+                    con_color(CLR_OK);
+                    con_print("  (running)");
+                    con_color(CLR_DEFAULT);
+                }
+                con_print("\n");
+            }
+
+            con_color(CLR_TITLE);
+            con_print("    [%d] ", NUM_KNOWN + 1);
+            con_color(CLR_DEFAULT);
+            con_print("Other (enter process name)\n");
+
+            con_print("\n  > ");
+
+            // Read input
+            HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
+            char input_buf[256] = {};
+            DWORD chars_read = 0;
+            ReadConsoleA(hInput, input_buf, sizeof(input_buf) - 1, &chars_read, nullptr);
+
+            // Trim newline
+            for (DWORD i = 0; i < chars_read; i++) {
+                if (input_buf[i] == '\r' || input_buf[i] == '\n') {
+                    input_buf[i] = '\0';
+                    break;
+                }
+            }
+
+            int choice = atoi(input_buf);
+            if (choice >= 1 && choice <= NUM_KNOWN) {
+                target_process = known_games[choice - 1].process;
+            } else if (choice == NUM_KNOWN + 1) {
+                // Custom process name
+                con_print("  Enter process name (e.g. game.exe): ");
+                char custom_buf[256] = {};
+                DWORD custom_read = 0;
+                ReadConsoleA(hInput, custom_buf, sizeof(custom_buf) - 1, &custom_read, nullptr);
+                for (DWORD i = 0; i < custom_read; i++) {
+                    if (custom_buf[i] == '\r' || custom_buf[i] == '\n') {
+                        custom_buf[i] = '\0';
+                        break;
+                    }
+                }
+                target_process = custom_buf;
+                if (target_process.empty()) {
+                    con_fail("No process name entered.");
+                    wait_for_keypress();
+                    return 1;
+                }
+                // Append .exe if not present
+                if (target_process.find('.') == std::string::npos) {
+                    target_process += ".exe";
+                }
+            } else {
+                con_fail("Invalid selection.");
+                wait_for_keypress();
+                return 1;
+            }
+
+            con_print("\n");
         }
     }
 
@@ -1460,23 +1581,11 @@ int main(int argc, char* argv[]) {
         if (!game_display.empty()) game_display[0] = toupper(game_display[0]);
     }
 
-    // Set console title
+    // Update console title with selected game
     {
         std::string title = "dezlock-dump - " + game_display + " Schema Extractor";
         SetConsoleTitleA(title.c_str());
     }
-
-    con_print("\n");
-    con_color(CLR_TITLE);
-    con_print("  dezlock-dump");
-    con_color(CLR_DIM);
-    con_print("  v1.1.0\n");
-    con_color(CLR_DEFAULT);
-    con_print("  Runtime schema + RTTI extraction for %s (Source 2)\n", game_display.c_str());
-    con_color(CLR_DIM);
-    con_print("  https://github.com/dougwithseismic/dezlock-dump\n");
-    con_color(CLR_DEFAULT);
-    con_print("\n");
 
     // --all enables everything
     if (gen_all) {
