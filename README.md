@@ -16,15 +16,15 @@ No source2gen required — reads directly from the game's `SchemaSystem` and MSV
 
 ## Output
 
-For each module with schema data (e.g. `client.dll` → `client`):
+For each module with schema data (e.g. `client.dll` → `client`), output is organized per-game:
 
 | File | Format | Description |
 |------|--------|-------------|
-| `schema-dump/<module>.txt` | Greppable text | Every class + field with offsets and metadata |
-| `schema-dump/<module>-flat.txt` | Flattened text | Inherited fields resolved per entity class |
-| `schema-dump/<module>-enums.txt` | Greppable text | Every enum + enumerator values |
-| `schema-dump/<module>/hierarchy/` | Tree | Per-class files organized by inheritance |
-| `schema-dump/all-modules.json` | JSON | Full structured export for tooling (all modules) |
+| `schema-dump/<game>/<module>.txt` | Greppable text | Every class + field with offsets and metadata |
+| `schema-dump/<game>/<module>-flat.txt` | Flattened text | Inherited fields resolved per entity class |
+| `schema-dump/<game>/<module>-enums.txt` | Greppable text | Every enum + enumerator values |
+| `schema-dump/<game>/<module>/hierarchy/` | Tree | Per-class files organized by inheritance |
+| `schema-dump/<game>/all-modules.json` | JSON | Full structured export for tooling (all modules) |
 
 For signature generation (all modules with vtables):
 
@@ -54,7 +54,7 @@ dezlock-dump.exe --process cs2.exe --all
 dezlock-dump.exe --process dota2.exe --all
 ```
 
-This dumps schema + generates SDK headers + pattern signatures in one shot. Output lands in `schema-dump/` next to the exe.
+This dumps schema + generates SDK headers + pattern signatures in one shot. Output lands in `schema-dump/<game>/` next to the exe (e.g. `schema-dump/deadlock/`, `schema-dump/cs2/`).
 
 ### Build from Source
 
@@ -75,7 +75,7 @@ dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--heade
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--process <name>` | `deadlock.exe` | Target process (e.g. `cs2.exe`, `dota2.exe`) |
-| `--output <dir>` | `schema-dump/` next to exe | Output directory |
+| `--output <dir>` | `schema-dump/<game>/` next to exe | Output directory (auto per-game) |
 | `--wait <seconds>` | `30` | Max time to wait for worker DLL |
 | `--headers` | off | Generate C++ SDK headers (structs, enums, offsets) |
 | `--signatures` | off | Generate byte pattern signatures (requires Python 3) |
@@ -209,7 +209,11 @@ auto addr = pattern_scan(panorama_dll, "48 89 5C 24 08 57 48 83 EC 20 48 8B DA 4
 ```bash
 # After running dezlock-dump.exe
 python import-schema.py --game deadlock
+python import-schema.py --game cs2 --json path/to/all-modules.json
+python import-schema.py --game dota2 --json path/to/all-modules.json
 ```
+
+Output goes to `generated/<game>/` by default (e.g. `generated/deadlock/`, `generated/cs2/`).
 
 ### Generated Files
 
@@ -330,7 +334,7 @@ This includes **RTTI-only classes** that have no schema entry — things like `C
 ## How It Works
 
 1. Finds target process (default: `deadlock.exe`, configurable via `--process`)
-2. Injects `dezlock-worker.dll` via `CreateRemoteThread` + `LoadLibraryA`
+2. Manual-maps `dezlock-worker.dll` into the target process (PE mapping, relocations, import resolution, SEH registration — no `LoadLibraryA` call)
 3. Worker auto-discovers all loaded modules with schema data via `EnumProcessModules`
 4. For each schema module, walks `SchemaSystem_001` — enumerates classes (CUtlTSHash at +0x0560) and enums (+0x0BE8)
 5. Reads field metadata, class metadata, and static fields from each class
