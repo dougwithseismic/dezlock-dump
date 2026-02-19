@@ -56,6 +56,8 @@ dezlock-dump.exe --process dota2.exe --all
 
 This dumps schema + generates SDK headers + pattern signatures in one shot. Output lands in `schema-dump/<game>/` next to the exe (e.g. `schema-dump/deadlock/`, `schema-dump/cs2/`).
 
+> **Note:** The schema dump itself finishes in seconds, but SDK header generation (`--headers`) and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions across 58+ DLLs. Let it run, don't close the window early.
+
 ### Build from Source
 
 Requires Visual Studio 2022 (any edition with C++ desktop workload).
