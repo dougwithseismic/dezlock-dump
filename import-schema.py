@@ -1131,18 +1131,22 @@ def main():
         classes = mod.get("classes", [])
         enums = mod.get("enums", [])
 
-        if not classes and not enums:
+        # Filter to classes that actually have fields worth generating
+        useful_classes = [c for c in classes if c["size"] > 0 and c.get("fields")]
+        has_content = bool(useful_classes) or bool(enums)
+
+        if not has_content:
             continue
 
         module_names.append(mod_name)
 
-        # Ensure module directory exists (offsets, enums, and structs all go here)
+        # Create module directory only when there's actual content
         mod_dir = out_dir / mod_name
         mod_dir.mkdir(exist_ok=True)
 
-        # Per-module offset constants
-        if classes:
-            offsets_content = generate_module_offsets(classes, mod["name"], args.game, timestamp)
+        # Per-module offset constants (only if classes have fields)
+        if useful_classes:
+            offsets_content = generate_module_offsets(useful_classes, mod["name"], args.game, timestamp)
             offsets_path = mod_dir / "_offsets.hpp"
             offsets_path.write_text(offsets_content, encoding="utf-8")
 
@@ -1153,28 +1157,19 @@ def main():
             enums_path.write_text(enums_content, encoding="utf-8")
 
         # Per-class struct headers
-        if classes:
+        mod_count = 0
+        for cls in sorted(useful_classes, key=lambda c: c["name"]):
+            header = generate_struct_header(
+                cls, mod["name"], global_lookup, class_to_module, timestamp
+            )
+            safe_name = safe_class_name(cls["name"])
+            filepath = mod_dir / f"{safe_name}.hpp"
+            filepath.write_text(header, encoding="utf-8")
+            mod_count += 1
 
-            mod_count = 0
-            for cls in sorted(classes, key=lambda c: c["name"]):
-                if cls["size"] <= 0:
-                    continue
-                if not cls.get("fields"):
-                    continue
+        total_structs += mod_count
 
-                header = generate_struct_header(
-                    cls, mod["name"], global_lookup, class_to_module, timestamp
-                )
-                safe_name = safe_class_name(cls["name"])
-                filepath = mod_dir / f"{safe_name}.hpp"
-                filepath.write_text(header, encoding="utf-8")
-                mod_count += 1
-
-            total_structs += mod_count
-
-        enum_count = len(enums) if enums else 0
-        cls_count = len([c for c in classes if c["size"] > 0 and c.get("fields")]) if classes else 0
-        print(f"  {mod['name']:30s}  {cls_count:4d} structs, {enum_count:4d} enums")
+        print(f"  {mod['name']:30s}  {mod_count:4d} structs, {len(enums):4d} enums")
 
     # 3. Consolidated includes
     if module_names:
