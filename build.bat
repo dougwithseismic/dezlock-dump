@@ -41,6 +41,8 @@ set "WORKER_SRC=!TOOL_DIR!\worker.cpp"
 set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\schema-manager.cpp"
 set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\rtti-hierarchy.cpp"
 set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\log.cpp"
+set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\global-scanner.cpp"
+set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\pattern-scanner.cpp"
 
 set "CFLAGS=/nologo /std:c++17 /O2 /MP /MT /EHsc /W3 /DUNICODE /D_UNICODE"
 set "CFLAGS=!CFLAGS! /I"!TOOL_DIR!""
@@ -66,6 +68,12 @@ if errorlevel 1 (
     exit /b 1
 )
 echo   Built: dezlock-dump.exe
+
+:: Copy patterns config to bin/
+if exist "!TOOL_DIR!\patterns.json" (
+    copy /Y "!TOOL_DIR!\patterns.json" "!OUTPUT_DIR!\patterns.json" >nul
+    echo   Copied: patterns.json
+)
 
 :: Clean up obj files
 del /q *.obj 2>nul

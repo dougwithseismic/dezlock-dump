@@ -8,11 +8,13 @@
 
 ---
 
-Runtime schema + RTTI + vtable + signature extraction tool for Source 2 games (Deadlock, CS2, Dota 2). Injects a minimal worker DLL into a running game process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, **every virtual function table**, and **pattern signatures** for all virtual functions.
+Runtime schema + RTTI + vtable + global singleton + signature extraction tool for Source 2 games (Deadlock, CS2, Dota 2). Injects a minimal worker DLL into a running game process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, **every virtual function table**, **global singleton instances**, and **pattern signatures** for all virtual functions.
 
 No source2gen required — reads directly from the game's `SchemaSystem` and MSVC x64 RTTI at runtime.
 
 **Scans every loaded DLL** — walks all modules for schema data (client.dll, server.dll, engine2.dll, etc.) and RTTI vtables (panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, and 50+ more).
+
+**Auto-discovers global singletons** — scans `.data` sections of every loaded module and cross-references against the RTTI vtable catalog to find every typed singleton instance. No hardcoded patterns — globals are discovered automatically from the same data the tool already collects.
 
 ## Output
 
@@ -24,6 +26,7 @@ For each module with schema data (e.g. `client.dll` → `client`), output is org
 | `schema-dump/<game>/<module>-flat.txt` | Flattened text | Inherited fields resolved per entity class |
 | `schema-dump/<game>/<module>-enums.txt` | Greppable text | Every enum + enumerator values |
 | `schema-dump/<game>/<module>/hierarchy/` | Tree | Per-class files organized by inheritance |
+| `schema-dump/<game>/globals.txt` | Greppable text | Auto-discovered global singletons with `[schema]` tags |
 | `schema-dump/<game>/all-modules.json` | JSON | Full structured export for tooling (all modules) |
 
 For signature generation (all modules with vtables):
@@ -113,6 +116,12 @@ grep "= static" schema-dump/client.txt
 # Search across all modules
 grep -r m_iHealth schema-dump/*.txt
 
+# Find global singletons (schema-tagged = known field layouts)
+grep "\[schema\]" schema-dump/globals.txt
+
+# Find a specific system's global pointer
+grep CGameEntitySystem schema-dump/globals.txt
+
 # Get the full class layout
 cat schema-dump/hierarchy/C_BaseEntity/C_CitadelPlayerPawn.txt
 
@@ -122,6 +131,50 @@ python generate-signatures.py --json bin/schema-dump/all-modules.json
 # Find a signature for a specific class
 grep CCitadelInput bin/schema-dump/signatures/client.txt
 ```
+
+## Global Singleton Discovery
+
+dezlock-dump automatically finds global singleton instances by scanning `.data` sections of every loaded module and cross-referencing pointer values against the RTTI vtable catalog. No hardcoded patterns or config files needed — it uses the same vtable data the tool already collects.
+
+### How It Works
+
+1. Builds a map of every known vtable address from the RTTI scan (18,000+ classes)
+2. Walks writable `.data` sections of each module (8-byte aligned)
+3. **Direct match**: value at address IS a known vtable → object lives in `.data` (static global)
+4. **Indirect match**: value is a pointer, dereference it, check if the pointed-to object's vtable is known → pointer to heap-allocated singleton
+5. Tags each result with `has_schema` — whether the class has SchemaSystem field data (known layout)
+
+### Output
+
+`globals.txt` — greppable, `[schema]`-tagged entries sorted first per module:
+
+```
+# --- client.dll (898 globals, 10 with schema) ---
+
+client.dll::C_CSGameRules = 0x2308DA0 (pointer) [schema]
+client.dll::C_CSPlayerPawn = 0x2064AE0 (pointer) [schema]
+client.dll::C_CSPlayerResource = 0x22EA6D0 (pointer) [schema]
+client.dll::C_CSTeam = 0x1FC7248 (pointer) [schema]
+client.dll::C_World = 0x22FE478 (pointer) [schema]
+client.dll::CGamePortraitWorldSystem = 0x1F9D2E0 (pointer)
+client.dll::CUIRootGameSystem = 0x1F9D400 (pointer)
+```
+
+`[schema]` = class exists in SchemaSystem with known field layouts — these are the globals modders can read useful data from. Non-schema globals are still listed for completeness.
+
+The JSON export (`all-modules.json`) includes the full globals section:
+
+```json
+"globals": {
+  "client.dll": [
+    {"class": "C_CSGameRules", "rva": "0x2308DA0", "vtable_rva": "0x1F9C2A8", "type": "pointer", "has_schema": true}
+  ]
+}
+```
+
+### Supplementary Pattern Scanning
+
+An optional `patterns.json` file can be placed next to the exe for supplementary pattern-based global resolution. This covers untyped globals that vtable scanning can't find (e.g. `dwViewMatrix`, `dwBuildNumber`, `dwWindowWidth`). If present, results appear in a separate `"pattern_globals"` section in the JSON.
 
 ## Signature Generation
 
@@ -307,6 +360,7 @@ The type resolver maps schema types to proper C++ types across 10 categories:
 | Enums | SchemaEnumInfoData_t | ~24 |
 | RTTI classes | MSVC x64 TypeDescriptor (all DLLs) | ~23,000 |
 | Vtables | RTTI COL → .rdata scan (58 DLLs) | ~23,000 |
+| Global singletons | .data vtable cross-reference | ~10,000 (~30 with schema) |
 | Virtual functions | .text pointer entries | ~839,000 |
 | Function bytes | 128 bytes per function prologue | ~839,000 |
 | Hookable signatures | Module-unique + class-unique | ~359,000 (76%) |
@@ -349,11 +403,13 @@ This includes **RTTI-only classes** that have no schema entry — things like `C
 7. **Full DLL scan**: enumerates ALL loaded DLLs and RTTI-scans any not already covered (catches panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, etc. — skips Windows system DLLs)
 8. **Pass 4 — Vtable discovery**: scans `.rdata` for pointers to COL structures (vtable[-1]), reads consecutive `.text`-pointing entries as virtual function addresses
 9. **Function bytes**: reads 128 bytes from each function's prologue (SEH-protected) for signature generation
-10. Exports JSON to `%TEMP%`, signals completion via marker file
-11. Main exe reads JSON and generates all output formats per module
-12. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
-13. **Optional**: `--headers` generates C++ SDK headers with padded structs
-14. Worker auto-unloads via `FreeLibraryAndExitThread`
+10. **Pass 5 — Global discovery**: scans writable `.data` sections of every module, cross-references 8-byte values against the vtable catalog (direct match = static object, indirect dereference = pointer to heap singleton), tags results with `has_schema`
+11. **Optional**: supplementary pattern scan from `patterns.json` for untyped globals (dwViewMatrix, etc.)
+12. Exports JSON to `%TEMP%`, signals completion via marker file
+13. Main exe reads JSON and generates all output formats per module, including `globals.txt`
+14. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
+15. **Optional**: `--headers` generates C++ SDK headers with padded structs
+16. Worker auto-unloads via `FreeLibraryAndExitThread`
 
 ### Vtable Discovery Detail
 
@@ -452,7 +508,7 @@ CCitadelInput::idx_8  48 89 5C 24 08 ...  [DUP]  # shared: CInput::idx_8
 
 ## Why Not source2gen?
 
-source2gen works great but requires building and injecting a separate loader, generates thousands of SDK header files you then have to parse, and doesn't give you vtables or RTTI inheritance. dezlock-dump gives you one JSON file with everything — schema + RTTI + vtables + signatures — in ~2 seconds. Use whatever fits your workflow.
+source2gen works great but requires building and injecting a separate loader, generates thousands of SDK header files you then have to parse, and doesn't give you vtables, RTTI inheritance, or global pointers. dezlock-dump gives you one JSON file with everything — schema + RTTI + vtables + globals + signatures — in ~2 seconds. Use whatever fits your workflow.
 
 ## Contributing
 
@@ -460,10 +516,6 @@ Contributions are welcome! Feel free to:
 
 - Open an [issue](../../issues) for bugs, feature requests, or offset discrepancies
 - Submit a [pull request](../../pulls) with improvements
-
-## License
-
-[MIT](LICENSE)
 
 ---
 

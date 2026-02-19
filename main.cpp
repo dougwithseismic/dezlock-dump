@@ -1693,11 +1693,21 @@ int main(int argc, char* argv[]) {
     char temp_dir[MAX_PATH];
     GetTempPathA(MAX_PATH, temp_dir);
 
-    char json_path[MAX_PATH], done_path[MAX_PATH];
+    char json_path[MAX_PATH], done_path[MAX_PATH], patterns_temp[MAX_PATH];
     snprintf(json_path, MAX_PATH, "%sdezlock-export.json", temp_dir);
     snprintf(done_path, MAX_PATH, "%sdezlock-done", temp_dir);
+    snprintf(patterns_temp, MAX_PATH, "%sdezlock-patterns.json", temp_dir);
     DeleteFileA(done_path);
     DeleteFileA(json_path);
+
+    // Copy patterns.json to %TEMP% for supplementary pattern scan (optional)
+    {
+        char patterns_src[MAX_PATH];
+        snprintf(patterns_src, MAX_PATH, "%spatterns.json", exe_path);
+        if (GetFileAttributesA(patterns_src) != INVALID_FILE_ATTRIBUTES) {
+            CopyFileA(patterns_src, patterns_temp, FALSE);
+        }
+    }
 
     {
         std::string step_msg = "Extracting schema from " + game_display + "...";
@@ -1812,6 +1822,68 @@ int main(int argc, char* argv[]) {
     std::string json_out = output_dir + "\\all-modules.json";
     CopyFileA(json_path, json_out.c_str(), FALSE);
 
+    // ---- Globals text output ----
+    if (data.contains("globals")) {
+        std::string globals_path = output_dir + "\\globals.txt";
+        FILE* gfp = fopen(globals_path.c_str(), "w");
+        if (gfp) {
+            fprintf(gfp, "# Dezlock Global Singleton Discovery\n");
+            fprintf(gfp, "# Auto-discovered by scanning .data sections against RTTI vtable catalog\n");
+            fprintf(gfp, "# Format: module::ClassName = 0xRVA (type) [schema]\n");
+            fprintf(gfp, "# [schema] = class has SchemaSystem fields (known layout, useful for modding)\n");
+            fprintf(gfp, "#\n\n");
+
+            int total_written = 0;
+            for (const auto& [mod_name, mod_globals] : data["globals"].items()) {
+                if (!mod_globals.is_array() || mod_globals.empty()) continue;
+
+                // Count schema vs total for this module
+                int mod_schema = 0;
+                for (const auto& g : mod_globals) {
+                    if (g.value("has_schema", false)) mod_schema++;
+                }
+                fprintf(gfp, "# --- %s (%d globals, %d with schema) ---\n\n",
+                        mod_name.c_str(), (int)mod_globals.size(), mod_schema);
+
+                // Schema globals first, then the rest
+                for (int pass = 0; pass < 2; pass++) {
+                    for (const auto& g : mod_globals) {
+                        bool has_schema = g.value("has_schema", false);
+                        if (pass == 0 && !has_schema) continue;
+                        if (pass == 1 && has_schema) continue;
+
+                        fprintf(gfp, "%s::%s = %s (%s)%s\n",
+                                mod_name.c_str(),
+                                g.value("class", "?").c_str(),
+                                g.value("rva", "?").c_str(),
+                                g.value("type", "?").c_str(),
+                                has_schema ? " [schema]" : "");
+                        total_written++;
+                    }
+                }
+                fprintf(gfp, "\n");
+            }
+
+            // Pattern globals section
+            if (data.contains("pattern_globals")) {
+                fprintf(gfp, "# === Pattern-scanned globals (from patterns.json) ===\n\n");
+                for (const auto& [mod_name, mod_pats] : data["pattern_globals"].items()) {
+                    if (!mod_pats.is_object()) continue;
+                    for (const auto& [name, rva] : mod_pats.items()) {
+                        fprintf(gfp, "%s::%s = %s (pattern)\n",
+                                mod_name.c_str(), name.c_str(),
+                                rva.get<std::string>().c_str());
+                        total_written++;
+                    }
+                }
+                fprintf(gfp, "\n");
+            }
+
+            fclose(gfp);
+            printf("  -> %s (%d entries)\n", globals_path.c_str(), total_written);
+        }
+    }
+
     // ---- Signature generation (optional) ----
     int sig_unique = 0, sig_total = 0;
     if (gen_signatures) {
@@ -1888,6 +1960,7 @@ int main(int argc, char* argv[]) {
 
     // Clean up temp files
     DeleteFileA(done_path);
+    DeleteFileA(patterns_temp);
 
     // ---- Summary ----
     con_print("\n");
@@ -1900,6 +1973,26 @@ int main(int argc, char* argv[]) {
     con_print("  %-20s %d\n", "Enums:", total_enums);
     con_print("  %-20s %d\n", "RTTI hierarchies:", rtti_count);
     con_print("  %-20s %d\n", "Static fields:", total_static);
+    if (data.contains("globals")) {
+        int glob_total = 0, glob_schema = 0;
+        for (const auto& [mod_name, mod_globals] : data["globals"].items()) {
+            if (!mod_globals.is_array()) continue;
+            glob_total += (int)mod_globals.size();
+            for (const auto& g : mod_globals) {
+                if (g.value("has_schema", false)) glob_schema++;
+            }
+        }
+        con_print("  %-20s %d with schema, %d total\n", "Global singletons:", glob_schema, glob_total);
+    }
+    if (data.contains("pattern_globals")) {
+        int pat_count = 0;
+        for (const auto& [mod_name, mod_pats] : data["pattern_globals"].items()) {
+            if (mod_pats.is_object())
+                pat_count += (int)mod_pats.size();
+        }
+        if (pat_count > 0)
+            con_print("  %-20s %d (from patterns.json)\n", "Pattern globals:", pat_count);
+    }
     if (sig_total > 0) {
         con_print("  %-20s %d (%d unique)\n", "Signatures:", sig_total, sig_unique);
     }

@@ -13,6 +13,8 @@
 #include "src/log.hpp"
 #include "src/schema-manager.hpp"
 #include "src/rtti-hierarchy.hpp"
+#include "src/global-scanner.hpp"
+#include "src/pattern-scanner.hpp"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -102,7 +104,9 @@ static bool write_field_json(FILE* fp, const schema::RuntimeField& f, bool first
     return true;
 }
 
-bool write_export(schema::SchemaManager& mgr, const char* path) {
+bool write_export(schema::SchemaManager& mgr, const char* path,
+                  const globals::GlobalMap& discovered,
+                  const pattern::ResultMap& pattern_globals) {
     FILE* fp = fopen(path, "w");
     if (!fp) {
         LOG_E("Failed to open %s for writing", path);
@@ -308,7 +312,67 @@ bool write_export(schema::SchemaManager& mgr, const char* path) {
         fprintf(fp, "    }");
     }
 
-    fprintf(fp, "\n  ]\n}\n");
+    fprintf(fp, "\n  ]");
+
+    // ---- Globals section (auto-discovered via vtable scan) ----
+    if (!discovered.empty()) {
+        fprintf(fp, ",\n  \"globals\": {\n");
+        int mod_idx = 0;
+        for (const auto& [mod_name, entries] : discovered) {
+            if (entries.empty()) continue;
+
+            if (mod_idx > 0) fprintf(fp, ",\n");
+            fprintf(fp, "    \"%s\": [\n", mod_name.c_str());
+            for (size_t i = 0; i < entries.size(); i++) {
+                const auto& g = entries[i];
+                if (i > 0) fprintf(fp, ",\n");
+                fprintf(fp, "      {\"class\": \"%s\", \"rva\": \"0x%X\", \"vtable_rva\": \"0x%X\", \"type\": \"%s\", \"has_schema\": %s}",
+                        g.class_name.c_str(), g.global_rva, g.vtable_rva,
+                        g.is_pointer ? "pointer" : "static",
+                        g.has_schema ? "true" : "false");
+            }
+            fprintf(fp, "\n    ]");
+            mod_idx++;
+        }
+        fprintf(fp, "\n  }");
+    }
+
+    // ---- Pattern globals (supplementary, from patterns.json) ----
+    if (!pattern_globals.empty()) {
+        bool has_any = false;
+        for (const auto& [mod, results] : pattern_globals) {
+            for (const auto& r : results) {
+                if (r.found) { has_any = true; break; }
+            }
+            if (has_any) break;
+        }
+        if (has_any) {
+            fprintf(fp, ",\n  \"pattern_globals\": {\n");
+            int mod_idx = 0;
+            for (const auto& [mod_name, results] : pattern_globals) {
+                bool mod_has_any = false;
+                for (const auto& r : results) {
+                    if (r.found) { mod_has_any = true; break; }
+                }
+                if (!mod_has_any) continue;
+
+                if (mod_idx > 0) fprintf(fp, ",\n");
+                fprintf(fp, "    \"%s\": {\n", mod_name.c_str());
+                int entry_idx = 0;
+                for (const auto& r : results) {
+                    if (!r.found) continue;
+                    if (entry_idx > 0) fprintf(fp, ",\n");
+                    fprintf(fp, "      \"%s\": \"0x%X\"", r.name.c_str(), r.rva);
+                    entry_idx++;
+                }
+                fprintf(fp, "\n    }");
+                mod_idx++;
+            }
+            fprintf(fp, "\n  }");
+        }
+    }
+
+    fprintf(fp, "\n}\n");
     fclose(fp);
 
     LOG_I("Exported %d modules (%d classes, %d enums) to %s",
@@ -459,9 +523,55 @@ void worker_thread(HMODULE hModule) {
               mgr.class_count(), mgr.total_field_count(),
               mgr.total_static_field_count(), mgr.enum_count());
 
+        // ---- Auto-discover globals via .data vtable scan ----
+        LOG_I("Scanning .data sections for global singletons...");
+
+        // Build set of class names that have schema data (for tagging)
+        std::unordered_set<std::string> schema_classes;
+        for (const auto& [key, cls] : mgr.cache()) {
+            // Cache key is "module::ClassName", extract just the class name
+            auto sep = key.find("::");
+            if (sep != std::string::npos)
+                schema_classes.insert(key.substr(sep + 2));
+            else
+                schema_classes.insert(key);
+        }
+        LOG_I("Schema class set: %d classes for tagging", (int)schema_classes.size());
+
+        globals::GlobalMap discovered = globals::scan(mgr.rtti_map(), schema_classes);
+        {
+            int total = 0;
+            for (const auto& [mod, entries] : discovered) total += (int)entries.size();
+            LOG_I("Auto-discovered %d globals", total);
+        }
+
+        // ---- Optional: pattern-based globals (supplementary) ----
+        pattern::ResultMap pattern_globals;
+        {
+            char patterns_path[MAX_PATH];
+            snprintf(patterns_path, MAX_PATH, "%sdezlock-patterns.json", temp_dir);
+
+            pattern::PatternConfig pcfg;
+            if (pattern::load_config(patterns_path, pcfg)) {
+                LOG_I("Running supplementary pattern scan (%d patterns)...", (int)pcfg.entries.size());
+                pattern_globals = pattern::resolve_all(pcfg);
+
+                int found = 0, total = 0;
+                for (const auto& [mod, results] : pattern_globals) {
+                    for (const auto& r : results) {
+                        total++;
+                        if (r.found) found++;
+                    }
+                }
+                LOG_I("Patterns: %d/%d resolved", found, total);
+            } else {
+                LOG_I("No patterns.json — pattern globals skipped (auto-discovery is primary)");
+            }
+        }
+
         // Export to JSON (all modules)
         LOG_I("Writing JSON export...");
-        write_export(mgr, json_path);
+        write_export(mgr, json_path, discovered, pattern_globals);
     }
 
 done:

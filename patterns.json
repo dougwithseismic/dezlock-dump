@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "description": "Source 2 global pointer patterns (from cs2-dumper). Shared between CS2 and Deadlock.",
+  "entries": [
+    {
+      "name": "dwEntityList",
+      "module": "client.dll",
+      "pattern": "48 89 0D ?? ?? ?? ?? E9 ?? ?? ?? ?? CC",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwLocalPlayerController",
+      "module": "client.dll",
+      "pattern": "48 8B 05 ?? ?? ?? ?? 41 89 BE",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwViewMatrix",
+      "module": "client.dll",
+      "pattern": "48 8D 0D ?? ?? ?? ?? 48 C1 E0 06",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwGameEntitySystem",
+      "module": "client.dll",
+      "pattern": "48 8B 1D ?? ?? ?? ?? 48 89 1D ?? ?? ?? ?? 4C 63 B3",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwViewRender",
+      "module": "client.dll",
+      "pattern": "48 89 05 ?? ?? ?? ?? 48 8B C8 48 85 C0",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwGlowManager",
+      "module": "client.dll",
+      "pattern": "48 8B 05 ?? ?? ?? ?? C3 CC CC CC CC CC CC CC CC 8B 41",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwGameRules",
+      "module": "client.dll",
+      "pattern": "48 89 1D ?? ?? ?? ?? FF 15 ?? ?? ?? ?? 84 C0",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwPrediction",
+      "module": "client.dll",
+      "pattern": "48 8D 05 ?? ?? ?? ?? C3 CC CC CC CC CC CC CC CC 40 53 56 41 54",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwBuildNumber",
+      "module": "engine2.dll",
+      "pattern": "89 05 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? FF 15 ?? ?? ?? ?? 48 8B 0D",
+      "rip_offset": 2
+    },
+    {
+      "name": "dwNetworkGameClient",
+      "module": "engine2.dll",
+      "pattern": "48 89 3D ?? ?? ?? ?? FF 87",
+      "rip_offset": 3
+    },
+    {
+      "name": "dwWindowHeight",
+      "module": "engine2.dll",
+      "pattern": "8B 05 ?? ?? ?? ?? 89 03",
+      "rip_offset": 2
+    },
+    {
+      "name": "dwWindowWidth",
+      "module": "engine2.dll",
+      "pattern": "8B 05 ?? ?? ?? ?? 89 07",
+      "rip_offset": 2
+    },
+    {
+      "name": "dwLocalPlayerPawn",
+      "module": "client.dll",
+      "mode": "derived",
+      "derived_from": "dwPrediction",
+      "chain_pattern": "4C 39 B6 ?? ?? ?? ?? 74 ?? 44 88 BE",
+      "chain_extract_offset": 3
+    }
+  ]
+}
