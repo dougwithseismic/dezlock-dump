@@ -4,7 +4,7 @@
  * Walks MSVC x64 RTTI structures in a loaded module to discover
  * the complete C++ class hierarchy. Three passes:
  *
- *   1. Scan for TypeDescriptor names (".?AV" prefix) -> RVA-to-name map
+ *   1. Scan for TypeDescriptor names (".?AV"/".?AU" prefixes) -> RVA-to-name map
  *   2. Scan for CompleteObjectLocators (signature=1, selfRVA valid) -> COL list
  *   3. For each COL, walk ClassHierarchyDescriptor -> BaseClassArray -> parent chain
  *
@@ -70,10 +70,10 @@ static size_t safe_memcpy(void* dst, const void* src, size_t len) {
 }
 
 // Extract clean class name from mangled RTTI name.
-// ".?AVC_BaseEntity@@" -> "C_BaseEntity"
-// ".?AVCEntityInstance@@" -> "CEntityInstance"
+// ".?AVC_BaseEntity@@" -> "C_BaseEntity"       (class)
+// ".?AUCEntityInstance@@" -> "CEntityInstance"  (struct)
 static std::string demangle(const char* mangled) {
-    if (!mangled || strncmp(mangled, ".?AV", 4) != 0) return {};
+    if (!mangled || (strncmp(mangled, ".?AV", 4) != 0 && strncmp(mangled, ".?AU", 4) != 0)) return {};
     const char* start = mangled + 4;
     const char* end = strstr(start, "@@");
     if (!end || (end - start) > 256 || (end - start) <= 0) return {};
@@ -93,17 +93,17 @@ build_rtti_hierarchy(uintptr_t base, size_t size) {
     const uint8_t* mem = reinterpret_cast<const uint8_t*>(base);
 
     // ========================================================================
-    // Pass 1: Find all TypeDescriptors by scanning for ".?AV" name strings.
+    // Pass 1: Find all TypeDescriptors by scanning for ".?AV"/".?AU" name strings.
     // TypeDescriptor layout (x64):
     //   +0x00  vtable_ptr (8 bytes)
     //   +0x08  spare      (8 bytes)
-    //   +0x10  name[]     (mangled C string, starts with ".?AV")
+    //   +0x10  name[]     (mangled C string, starts with ".?AV" or ".?AU")
     // ========================================================================
 
     std::unordered_map<int32_t, std::string> rva_to_name;  // TD RVA -> clean name
 
     for (size_t i = 0; i + 20 < size; i++) {
-        if (mem[i] != '.' || mem[i+1] != '?' || mem[i+2] != 'A' || mem[i+3] != 'V')
+        if (mem[i] != '.' || mem[i+1] != '?' || mem[i+2] != 'A' || (mem[i+3] != 'V' && mem[i+3] != 'U'))
             continue;
 
         // Candidate TypeDescriptor.name at offset i
