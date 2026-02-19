@@ -27,8 +27,21 @@
  *   +0x08  m_pValue (void*)
  *
  * SchemaBaseClassInfoData_t (0x10 bytes each):
- *   +0x00  m_unOffset (uint32)
+ *   +0x00  m_unOffset (uint32)  — offset of base within derived class
  *   +0x08  m_pClass (CSchemaClassInfo*)
+ *
+ * SchemaClassInfoData_t layout (from neverlosecc/source2gen):
+ *   +0x00  m_pSelf (SchemaClassInfoData_t*)
+ *   +0x08  m_pszName (const char*)
+ *   +0x10  m_pszModule (const char*)
+ *   +0x18  m_nSizeOf (int32)
+ *   +0x1C  m_nFieldSize (int16)
+ *   +0x20  m_nStaticMetadataSize (int16)
+ *   +0x22  m_unAlignOf (uint8)
+ *   +0x23  m_nBaseClassSize (int8)  — count of base classes
+ *   +0x28  m_pFields (SchemaClassFieldData_t*)
+ *   +0x38  m_pBaseClasses (SchemaBaseClassInfoData_t*)
+ *   +0x48  m_pStaticMetadata (SchemaMetadataEntryData_t*)
  *
  * CSchemaType:
  *   +0x08  m_pszName (const char*)
@@ -284,14 +297,18 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
     }
 
     // Read base classes
-    // Raw dump of ClassInfo+0x20: 08 01 03 00 02 00 00 00
-    //   +0x20=0x08, +0x21=0x01(base_count), +0x22=0x03(flags?), +0x23=0x00
-    // SchemaBaseClassInfoData_t layout (confirmed via memory dump):
-    //   +0x00  m_pClass (CSchemaClassInfo*)  -- pointer FIRST
-    //   +0x08  m_nOffset (int32)             -- offset SECOND
+    //
+    // SchemaClassInfoData_t layout (from neverlosecc/source2gen, verified with static_assert):
+    //   +0x22  m_unAlignOf (uint8)
+    //   +0x23  m_nBaseClassSize (int8) — COUNT of base classes
+    //   +0x38  m_pBaseClasses (SchemaBaseClassInfoData_t*)
+    //
+    // SchemaBaseClassInfoData_t layout (from neverlosecc/source2gen):
+    //   +0x00  m_unOffset (uint32)        — offset of base within derived class
+    //   +0x08  m_pClass (CSchemaClassInfo*) — pointer to base class info
     //   Total: 0x10 bytes per entry
     int8_t base_count = 0;
-    seh_read_i8(ci + 0x21, &base_count);
+    seh_read_i8(ci + 0x23, &base_count);
 
     uintptr_t bases_ptr = 0;
     seh_read_ptr(ci + 0x38, &bases_ptr);
@@ -302,18 +319,18 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
         for (int8_t i = 0; i < base_count; ++i) {
             uintptr_t entry_addr = bases_ptr + i * 0x10;
 
-            uintptr_t parent_ci = 0;
-            seh_read_ptr(entry_addr + 0x00, &parent_ci);
-
             int32_t parent_offset = 0;
-            seh_read_i32(entry_addr + 0x08, &parent_offset);
+            seh_read_i32(entry_addr + 0x00, &parent_offset);
+
+            uintptr_t parent_ci = 0;
+            seh_read_ptr(entry_addr + 0x08, &parent_ci);
 
             if (parent_ci) {
                 uintptr_t parent_name_ptr = 0;
                 if (seh_read_ptr(parent_ci + 0x08, &parent_name_ptr) && parent_name_ptr) {
                     const char* pname = nullptr;
                     if (seh_read_string(parent_name_ptr, &pname) && pname && pname[0]) {
-                        out.base_classes.push_back({pname, parent_offset});
+                        out.base_classes.push_back({pname, parent_offset, parent_ci});
                     }
                 }
             }
@@ -541,19 +558,24 @@ int32_t SchemaManager::get_offset(const char* module, const char* class_name, co
         }
     }
 
-    // Walk RTTI parent chain (primary inheritance = offset 0)
-    auto* info = get_inheritance(class_name);
-    if (info && !info->parent.empty()) {
-        int32_t parent_off = get_offset(module, info->parent.c_str(), field_name);
-        if (parent_off >= 0) return parent_off;
-    }
-
-    // Fallback: search schema base_classes (embedded components)
+    // Walk base classes (schema base_classes include the m_unOffset from
+    // SchemaBaseClassInfoData_t which gives the absolute position of the
+    // parent within the derived class). Field offsets from the schema are
+    // relative to the declaring class, so we must add base.offset.
     for (const auto& base : cls->base_classes) {
         if (!base.name) continue;
         int32_t off = get_offset(module, base.name, field_name);
         if (off >= 0) {
             return base.offset + off;
+        }
+    }
+
+    // Fallback: walk RTTI parent chain for classes not in schema base_classes
+    if (cls->base_classes.empty()) {
+        auto* info = get_inheritance(class_name);
+        if (info && !info->parent.empty()) {
+            int32_t parent_off = get_offset(module, info->parent.c_str(), field_name);
+            if (parent_off >= 0) return parent_off;
         }
     }
 
@@ -573,32 +595,43 @@ bool SchemaManager::get_flat_layout(const char* module, const char* class_name, 
     out.fields.clear();
     out.inheritance_chain.clear();
 
-    // Walk RTTI parent chain to collect fields from entire hierarchy.
-    // Primary inheritance = offset 0 (single inheritance for all Source 2 entity classes).
-    // We walk: self -> parent -> grandparent -> ... -> root
-    const RuntimeClass* current = cls;
-    int depth = 0;
+    // Recursive helper: collect fields from a class and all its base classes,
+    // adding base_offset to convert schema-relative offsets to absolute offsets.
+    struct Collector {
+        SchemaManager* mgr;
+        const char* module;
+        FlatLayout* out;
 
-    while (current && depth < 32) {
-        depth++;
-        out.inheritance_chain.push_back(current->name ? current->name : "?");
+        void collect(const RuntimeClass* cls, int32_t base_offset, int depth) {
+            if (!cls || depth > 32) return;
 
-        // Add this class's own fields
-        for (const auto& f : current->fields) {
-            FlatField ff;
-            ff.name = f.name;
-            ff.type_name = f.type_name;
-            ff.offset = f.offset;  // primary inheritance: parent at offset 0
-            ff.size = f.size;
-            ff.defined_in = current->name;
-            out.fields.push_back(ff);
+            out->inheritance_chain.push_back(cls->name ? cls->name : "?");
+
+            // Add this class's own fields with accumulated base offset
+            for (const auto& f : cls->fields) {
+                FlatField ff;
+                ff.name = f.name;
+                ff.type_name = f.type_name;
+                ff.offset = base_offset + f.offset;
+                ff.size = f.size;
+                ff.defined_in = cls->name;
+                out->fields.push_back(ff);
+            }
+
+            // Walk schema base classes (each has m_unOffset for its position
+            // within the derived class)
+            for (const auto& base : cls->base_classes) {
+                if (!base.name) continue;
+                const RuntimeClass* parent = mgr->find_class(module, base.name);
+                if (parent) {
+                    collect(parent, base_offset + base.offset, depth + 1);
+                }
+            }
         }
+    };
 
-        // Follow RTTI parent
-        auto* info = get_inheritance(current->name);
-        if (!info || info->parent.empty()) break;
-        current = find_class(module, info->parent.c_str());
-    }
+    Collector c{this, module, &out};
+    c.collect(cls, 0, 0);
 
     // Sort by absolute offset
     std::sort(out.fields.begin(), out.fields.end(),
@@ -724,11 +757,11 @@ static int seh_probe_bucket_at(uintptr_t candidate_bucket, bool (*validator)(uin
 }
 
 // Auto-detect where hash buckets start by probing candidate offsets.
-// The CUtlMemoryPoolBase size varies between builds (0x28 on V1, 0x80 on V2, etc.)
-// We try candidate pool sizes and check if buckets contain valid entries.
+// UtlMemoryPool is 0x60 bytes (confirmed by cs2-dumper), so buckets at hash+0x60.
+// We probe a range to handle build-specific variations.
 static uintptr_t find_bucket_base(uintptr_t hash_base, bool (*validator)(uintptr_t)) {
-    // Known pool sizes: V1=0x28, V2=0x80, but can vary. Probe a range.
-    static const int pool_sizes[] = { 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0 };
+    // Known pool size: 0x60 (cs2-dumper). Probe 0x60 first, then nearby.
+    static const int pool_sizes[] = { 0x60, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0 };
 
     for (int ps : pool_sizes) {
         uintptr_t candidate = hash_base + ps;
@@ -870,7 +903,48 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
         }
     }
 
-    LOG_I("enumerate_scope: %d classes resolved from %s", classes_found, module_name);
+    LOG_I("enumerate_scope: %d classes from hash table in %s", classes_found, module_name);
+
+    // Phase 2: Discover base classes referenced by m_pClass pointers but
+    // NOT in the CUtlTSHash. These are classes like CBasePlayerController
+    // that exist in server.dll's hash table but are referenced by client.dll
+    // classes via base class entries. The m_pClass pointer may point to a
+    // module-local CSchemaClassInfo with correct offsets for this module.
+    std::string prefix = std::string(module_name) + "::";
+    int discovered = 0;
+    bool found_new = true;
+    while (found_new) {
+        found_new = false;
+        // Collect raw class info pointers from base classes of cached classes
+        std::vector<std::pair<uintptr_t, std::string>> pending;
+        for (const auto& [key, cls] : m_cache) {
+            if (key.rfind(prefix, 0) != 0) continue;
+            for (const auto& base : cls.base_classes) {
+                if (!base.raw_class_info || !base.name) continue;
+                std::string bkey = prefix + base.name;
+                if (m_cache.find(bkey) == m_cache.end()) {
+                    pending.push_back({base.raw_class_info, bkey});
+                }
+            }
+        }
+        for (const auto& [ptr, key] : pending) {
+            RuntimeClass cls = {};
+            if (resolve_class(reinterpret_cast<void*>(ptr), module_name, cls)) {
+                if (m_cache.find(key) == m_cache.end()) {
+                    m_cache.emplace(key, std::move(cls));
+                    found_new = true;
+                    discovered++;
+                }
+            }
+        }
+    }
+
+    if (discovered > 0) {
+        LOG_I("enumerate_scope: +%d base classes discovered via m_pClass in %s",
+              discovered, module_name);
+    }
+
+    classes_found += discovered;
     return classes_found > 0;
 }
 
@@ -901,8 +975,9 @@ bool SchemaManager::enumerate_enums(void* type_scope, const char* module_name) {
     // Also try legacy offset 0x0BE8 in case V1 layout is in use.
     // Additionally try offsets that source2gen uses.
     static const int enum_offsets[] = {
-        // V2: after the class hash buckets
-        0x1DE0, 0x1DE8, 0x1DF0, 0x1DF8, 0x1E00, 0x1E08, 0x1E10, 0x1E18,
+        // V2: right after the class CUtlTsHash (cs2-dumper confirms 0x1DD0)
+        0x1DD0, 0x1DD8, 0x1DE0, 0x1DE8, 0x1DF0, 0x1DF8,
+        0x1E00, 0x1E08, 0x1E10, 0x1E18,
         0x1E20, 0x1E28, 0x1E30, 0x1E38, 0x1E40, 0x1E48, 0x1E50,
         // V1 legacy
         0x0BE8, 0x0BF0, 0x0BF8, 0x0C00, 0x0C08, 0x0C10,

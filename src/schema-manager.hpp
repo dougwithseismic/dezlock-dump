@@ -30,6 +30,7 @@ struct RuntimeField {
 struct BaseClassRef {
     const char* name;           // base class name (engine-owned string)
     int32_t offset;             // offset of base within derived class
+    uintptr_t raw_class_info;   // raw CSchemaClassInfo* for base class discovery
 };
 
 struct RuntimeClass {

@@ -875,7 +875,8 @@ void generate_headers(const std::vector<ClassInfo>& classes,
 void generate_module_txt(const std::vector<ClassInfo>& classes,
                          const std::vector<EnumInfo>& enums,
                          const json& data,
-                         const std::string& output_dir, const std::string& module_name) {
+                         const std::string& output_dir, const std::string& module_name,
+                         const std::unordered_map<std::string, const ClassInfo*>& global_lookup) {
     std::string txt_path = output_dir + "\\" + module_name + ".txt";
     FILE* fp = fopen(txt_path.c_str(), "w");
     if (!fp) {
@@ -962,30 +963,44 @@ void generate_module_txt(const std::vector<ClassInfo>& classes,
     for (const auto& c : classes) by_name[c.name] = &c;
 
     struct Collector {
-        const std::unordered_map<std::string, const ClassInfo*>& lookup;
+        const std::unordered_map<std::string, const ClassInfo*>& local;
+        const std::unordered_map<std::string, const ClassInfo*>& global;
         std::vector<Field> result;
+
+        const ClassInfo* find(const std::string& name) {
+            auto it = local.find(name);
+            if (it != local.end()) return it->second;
+            // Try C_ client equivalent in local before falling back to global
+            if (name.size() > 1 && name[0] == 'C' && name[1] != '_') {
+                std::string cn = "C_" + name.substr(1);
+                it = local.find(cn);
+                if (it != local.end()) return it->second;
+            }
+            it = global.find(name);
+            return (it != global.end()) ? it->second : nullptr;
+        }
 
         void collect(const std::string& name, std::unordered_set<std::string>& visited) {
             if (visited.count(name)) return;
             visited.insert(name);
-            auto it = lookup.find(name);
-            if (it == lookup.end()) return;
-            const auto* cls = it->second;
+            const auto* cls = find(name);
+            if (!cls) return;
+            visited.insert(cls->name);
+
             for (const auto& f : cls->fields) {
                 Field ff = f;
-                ff.defined_in = name;
+                ff.defined_in = cls->name;
                 result.push_back(ff);
             }
-            if (!cls->parent.empty()) {
+            if (!cls->parent.empty())
                 collect(cls->parent, visited);
-            }
         }
     };
 
     for (const auto& cls : classes) {
         if (cls.inheritance.size() < 3) continue;
 
-        Collector col{by_name, {}};
+        Collector col{by_name, global_lookup, {}};
         std::unordered_set<std::string> visited;
         col.collect(cls.name, visited);
         if (col.result.empty()) continue;
@@ -1037,7 +1052,8 @@ void generate_module_txt(const std::vector<ClassInfo>& classes,
 }
 
 void generate_hierarchy(const std::vector<ClassInfo>& classes,
-                        const std::string& output_dir, const std::string& module_name) {
+                        const std::string& output_dir, const std::string& module_name,
+                        const std::unordered_map<std::string, const ClassInfo*>& global_lookup) {
     // Build lookup
     std::unordered_map<std::string, const ClassInfo*> by_name;
     for (const auto& c : classes) by_name[c.name] = &c;
@@ -1057,18 +1073,32 @@ void generate_hierarchy(const std::vector<ClassInfo>& classes,
 
     // Recursive field collector for flat layout
     struct Collector {
-        const std::unordered_map<std::string, const ClassInfo*>& lookup;
+        const std::unordered_map<std::string, const ClassInfo*>& local;
+        const std::unordered_map<std::string, const ClassInfo*>& global;
         std::vector<Field> result;
+
+        const ClassInfo* find(const std::string& name) {
+            auto it = local.find(name);
+            if (it != local.end()) return it->second;
+            if (name.size() > 1 && name[0] == 'C' && name[1] != '_') {
+                std::string cn = "C_" + name.substr(1);
+                it = local.find(cn);
+                if (it != local.end()) return it->second;
+            }
+            it = global.find(name);
+            return (it != global.end()) ? it->second : nullptr;
+        }
 
         void collect(const std::string& name, std::unordered_set<std::string>& visited) {
             if (visited.count(name)) return;
             visited.insert(name);
-            auto it = lookup.find(name);
-            if (it == lookup.end()) return;
-            const auto* cls = it->second;
+            const auto* cls = find(name);
+            if (!cls) return;
+            visited.insert(cls->name);
+
             for (const auto& f : cls->fields) {
                 Field ff = f;
-                ff.defined_in = name;
+                ff.defined_in = cls->name;
                 result.push_back(ff);
             }
             if (!cls->parent.empty())
@@ -1161,7 +1191,7 @@ void generate_hierarchy(const std::vector<ClassInfo>& classes,
 
         // Full flattened layout (if has parents)
         if (!cls.parent.empty()) {
-            Collector col{by_name, {}};
+            Collector col{by_name, global_lookup, {}};
             std::unordered_set<std::string> visited;
             col.collect(cls.name, visited);
 
@@ -1806,6 +1836,17 @@ int main(int argc, char* argv[]) {
 
     CreateDirectoryA(output_dir.c_str(), nullptr);
 
+    // Build cross-module class lookup for flattening inherited fields
+    // (e.g. client.dll's CCSPlayerController inherits from server.dll's CBasePlayerController)
+    std::unordered_map<std::string, const ClassInfo*> global_class_lookup;
+    for (const auto& mod : modules) {
+        for (const auto& cls : mod.classes) {
+            // First module wins for duplicates (client.dll classes preferred over server.dll)
+            if (global_class_lookup.find(cls.name) == global_class_lookup.end())
+                global_class_lookup[cls.name] = &cls;
+        }
+    }
+
     for (auto& mod : modules) {
         std::string module_name = mod.name;
         {
@@ -1818,8 +1859,8 @@ int main(int argc, char* argv[]) {
         std::sort(mod.enums.begin(), mod.enums.end(),
                   [](const EnumInfo& a, const EnumInfo& b) { return a.name < b.name; });
 
-        generate_module_txt(mod.classes, mod.enums, data, output_dir, module_name);
-        generate_hierarchy(mod.classes, output_dir, module_name);
+        generate_module_txt(mod.classes, mod.enums, data, output_dir, module_name, global_class_lookup);
+        generate_hierarchy(mod.classes, output_dir, module_name, global_class_lookup);
         if (gen_headers) {
             generate_headers(mod.classes, mod.enums, output_dir, module_name);
         }
@@ -1841,25 +1882,36 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Recursive field collector that includes inherited fields
+        // Recursive field collector that includes inherited fields.
         struct FlatCollector {
             const std::unordered_map<std::string, const ClassInfo*>& lookup;
             std::vector<Field> result;
 
+            const ClassInfo* find(const std::string& name) {
+                auto it = lookup.find(name);
+                if (it != lookup.end()) return it->second;
+                if (name.size() > 1 && name[0] == 'C' && name[1] != '_') {
+                    std::string cn = "C_" + name.substr(1);
+                    it = lookup.find(cn);
+                    if (it != lookup.end()) return it->second;
+                }
+                return nullptr;
+            }
+
             void collect(const std::string& name, std::unordered_set<std::string>& visited) {
                 if (visited.count(name)) return;
                 visited.insert(name);
-                auto it = lookup.find(name);
-                if (it == lookup.end()) return;
-                const auto* cls = it->second;
+                const auto* cls = find(name);
+                if (!cls) return;
+                visited.insert(cls->name);
+
                 for (const auto& f : cls->fields) {
                     Field ff = f;
-                    ff.defined_in = name;
+                    ff.defined_in = cls->name;
                     result.push_back(ff);
                 }
-                if (!cls->parent.empty()) {
+                if (!cls->parent.empty())
                     collect(cls->parent, visited);
-                }
             }
         };
 
@@ -2222,15 +2274,27 @@ int main(int argc, char* argv[]) {
                     struct FC {
                         const std::unordered_map<std::string, const ClassInfo*>& lookup;
                         std::vector<Field> result;
+                        const ClassInfo* find(const std::string& name) {
+                            auto it = lookup.find(name);
+                            if (it != lookup.end()) return it->second;
+                            if (name.size() > 1 && name[0] == 'C' && name[1] != '_') {
+                                std::string cn = "C_" + name.substr(1);
+                                it = lookup.find(cn);
+                                if (it != lookup.end()) return it->second;
+                            }
+                            return nullptr;
+                        }
                         void collect(const std::string& name, std::unordered_set<std::string>& visited) {
                             if (visited.count(name)) return;
                             visited.insert(name);
-                            auto it = lookup.find(name);
-                            if (it == lookup.end()) return;
-                            for (const auto& f : it->second->fields) {
-                                Field ff = f; ff.defined_in = name; result.push_back(ff);
+                            const auto* cls = find(name);
+                            if (!cls) return;
+                            visited.insert(cls->name);
+                            for (const auto& f : cls->fields) {
+                                Field ff = f; ff.defined_in = cls->name; result.push_back(ff);
                             }
-                            if (!it->second->parent.empty()) collect(it->second->parent, visited);
+                            if (!cls->parent.empty())
+                                collect(cls->parent, visited);
                         }
                     };
 
