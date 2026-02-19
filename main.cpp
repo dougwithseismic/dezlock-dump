@@ -1,10 +1,10 @@
 /**
  * Dezlock Dump — Standalone Schema Extraction Tool
  *
- * Usage: dezlock-dump.exe [--output <dir>] [--wait <seconds>]
+ * Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>]
  *
- * 1. Finds Deadlock process
- * 2. Injects dezlock-worker.dll via CreateRemoteThread
+ * 1. Finds target Source 2 process (default: deadlock.exe)
+ * 2. Injects dezlock-worker.dll via manual-map (PE mapping + shellcode)
  * 3. Waits for the worker to finish (writes JSON to %TEMP%)
  * 4. Reads JSON and generates output files:
  *    - schema-dump/client.txt      (greppable text)
@@ -12,7 +12,7 @@
  *    - schema-dump/client.json     (full JSON)
  *
  * Requires: admin elevation (for process injection)
- * Requires: Deadlock must be running
+ * Requires: Target Source 2 game must be running
  */
 
 #include <Windows.h>
@@ -54,60 +54,406 @@ DWORD find_process(const wchar_t* name) {
     return pid;
 }
 
+// Forward declarations for console helpers (defined below)
+static void con_ok(const char* fmt, ...);
+static void con_fail(const char* fmt, ...);
+static void con_info(const char* fmt, ...);
+
 // ============================================================================
-// DLL Injection via CreateRemoteThread + LoadLibraryA
+// DLL Injection via Manual-Map (PE mapping + in-process shellcode)
 // ============================================================================
 
+// --- PE Parser ---
+
+struct PeInfo {
+    std::vector<uint8_t>   raw;
+    IMAGE_DOS_HEADER*      dos;
+    IMAGE_NT_HEADERS64*    nt;
+    IMAGE_SECTION_HEADER*  sections;
+    WORD                   num_sections;
+    uint64_t               preferred_base;
+    uint32_t               size_of_image;
+    uint32_t               entry_point_rva;
+    IMAGE_DATA_DIRECTORY   reloc_dir;
+    IMAGE_DATA_DIRECTORY   import_dir;
+    IMAGE_DATA_DIRECTORY   exc_dir;
+    IMAGE_DATA_DIRECTORY   tls_dir;
+};
+
+static bool pe_parse(const char* path, PeInfo& pe) {
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        con_fail("Cannot open DLL: %s (err %lu)", path, GetLastError());
+        return false;
+    }
+
+    DWORD file_size = GetFileSize(hFile, nullptr);
+    if (file_size < sizeof(IMAGE_DOS_HEADER)) {
+        con_fail("File too small");
+        CloseHandle(hFile);
+        return false;
+    }
+
+    pe.raw.resize(file_size);
+    DWORD read;
+    ReadFile(hFile, pe.raw.data(), file_size, &read, nullptr);
+    CloseHandle(hFile);
+    if (read != file_size) return false;
+
+    pe.dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pe.raw.data());
+    if (pe.dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        con_fail("Invalid DOS signature");
+        return false;
+    }
+
+    pe.nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe.raw.data() + pe.dos->e_lfanew);
+    if (pe.nt->Signature != IMAGE_NT_SIGNATURE) {
+        con_fail("Invalid NT signature");
+        return false;
+    }
+
+    if (pe.nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        con_fail("Not a 64-bit DLL");
+        return false;
+    }
+
+    if (!(pe.nt->FileHeader.Characteristics & IMAGE_FILE_DLL)) {
+        con_fail("Not a DLL");
+        return false;
+    }
+
+    auto& opt = pe.nt->OptionalHeader;
+    pe.preferred_base  = opt.ImageBase;
+    pe.size_of_image   = opt.SizeOfImage;
+    pe.entry_point_rva = opt.AddressOfEntryPoint;
+    pe.sections        = IMAGE_FIRST_SECTION(pe.nt);
+    pe.num_sections    = pe.nt->FileHeader.NumberOfSections;
+
+    pe.reloc_dir  = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    pe.import_dir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    pe.exc_dir    = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    pe.tls_dir    = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+
+    con_info("PE: ImageBase=0x%llX  SizeOfImage=0x%X  EntryRVA=0x%X",
+             pe.preferred_base, pe.size_of_image, pe.entry_point_rva);
+    con_info("PE: Sections=%u  Relocs=0x%X (%u bytes)  Imports=0x%X",
+             pe.num_sections, pe.reloc_dir.VirtualAddress, pe.reloc_dir.Size,
+             pe.import_dir.VirtualAddress);
+
+    return true;
+}
+
+// --- Mapping Context & In-Process Shellcode ---
+
+typedef struct _MAPPING_CTX {
+    LPVOID    base_addr;
+    HINSTANCE (WINAPI* fn_LoadLibrary)(LPCSTR);
+    FARPROC   (WINAPI* fn_GetProcAddress)(HMODULE, LPCSTR);
+    BOOL      (WINAPI* fn_RtlAddFunctionTable)(PVOID, DWORD, DWORD64);
+    HINSTANCE mod_handle;
+    DWORD     reason;
+    LPVOID    reserved;
+    BOOL      seh_enabled;
+} MAPPING_CTX;
+
+#define RELOC_FLAG64(info) (((info) >> 12) == IMAGE_REL_BASED_DIR64)
+#define INJECT_INVALID_DATA ((HINSTANCE)0x404040)
+#define INJECT_SEH_FAILED   ((HINSTANCE)0x505050)
+
+static constexpr size_t CTX_OFFSET  = 0;
+static constexpr size_t CODE_OFFSET = 0x100;
+static constexpr size_t SHELL_PAGE  = 0x1000;
+
+#pragma runtime_checks("", off)
+#pragma optimize("", off)
+#pragma strict_gs_check(push, off)
+#pragma check_stack(off)
+__declspec(safebuffers)
+static DWORD WINAPI target_shellcode(LPVOID lpParam) {
+    MAPPING_CTX* pData = reinterpret_cast<MAPPING_CTX*>(lpParam);
+    if (!pData)
+        return 1;
+
+    BYTE* pBase = reinterpret_cast<BYTE*>(pData->base_addr);
+    if (!pBase) {
+        pData->mod_handle = INJECT_INVALID_DATA;
+        return 2;
+    }
+
+    auto* pOpt = &reinterpret_cast<IMAGE_NT_HEADERS*>(
+        pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pBase)->e_lfanew)->OptionalHeader;
+
+    auto _LoadLibraryA   = pData->fn_LoadLibrary;
+    auto _GetProcAddress = pData->fn_GetProcAddress;
+
+    if (!_LoadLibraryA || !_GetProcAddress) {
+        pData->mod_handle = INJECT_INVALID_DATA;
+        return 3;
+    }
+
+    auto _DllMain = reinterpret_cast<BOOL(WINAPI*)(void*, DWORD, void*)>(
+        pBase + pOpt->AddressOfEntryPoint);
+
+    // Phase 1: Relocations
+    BYTE* delta = pBase - pOpt->ImageBase;
+    if (delta && pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) {
+        auto* pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+            pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+        const auto* pRelocEnd = reinterpret_cast<BYTE*>(pReloc) +
+            pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+
+        while (reinterpret_cast<BYTE*>(pReloc) < pRelocEnd && pReloc->SizeOfBlock) {
+            UINT count = (pReloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            WORD* entries = reinterpret_cast<WORD*>(pReloc + 1);
+
+            for (UINT i = 0; i < count; ++i) {
+                if (RELOC_FLAG64(entries[i])) {
+                    UINT_PTR* pPatch = reinterpret_cast<UINT_PTR*>(
+                        pBase + pReloc->VirtualAddress + (entries[i] & 0xFFF));
+                    *pPatch += reinterpret_cast<UINT_PTR>(delta);
+                }
+            }
+
+            pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(
+                reinterpret_cast<BYTE*>(pReloc) + pReloc->SizeOfBlock);
+        }
+    }
+
+    // Phase 2: Import Resolution
+    if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
+        auto* pImport = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+            pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+        while (pImport->Name) {
+            HMODULE hMod = _LoadLibraryA(reinterpret_cast<char*>(pBase + pImport->Name));
+            if (!hMod) {
+                pData->mod_handle = INJECT_INVALID_DATA;
+                return 4;
+            }
+
+            ULONG_PTR* pThunk = reinterpret_cast<ULONG_PTR*>(
+                pBase + pImport->OriginalFirstThunk);
+            ULONG_PTR* pFunc = reinterpret_cast<ULONG_PTR*>(
+                pBase + pImport->FirstThunk);
+            if (!pThunk) pThunk = pFunc;
+
+            for (; *pThunk; ++pThunk, ++pFunc) {
+                if (IMAGE_SNAP_BY_ORDINAL(*pThunk)) {
+                    *pFunc = reinterpret_cast<ULONG_PTR>(
+                        _GetProcAddress(hMod, reinterpret_cast<char*>(*pThunk & 0xFFFF)));
+                } else {
+                    auto* pName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + *pThunk);
+                    *pFunc = reinterpret_cast<ULONG_PTR>(
+                        _GetProcAddress(hMod, pName->Name));
+                }
+            }
+
+            ++pImport;
+        }
+    }
+
+    // Phase 3: TLS Callbacks
+    if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {
+        auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(
+            pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+        auto** pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
+        for (; pCallback && *pCallback; ++pCallback) {
+            (*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
+        }
+    }
+
+    // Phase 4: SEH Exception Handlers (.pdata)
+    bool seh_failed = false;
+    if (pData->seh_enabled) {
+        auto& excDir = pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (excDir.Size) {
+            if (!pData->fn_RtlAddFunctionTable(
+                    reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(pBase + excDir.VirtualAddress),
+                    excDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY),
+                    reinterpret_cast<DWORD64>(pBase))) {
+                seh_failed = true;
+            }
+        }
+    }
+
+    // Phase 5: DllMain
+    _DllMain(pBase, pData->reason, pData->reserved);
+
+    pData->mod_handle = seh_failed
+        ? INJECT_SEH_FAILED
+        : reinterpret_cast<HINSTANCE>(pBase);
+
+    return 0;
+}
+#pragma strict_gs_check(pop)
+#pragma runtime_checks("", restore)
+#pragma optimize("", on)
+
+// --- Manual-Map Inject ---
+
+static bool mmap_inject(HANDLE hProc, const PeInfo& pe) {
+    // Allocate image in target (RWX during setup)
+    void* image_base = VirtualAllocEx(hProc, nullptr, pe.size_of_image,
+                                       MEM_COMMIT | MEM_RESERVE,
+                                       PAGE_EXECUTE_READWRITE);
+    if (!image_base) {
+        con_fail("VirtualAllocEx failed for image (%u bytes, err %lu)",
+                 pe.size_of_image, GetLastError());
+        return false;
+    }
+    con_info("Image allocated at 0x%p (%u bytes)", image_base, pe.size_of_image);
+
+    // Write PE headers
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(hProc, image_base, pe.raw.data(),
+                            pe.nt->OptionalHeader.SizeOfHeaders, &written)) {
+        con_fail("Failed to write PE headers (err %lu)", GetLastError());
+        VirtualFreeEx(hProc, image_base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Write each section
+    for (WORD i = 0; i < pe.num_sections; ++i) {
+        auto& sec = pe.sections[i];
+        if (sec.SizeOfRawData == 0) continue;
+
+        void* dest = static_cast<BYTE*>(image_base) + sec.VirtualAddress;
+        if (!WriteProcessMemory(hProc, dest,
+                                pe.raw.data() + sec.PointerToRawData,
+                                sec.SizeOfRawData, &written)) {
+            con_fail("Failed to write section %.8s (err %lu)",
+                     sec.Name, GetLastError());
+            VirtualFreeEx(hProc, image_base, 0, MEM_RELEASE);
+            return false;
+        }
+    }
+    con_info("PE headers + %u sections written", pe.num_sections);
+
+    // Allocate shellcode page
+    void* shell_page = VirtualAllocEx(hProc, nullptr, SHELL_PAGE,
+                                       MEM_COMMIT | MEM_RESERVE,
+                                       PAGE_EXECUTE_READWRITE);
+    if (!shell_page) {
+        con_fail("VirtualAllocEx failed for shellcode (err %lu)", GetLastError());
+        VirtualFreeEx(hProc, image_base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Write MAPPING_CTX
+    MAPPING_CTX ctx{};
+    ctx.base_addr          = image_base;
+    ctx.fn_LoadLibrary     = LoadLibraryA;
+    ctx.fn_GetProcAddress  = GetProcAddress;
+    ctx.fn_RtlAddFunctionTable = reinterpret_cast<decltype(ctx.fn_RtlAddFunctionTable)>(RtlAddFunctionTable);
+    ctx.mod_handle         = nullptr;
+    ctx.reason             = DLL_PROCESS_ATTACH;
+    ctx.reserved           = nullptr;
+    ctx.seh_enabled        = TRUE;
+
+    if (!WriteProcessMemory(hProc, static_cast<BYTE*>(shell_page) + CTX_OFFSET,
+                            &ctx, sizeof(ctx), &written)) {
+        con_fail("Failed to write MAPPING_CTX (err %lu)", GetLastError());
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        VirtualFreeEx(hProc, image_base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Write shellcode function bytes
+    if (!WriteProcessMemory(hProc, static_cast<BYTE*>(shell_page) + CODE_OFFSET,
+                            reinterpret_cast<const void*>(&target_shellcode),
+                            SHELL_PAGE - CODE_OFFSET, &written)) {
+        con_fail("Failed to write shellcode (err %lu)", GetLastError());
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        VirtualFreeEx(hProc, image_base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Execute via CreateRemoteThread
+    void* thread_entry = static_cast<BYTE*>(shell_page) + CODE_OFFSET;
+    void* thread_param = static_cast<BYTE*>(shell_page) + CTX_OFFSET;
+
+    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0,
+                                         reinterpret_cast<LPTHREAD_START_ROUTINE>(thread_entry),
+                                         thread_param, 0, nullptr);
+    if (!hThread) {
+        con_fail("CreateRemoteThread failed (err %lu)", GetLastError());
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        VirtualFreeEx(hProc, image_base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Wait for completion
+    DWORD wait = WaitForSingleObject(hThread, 15000);
+    DWORD exit_code = 0;
+    GetExitCodeThread(hThread, &exit_code);
+    CloseHandle(hThread);
+
+    if (wait == WAIT_TIMEOUT) {
+        con_fail("Thread timed out (15s) — DLL may be stuck in DllMain");
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        return false;
+    }
+
+    if (wait != WAIT_OBJECT_0) {
+        con_fail("WaitForSingleObject failed (err %lu)", GetLastError());
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Check for crash exceptions
+    if (exit_code >= 0xC0000000) {
+        con_fail("Thread crashed with exception 0x%08lX", exit_code);
+        con_info("0xC0000005 = Access Violation, 0xC00000FD = Stack Overflow");
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        return false;
+    }
+
+    if (exit_code != 0) {
+        con_fail("Shellcode returned error %lu", exit_code);
+        con_info("1=null param, 2=null base, 3=null functions, 4=import fail");
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Read back MAPPING_CTX for result
+    MAPPING_CTX result{};
+    ReadProcessMemory(hProc, static_cast<BYTE*>(shell_page) + CTX_OFFSET,
+                      &result, sizeof(result), nullptr);
+
+    if (result.mod_handle == INJECT_INVALID_DATA) {
+        con_fail("Shellcode reported failure (imports or bad data)");
+        VirtualFreeEx(hProc, shell_page, 0, MEM_RELEASE);
+        return false;
+    }
+
+    if (result.mod_handle == INJECT_SEH_FAILED) {
+        con_info("Warning: SEH registration failed (non-fatal)");
+    }
+
+    return true;
+}
+
+// --- inject_dll: parse PE and manual-map into target process ---
+
 bool inject_dll(DWORD pid, const char* dll_path) {
+    PeInfo pe{};
+    if (!pe_parse(dll_path, pe))
+        return false;
+
     HANDLE hProcess = OpenProcess(
-        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
-        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+        PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD,
         FALSE, pid);
 
     if (!hProcess) {
-        printf("  ERROR: OpenProcess failed (err=%lu). Run as admin?\n", GetLastError());
+        con_fail("OpenProcess failed (err=%lu). Run as admin?", GetLastError());
         return false;
     }
 
-    size_t path_len = strlen(dll_path) + 1;
-    void* remote_buf = VirtualAllocEx(hProcess, nullptr, path_len,
-                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remote_buf) {
-        printf("  ERROR: VirtualAllocEx failed (err=%lu)\n", GetLastError());
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    if (!WriteProcessMemory(hProcess, remote_buf, dll_path, path_len, nullptr)) {
-        printf("  ERROR: WriteProcessMemory failed (err=%lu)\n", GetLastError());
-        VirtualFreeEx(hProcess, remote_buf, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
-    auto pLoadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        GetProcAddress(kernel32, "LoadLibraryA"));
-
-    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0,
-                                         pLoadLibrary, remote_buf, 0, nullptr);
-    if (!hThread) {
-        printf("  ERROR: CreateRemoteThread failed (err=%lu)\n", GetLastError());
-        VirtualFreeEx(hProcess, remote_buf, 0, MEM_RELEASE);
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    WaitForSingleObject(hThread, 10000);
-
-    DWORD exit_code = 0;
-    GetExitCodeThread(hThread, &exit_code);
-
-    CloseHandle(hThread);
-    VirtualFreeEx(hProcess, remote_buf, 0, MEM_RELEASE);
+    bool ok = mmap_inject(hProcess, pe);
     CloseHandle(hProcess);
-
-    return exit_code != 0;  // LoadLibraryA returns module handle (nonzero = success)
+    return ok;
 }
 
 // ============================================================================
@@ -251,12 +597,7 @@ std::vector<ModuleData> parse_modules(const json& data) {
     return result;
 }
 
-// ============================================================================
-// Console helpers (forward declarations for generate_headers)
-// ============================================================================
-
-static void con_ok(const char* fmt, ...);
-static void con_fail(const char* fmt, ...);
+// (con_ok, con_fail, con_info forward-declared above inject code)
 
 // ============================================================================
 // C++ SDK header generation
@@ -1076,23 +1417,9 @@ static bool run_python_script(const char* python, const char* script_path,
 int main(int argc, char* argv[]) {
     ensure_console();
 
-    // Set console title
-    SetConsoleTitleA("dezlock-dump - Deadlock Schema Extractor");
-
-    con_print("\n");
-    con_color(CLR_TITLE);
-    con_print("  dezlock-dump");
-    con_color(CLR_DIM);
-    con_print("  v1.0.0\n");
-    con_color(CLR_DEFAULT);
-    con_print("  Runtime schema + RTTI extraction for Deadlock (Source 2)\n");
-    con_color(CLR_DIM);
-    con_print("  https://github.com/dougwithseismic/dezlock-dump\n");
-    con_color(CLR_DEFAULT);
-    con_print("\n");
-
-    // Parse args
+    // Parse args (early pass — need process name for banner)
     std::string output_dir;
+    std::string target_process = "deadlock.exe";
     int timeout_sec = 30;
     bool gen_headers = false;
     bool gen_signatures = false;
@@ -1101,6 +1428,8 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_dir = argv[++i];
+        } else if (strcmp(argv[i], "--process") == 0 && i + 1 < argc) {
+            target_process = argv[++i];
         } else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
             timeout_sec = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--headers") == 0) {
@@ -1110,7 +1439,9 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--all") == 0) {
             gen_all = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            con_print("Usage: dezlock-dump.exe [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]\n\n");
+            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]\n\n");
+            con_print("  --process     Target process name (default: deadlock.exe)\n");
+            con_print("                Examples: --process cs2.exe, --process dota2.exe\n");
             con_print("  --output      Output directory (default: schema-dump/ next to exe)\n");
             con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
             con_print("  --headers     Generate C++ SDK headers (structs, enums, offsets)\n");
@@ -1120,6 +1451,32 @@ int main(int argc, char* argv[]) {
             return 0;
         }
     }
+
+    // Derive display name from process (e.g. "deadlock.exe" -> "Deadlock")
+    std::string game_display = target_process;
+    {
+        auto dot = game_display.rfind('.');
+        if (dot != std::string::npos) game_display = game_display.substr(0, dot);
+        if (!game_display.empty()) game_display[0] = toupper(game_display[0]);
+    }
+
+    // Set console title
+    {
+        std::string title = "dezlock-dump - " + game_display + " Schema Extractor";
+        SetConsoleTitleA(title.c_str());
+    }
+
+    con_print("\n");
+    con_color(CLR_TITLE);
+    con_print("  dezlock-dump");
+    con_color(CLR_DIM);
+    con_print("  v1.1.0\n");
+    con_color(CLR_DEFAULT);
+    con_print("  Runtime schema + RTTI extraction for %s (Source 2)\n", game_display.c_str());
+    con_color(CLR_DIM);
+    con_print("  https://github.com/dougwithseismic/dezlock-dump\n");
+    con_color(CLR_DEFAULT);
+    con_print("\n");
 
     // --all enables everything
     if (gen_all) {
@@ -1135,7 +1492,10 @@ int main(int argc, char* argv[]) {
         GetFullPathNameA(exe_dir, MAX_PATH, full_path, nullptr);
         char* last_slash = strrchr(full_path, '\\');
         if (last_slash) *(last_slash + 1) = '\0';
-        output_dir = std::string(full_path) + "schema-dump";
+        // Per-game output dir (e.g. schema-dump/deadlock/, schema-dump/cs2/)
+        std::string game_folder = game_display;
+        for (auto& c : game_folder) c = tolower(c);
+        output_dir = std::string(full_path) + "schema-dump\\" + game_folder;
     }
 
     // ---- Pre-flight checks ----
@@ -1147,7 +1507,7 @@ int main(int argc, char* argv[]) {
         con_fail("Not running as administrator.");
         con_print("\n");
         con_color(CLR_WARN);
-        con_print("  This tool needs admin privileges to read Deadlock's memory.\n");
+        con_print("  This tool needs admin privileges to read %s's memory.\n", game_display.c_str());
         con_print("  Right-click dezlock-dump.exe -> Run as administrator\n");
         con_color(CLR_DEFAULT);
         wait_for_keypress();
@@ -1155,25 +1515,29 @@ int main(int argc, char* argv[]) {
     }
     con_ok("Running as administrator");
 
-    // Check 2: Deadlock is running
-    DWORD pid = find_process(L"deadlock.exe");
+    // Check 2: Target game is running
+    // Convert process name to wide string for find_process
+    wchar_t target_wide[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, target_process.c_str(), -1, target_wide, MAX_PATH);
+
+    DWORD pid = find_process(target_wide);
     if (!pid) {
-        con_fail("Deadlock is not running.");
+        con_fail("%s is not running.", game_display.c_str());
         con_print("\n");
         con_color(CLR_WARN);
-        con_print("  Please launch Deadlock first, then run this tool.\n");
+        con_print("  Please launch %s first, then run this tool.\n", game_display.c_str());
         con_print("  The game needs to be fully loaded (main menu or in a match).\n");
         con_color(CLR_DEFAULT);
         con_print("\n");
-        con_info("Waiting for Deadlock to start...");
+        con_info("Waiting for %s to start...", game_display.c_str());
 
-        // Wait for deadlock with a spinner
+        // Wait for game with a spinner
         const char* spinner = "|/-\\";
         int spin = 0;
         int wait_count = 0;
         while (!pid) {
             Sleep(500);
-            pid = find_process(L"deadlock.exe");
+            pid = find_process(target_wide);
             wait_count++;
 
             // Update spinner
@@ -1186,14 +1550,14 @@ int main(int argc, char* argv[]) {
             // Give up after 5 minutes
             if (wait_count > 600) {
                 con_print("\n");
-                con_fail("Timed out waiting for Deadlock (5 min). Exiting.");
+                con_fail("Timed out waiting for %s (5 min). Exiting.", game_display.c_str());
                 wait_for_keypress();
                 return 1;
             }
         }
         con_print("\n");
     }
-    con_ok("Deadlock found (PID: %lu)", pid);
+    con_ok("%s found (PID: %lu)", game_display.c_str(), pid);
 
     // Check 3: Worker DLL exists
     char exe_path[MAX_PATH];
@@ -1220,28 +1584,27 @@ int main(int argc, char* argv[]) {
     char temp_dir[MAX_PATH];
     GetTempPathA(MAX_PATH, temp_dir);
 
-    char inject_path[MAX_PATH];
-    snprintf(inject_path, MAX_PATH, "%sdezlock-worker-%lu.dll", temp_dir, GetTickCount());
-    CopyFileA(dll_path, inject_path, FALSE);
-
     char json_path[MAX_PATH], done_path[MAX_PATH];
     snprintf(json_path, MAX_PATH, "%sdezlock-export.json", temp_dir);
     snprintf(done_path, MAX_PATH, "%sdezlock-done", temp_dir);
     DeleteFileA(done_path);
     DeleteFileA(json_path);
 
-    con_step("3/5", "Extracting schema from Deadlock...");
+    {
+        std::string step_msg = "Extracting schema from " + game_display + "...";
+        con_step("3/5", step_msg.c_str());
+    }
     con_info("This reads class layouts and field offsets from the game's memory.");
-    con_info("Deadlock will not be modified. This is read-only.");
+    con_info("%s will not be modified. This is read-only.", game_display.c_str());
 
-    if (!inject_dll(pid, inject_path)) {
-        con_fail("Could not connect to Deadlock process.");
+    if (!inject_dll(pid, dll_path)) {
+        con_fail("Could not connect to %s process.", game_display.c_str());
         con_info("Make sure the game is fully loaded (not still on splash screen).");
-        con_info("If the problem persists, try restarting Deadlock.");
+        con_info("If the problem persists, try restarting %s.", game_display.c_str());
         wait_for_keypress();
         return 1;
     }
-    con_ok("Connected to Deadlock");
+    con_ok("Connected to %s", game_display.c_str());
 
     // ---- Wait for completion ----
     con_step("4/5", "Dumping schema data...");
@@ -1416,7 +1779,6 @@ int main(int argc, char* argv[]) {
 
     // Clean up temp files
     DeleteFileA(done_path);
-    DeleteFileA(inject_path);
 
     // ---- Summary ----
     con_print("\n");

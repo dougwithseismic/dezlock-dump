@@ -14,6 +14,8 @@ Usage:
   python import-schema.py --game deadlock                              # auto-detect JSON from bin/
   python import-schema.py --game deadlock --json path/to/all-modules.json
   python import-schema.py --game deadlock --output ./my-sdk/
+  python import-schema.py --game cs2 --json path/to/all-modules.json   # CS2
+  python import-schema.py --game dota2 --json path/to/all-modules.json # Dota 2
 """
 
 import argparse
@@ -849,7 +851,7 @@ def main():
     if args.output:
         out_dir = Path(args.output)
     else:
-        out_dir = Path(__file__).parent / "generated"
+        out_dir = Path(__file__).parent / "generated" / game
 
     print(f"Output: {out_dir}")
     print(f"Modules: {len(modules)}")
