@@ -489,7 +489,20 @@ static bool resolve_enum(void* enum_info, const char* module_name, RuntimeEnum& 
 const RuntimeClass* SchemaManager::find_class(const char* module, const char* class_name) {
     if (!m_schema_system || !module || !class_name) return nullptr;
 
-    // Check cache first
+    // Prefer C_ prefixed variant over server-style names.
+    // Shared classes like CBaseAnimGraph reference parents by server name
+    // (CBaseModelEntity, CBaseEntity) but the client cache has the correct
+    // data under C_ names (C_BaseModelEntity, C_BaseEntity). Without this,
+    // any client class inheriting through CBaseAnimGraph gets server offsets.
+    if (class_name[0] == 'C' && class_name[1] != '_'
+        && class_name[1] >= 'A' && class_name[1] <= 'Z') {
+        std::string client_key = std::string(module) + "::C_" + (class_name + 1);
+        auto client_it = m_cache.find(client_key);
+        if (client_it != m_cache.end())
+            return &client_it->second;
+    }
+
+    // Check cache
     std::string key = std::string(module) + "::" + class_name;
     auto it = m_cache.find(key);
     if (it != m_cache.end()) return &it->second;
@@ -892,7 +905,21 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
     auto entries = collect_utltshash_entries(hash_base, seh_validate_class_info, module_name);
 
     int classes_found = 0;
+    int skipped_xmod = 0;
     for (uintptr_t class_info : entries) {
+        // Check m_pszModule (+0x10) — the TypeScope hash table can contain
+        // entries from other modules (server classes in client's scope).
+        // Only cache entries that actually belong to this module.
+        uintptr_t mod_ptr = 0;
+        if (seh_read_ptr(class_info + 0x10, &mod_ptr) && mod_ptr) {
+            const char* entry_mod = nullptr;
+            if (seh_read_string(mod_ptr, &entry_mod)
+                && entry_mod && _stricmp(entry_mod, module_name) != 0) {
+                skipped_xmod++;
+                continue;
+            }
+        }
+
         RuntimeClass cls = {};
         if (resolve_class(reinterpret_cast<void*>(class_info), module_name, cls)) {
             std::string key = std::string(module_name) + "::" + cls.name;
@@ -903,6 +930,8 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
         }
     }
 
+    if (skipped_xmod > 0)
+        LOG_I("enumerate_scope: skipped %d cross-module entries in %s", skipped_xmod, module_name);
     LOG_I("enumerate_scope: %d classes from hash table in %s", classes_found, module_name);
 
     // Phase 2: Discover base classes referenced by m_pClass pointers but
@@ -928,6 +957,21 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
             }
         }
         for (const auto& [ptr, key] : pending) {
+            if (m_cache.find(key) != m_cache.end()) continue;
+
+            // Check m_pszModule on the raw pointer — if it belongs to a
+            // different module (e.g. server.dll), skip it entirely.
+            // This prevents server-side class data from being cached
+            // under a client.dll key.
+            uintptr_t mod_ptr = 0;
+            if (seh_read_ptr(ptr + 0x10, &mod_ptr) && mod_ptr) {
+                const char* ptr_mod = nullptr;
+                if (seh_read_string(mod_ptr, &ptr_mod)
+                    && ptr_mod && _stricmp(ptr_mod, module_name) != 0) {
+                    continue;
+                }
+            }
+
             RuntimeClass cls = {};
             if (resolve_class(reinterpret_cast<void*>(ptr), module_name, cls)) {
                 if (m_cache.find(key) == m_cache.end()) {
