@@ -1455,6 +1455,7 @@ int main(int argc, char* argv[]) {
     int timeout_sec = 180;
     bool gen_headers = false;
     bool gen_signatures = false;
+    bool gen_sdk = false;
     bool gen_all = false;
 
     for (int i = 1; i < argc; i++) {
@@ -1468,17 +1469,20 @@ int main(int argc, char* argv[]) {
             gen_headers = true;
         } else if (strcmp(argv[i], "--signatures") == 0) {
             gen_signatures = true;
+        } else if (strcmp(argv[i], "--sdk") == 0) {
+            gen_sdk = true;
         } else if (strcmp(argv[i], "--all") == 0) {
             gen_all = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]\n\n");
+            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--sdk] [--all]\n\n");
             con_print("  --process     Target process name (skips game selection menu)\n");
             con_print("                Examples: --process cs2.exe, --process dota2.exe\n");
             con_print("  --output      Output directory (default: schema-dump/<game>/ next to exe)\n");
             con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
             con_print("  --headers     Generate C++ SDK headers (structs, enums, offsets)\n");
             con_print("  --signatures  Generate byte pattern signatures from vtable functions\n");
-            con_print("  --all         Enable all generators (headers + signatures)\n");
+            con_print("  --sdk         Generate cherry-pickable C++ SDK (v2-quality structs)\n");
+            con_print("  --all         Enable all generators (headers + signatures + sdk)\n");
             wait_for_keypress();
             return 0;
         }
@@ -1623,7 +1627,12 @@ int main(int argc, char* argv[]) {
     if (gen_all) {
         gen_headers = true;
         gen_signatures = true;
+        gen_sdk = true;
     }
+
+    // Game name (lowercase) for --sdk and folder naming
+    std::string game_name = game_display;
+    for (auto& c : game_name) c = tolower(c);
 
     // Default output dir: schema-dump/ next to the exe
     if (output_dir.empty()) {
@@ -1633,10 +1642,7 @@ int main(int argc, char* argv[]) {
         GetFullPathNameA(exe_dir, MAX_PATH, full_path, nullptr);
         char* last_slash = strrchr(full_path, '\\');
         if (last_slash) *(last_slash + 1) = '\0';
-        // Per-game output dir (e.g. schema-dump/deadlock/, schema-dump/cs2/)
-        std::string game_folder = game_display;
-        for (auto& c : game_folder) c = tolower(c);
-        output_dir = std::string(full_path) + "schema-dump\\" + game_folder;
+        output_dir = std::string(full_path) + "schema-dump\\" + game_name;
     }
 
     // ---- Pre-flight checks ----
@@ -2461,6 +2467,53 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ---- SDK generation (optional) ----
+    bool sdk_ok = false;
+    if (gen_sdk) {
+        con_print("\n");
+        con_step("SDK", "Generating cherry-pickable C++ SDK...");
+
+        char python[256] = {};
+        if (!find_python(python, sizeof(python))) {
+            con_fail("Python not found in PATH. Install Python 3.x to use --sdk.");
+            con_info("You can still run manually: python import-schema.py --game %s --json %s",
+                     game_name.c_str(), json_out.c_str());
+        } else {
+            // Find import-schema.py: check next to exe, then parent dir
+            char script_path[MAX_PATH];
+            snprintf(script_path, MAX_PATH, "%simport-schema.py", exe_path);
+
+            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
+                char parent_path[MAX_PATH];
+                snprintf(parent_path, MAX_PATH, "%s..\\import-schema.py", exe_path);
+                char resolved[MAX_PATH];
+                if (GetFullPathNameA(parent_path, MAX_PATH, resolved, nullptr) > 0 &&
+                    GetFileAttributesA(resolved) != INVALID_FILE_ATTRIBUTES) {
+                    snprintf(script_path, MAX_PATH, "%s", resolved);
+                }
+            }
+
+            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
+                con_fail("import-schema.py not found.");
+                con_info("Searched: %simport-schema.py", exe_path);
+                con_info("Searched: %s..\\import-schema.py", exe_path);
+            } else {
+                std::string sdk_output = output_dir + "\\sdk";
+                char args[2048];
+                snprintf(args, sizeof(args), "--game \"%s\" --json \"%s\" --output \"%s\"",
+                         game_name.c_str(), json_out.c_str(), sdk_output.c_str());
+
+                con_info("Running: %s %s %s", python, script_path, args);
+                if (run_python_script(python, script_path, args)) {
+                    con_ok("SDK generated -> %s\\", sdk_output.c_str());
+                    sdk_ok = true;
+                } else {
+                    con_fail("SDK generation failed. Check output above.");
+                }
+            }
+        }
+    }
+
     // Clean up temp files
     DeleteFileA(done_path);
     DeleteFileA(patterns_temp);
@@ -2499,6 +2552,9 @@ int main(int argc, char* argv[]) {
     if (sig_total > 0) {
         con_print("  %-20s %d (%d unique)\n", "Signatures:", sig_total, sig_unique);
     }
+    if (sdk_ok) {
+        con_print("  %-20s %s\\sdk\\\n", "SDK:", output_dir.c_str());
+    }
     con_print("\n");
 
     con_color(CLR_OK);
@@ -2514,12 +2570,16 @@ int main(int argc, char* argv[]) {
     if (gen_signatures && sig_total > 0) {
         con_print("    grep CCitadelInput %s\\signatures\\client.txt\n", output_dir.c_str());
     }
+    if (sdk_ok) {
+        con_print("    #include \"sdk/client/C_BaseEntity.hpp\"\n");
+    }
 
     // Show tips for unused features
     std::vector<std::string> tips;
     if (!gen_headers) tips.push_back("--headers     Generate C++ SDK headers");
     if (!gen_signatures) tips.push_back("--signatures  Generate byte pattern signatures");
-    if (!gen_all && (!gen_headers || !gen_signatures)) tips.push_back("--all         Enable all generators");
+    if (!gen_sdk) tips.push_back("--sdk         Generate cherry-pickable C++ SDK");
+    if (!gen_all && (!gen_headers || !gen_signatures || !gen_sdk)) tips.push_back("--all         Enable all generators");
 
     if (!tips.empty()) {
         con_print("\n");

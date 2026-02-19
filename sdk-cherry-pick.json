@@ -1,0 +1,24 @@
+{
+  "helpers": {
+    "C_BaseEntity": {
+      "methods": [
+        "bool is_alive() const { return m_lifeState == 0 && m_iHealth > 0; }",
+        "int team() const { return static_cast<int>(m_iTeamNum); }",
+        "int health() const { return m_iHealth; }",
+        "int max_health() const { return m_iMaxHealth; }",
+        "float health_pct() const { return m_iMaxHealth > 0 ? (float)m_iHealth / m_iMaxHealth : 0.f; }"
+      ]
+    },
+    "CBasePlayerController": {
+      "methods": [
+        "const char* player_name() const { return m_iszPlayerName; }",
+        "uint64_t steam_id() const { return m_steamID; }"
+      ]
+    },
+    "CGameSceneNode": {
+      "methods": [
+        "bool is_dormant() const { return m_bDormant != 0; }"
+      ]
+    }
+  }
+}

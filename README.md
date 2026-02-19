@@ -79,8 +79,20 @@ For signature generation (all modules with vtables):
 
 | File | Format | Description |
 |------|--------|-------------|
-| `bin/schema-dump/signatures/<module>.txt` | Greppable text | Pattern signatures per function |
-| `bin/schema-dump/signatures/_all-signatures.json` | JSON | Structured signatures for tooling |
+| `schema-dump/<game>/signatures/<module>.txt` | Greppable text | Pattern signatures per function |
+| `schema-dump/<game>/signatures/_all-signatures.json` | JSON | Structured signatures for tooling |
+
+For SDK generation (`--sdk`):
+
+| File | Format | Description |
+|------|--------|-------------|
+| `schema-dump/<game>/sdk/types.hpp` | C++ header | Base types (Vec3, QAngle, CHandle, etc.) |
+| `schema-dump/<game>/sdk/<module>/_offsets.hpp` | C++ header | Per-module constexpr offset constants |
+| `schema-dump/<game>/sdk/<module>/_enums.hpp` | C++ header | Per-module scoped enum classes |
+| `schema-dump/<game>/sdk/<module>/<Class>.hpp` | C++ header | Per-class padded struct with static_asserts |
+| `schema-dump/<game>/sdk/_all-offsets.hpp` | C++ header | Master include for all module offsets |
+| `schema-dump/<game>/sdk/_all-enums.hpp` | C++ header | Master include for all module enums |
+| `schema-dump/<game>/sdk/_all-vtables.hpp` | C++ header | VTable RVAs + function indices |
 
 Additionally, `%TEMP%\dezlock-export.json` contains the complete JSON export with vtable data and function bytes.
 
@@ -103,9 +115,9 @@ dezlock-dump.exe --process cs2.exe --all
 dezlock-dump.exe --process dota2.exe --all
 ```
 
-This dumps schema + generates SDK headers + pattern signatures in one shot. Output lands in `schema-dump/<game>/` next to the exe (e.g. `schema-dump/deadlock/`, `schema-dump/cs2/`).
+This dumps schema + generates SDK headers + cherry-pickable SDK + pattern signatures in one shot. Output lands in `schema-dump/<game>/` next to the exe (e.g. `schema-dump/deadlock/`, `schema-dump/cs2/`).
 
-> **Note:** The schema dump itself finishes in seconds, but SDK header generation (`--headers`) and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions (128 bytes each) across 58+ DLLs. Let it run, don't close the window early.
+> **Note:** The schema dump itself finishes in seconds, but SDK generation (`--sdk`), header generation (`--headers`), and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions (128 bytes each) across 58+ DLLs. Let it run, don't close the window early.
 
 ### Build from Source
 
@@ -120,7 +132,7 @@ Produces `bin/dezlock-dump.exe` and `bin/dezlock-worker.dll`.
 ## Usage
 
 ```
-dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--all]
+dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--headers] [--signatures] [--sdk] [--all]
 ```
 
 | Flag | Default | Description |
@@ -130,7 +142,8 @@ dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--heade
 | `--wait <seconds>` | `30` | Max time to wait for worker DLL |
 | `--headers` | off | Generate C++ SDK headers (structs, enums, offsets) |
 | `--signatures` | off | Generate byte pattern signatures (requires Python 3) |
-| `--all` | off | Enable all generators (headers + signatures) |
+| `--sdk` | off | Generate cherry-pickable C++ SDK (v2-quality structs, requires Python 3) |
+| `--all` | off | Enable all generators (headers + signatures + sdk) |
 
 ### Requirements
 
@@ -321,18 +334,147 @@ auto addr = pattern_scan(client_dll, "40 53 56 57 48 81");
 auto addr = pattern_scan(panorama_dll, "48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 48");
 ```
 
-## SDK Header Generation
+## Cherry-Pickable SDK Generation (`--sdk`)
 
-`import-schema.py` converts the JSON export into ready-to-include C++ headers:
+The `--sdk` flag generates a high-quality, cherry-pickable C++ SDK with v2-style types (`Vec3`, `QAngle`, `CHandle`), proper `namespace sdk {}` wrapping, and `static_assert` validation on every field. Each class gets its own `.hpp` file — include only what you need.
 
 ```bash
-# After running dezlock-dump.exe
-python import-schema.py --game deadlock
-python import-schema.py --game cs2 --json path/to/_all-modules.json
-python import-schema.py --game dota2 --json path/to/_all-modules.json
+# Integrated (runs automatically after schema dump)
+dezlock-dump.exe --sdk
+dezlock-dump.exe --all    # includes --sdk
+
+# Standalone (from existing JSON export)
+python import-schema.py --game deadlock --json schema-dump/deadlock/_all-modules.json
+python import-schema.py --game cs2 --json schema-dump/cs2/_all-modules.json
 ```
 
-Output goes to `generated/<game>/` by default (e.g. `generated/deadlock/`, `generated/cs2/`).
+### Output Structure
+
+```
+schema-dump/<game>/sdk/
+  types.hpp                    — Base types (Vec3, QAngle, CHandle, Color, ViewMatrix)
+  _all-offsets.hpp             — Master include for all offset constants
+  _all-enums.hpp               — Master include for all enums
+  _all-vtables.hpp             — VTable RVAs + function indices
+  client/
+    _offsets.hpp               — constexpr offset constants for client.dll
+    _enums.hpp                 — Scoped enum classes for client.dll
+    C_BaseEntity.hpp           — Padded struct with static_asserts
+    C_BasePlayerPawn.hpp
+    C_CitadelPlayerPawn.hpp
+    ...
+  server/
+    _offsets.hpp
+    _enums.hpp
+    CEntityInstance.hpp
+    ...
+```
+
+Cherry-pick a single class: `#include "sdk/client/C_BaseEntity.hpp"` — pulls just that class and its parent chain. No barrel files.
+
+### v2-Style Types
+
+Schema types are mapped to proper named structs instead of raw arrays:
+
+| Schema Type | SDK Type | Size |
+|-------------|----------|------|
+| `Vector` / `VectorWS` | `Vec3` | 12 |
+| `QAngle` | `QAngle` | 12 |
+| `Color` | `Color` | 4 |
+| `Vector2D` | `Vec2` | 8 |
+| `CHandle<T>` | `CHandle` | 4 |
+| `CNetworkUtlVectorBase<CHandle<T>>` | `CHandleVector` | 24 |
+| `GameTime_t` | `float` | 4 |
+
+`types.hpp` includes operator overloads, helper methods (`CHandle::is_valid()`, `CHandle::index()`, `Vec3::length_sqr()`), and static_asserts.
+
+### Generated Struct Example
+
+```cpp
+#include "../types.hpp"
+#include "../server/CEntityInstance.hpp"
+
+namespace sdk {
+
+#pragma pack(push, 1)
+struct C_BaseEntity : CEntityInstance {
+    void* m_CBodyComponent;        // 0x38
+    uint8_t _pad0040[0x2F0];
+    void* m_pGameSceneNode;        // 0x338
+    int32_t m_iMaxHealth;          // 0x350
+    int32_t m_iHealth;             // 0x354
+    uint8_t m_lifeState;           // 0x35C
+    CHandle m_hOwnerEntity;        // 0x528
+    Vec3 m_vecAbsVelocity;         // 0x404
+    // ...
+
+    // --- Helper methods (from sdk-cherry-pick.json) ---
+    bool is_alive() const { return m_lifeState == 0 && m_iHealth > 0; }
+    int team() const { return static_cast<int>(m_iTeamNum); }
+};
+#pragma pack(pop)
+
+static_assert(sizeof(C_BaseEntity) == 0x608, "C_BaseEntity size");
+static_assert(offsetof(C_BaseEntity, m_iHealth) == 0x354, "m_iHealth");
+
+} // namespace sdk
+```
+
+### Cherry-Pick Helpers (`sdk-cherry-pick.json`)
+
+Classes listed in `sdk-cherry-pick.json` get inline helper methods injected into their struct. Classes NOT listed still get generated — just without helpers.
+
+```json
+{
+  "helpers": {
+    "C_BaseEntity": {
+      "methods": [
+        "bool is_alive() const { return m_lifeState == 0 && m_iHealth > 0; }",
+        "int team() const { return static_cast<int>(m_iTeamNum); }"
+      ]
+    }
+  }
+}
+```
+
+### Offset Constants
+
+Per-module offset files live inside each module's folder:
+
+```cpp
+// sdk/client/_offsets.hpp
+namespace sdk::offsets::client {
+namespace C_BaseEntity {
+    constexpr uint32_t m_iHealth = 0x354;
+    constexpr uint32_t m_iMaxHealth = 0x350;
+}
+}
+```
+
+### Type Resolution (~96%)
+
+| Category | Description | Example |
+|----------|-------------|---------|
+| primitive | Built-in types | `int32` → `int32_t` |
+| rich_type | Named math/handle types | `Vector` → `Vec3`, `CHandle<T>` → `CHandle` |
+| alias | Known Source 2 types (~100) | `GameTime_t` → `float` |
+| template | Container types (~25) | `CUtlVector<T>` → sized blob |
+| embedded | Nested schema classes | Sized blob |
+| handle | Entity handles | `CHandle<T>` → `CHandle` |
+| enum | Enum-typed fields | Resolved to sized integer |
+| pointer | Pointer types | `T*` → `void*` |
+| array | Fixed-size arrays | `Vector[2]` → `Vec3[2]` |
+| bitfield | Bit fields (size=0) | Emitted as comments |
+| unresolved | Remaining (~3%) | Sized blob fallback (sizes always correct) |
+
+## Legacy SDK Header Generation (`--headers`)
+
+The `--headers` flag generates a simpler set of C++ headers without the v2-style type system or `namespace sdk` wrapping. Still useful for quick offset lookups.
+
+```bash
+dezlock-dump.exe --headers
+python import-schema.py --game deadlock  # standalone
+```
 
 ### Generated Files
 
@@ -353,62 +495,12 @@ namespace CCitadelInput {
     namespace fn {
         constexpr int idx_0 = 0;  // rva=0x508F10
         constexpr int idx_5 = 5;  // rva=0x15AF360 (CreateMove)
-        // ...
     }
 }
 }
 ```
 
 Vtable indices are ABI-stable — they don't change across patches. Only the RVAs shift. Hook by index, resolve the vtable at runtime with `module_base + vtable_rva`.
-
-### Offset Header
-
-```cpp
-namespace deadlock::generated::offsets {
-namespace C_BaseEntity {
-    constexpr uint32_t m_iHealth = 0x354;
-    constexpr uint32_t m_iMaxHealth = 0x350;
-    constexpr uint32_t m_pGameSceneNode = 0x330;
-    // ...
-}
-}
-```
-
-### Struct Headers
-
-Per-class headers with full padding and compile-time offset verification — if an offset is wrong after a patch, the build fails immediately:
-
-```cpp
-#pragma pack(push, 1)
-struct C_BaseEntity {
-    uint8_t _pad0000[0x330];
-    void* m_pGameSceneNode;         // 0x330
-    uint8_t _pad0338[0x18];
-    int32_t m_iMaxHealth;           // 0x350
-    int32_t m_iHealth;              // 0x354
-    // ...
-};
-#pragma pack(pop)
-static_assert(sizeof(C_BaseEntity) == 0xF60, "C_BaseEntity size");
-static_assert(offsetof(C_BaseEntity, m_iHealth) == 0x354, "m_iHealth");
-```
-
-### Type Resolution (~96%)
-
-The type resolver maps schema types to proper C++ types across 10 categories:
-
-| Category | Description | Example |
-|----------|-------------|---------|
-| primitive | Built-in types | `int32` → `int32_t` |
-| alias | Known Source 2 types (~100) | `Vector` → `float[3]`, `GameTime_t` → `float` |
-| template | Container types (~25) | `CUtlVector<T>` → sized blob with type comment |
-| embedded | Nested schema classes | Sized blob, class name in comment |
-| handle | Entity handles | `CHandle<T>` → `uint32_t` |
-| enum | Enum-typed fields | Resolved to sized integer from JSON |
-| pointer | Pointer types | `T*` → `void*` |
-| array | Fixed-size arrays | `int32[6]` → `int32_t[6]` |
-| bitfield | Bit fields (size=0) | Emitted as comments |
-| unresolved | Remaining (~3%) | Sized blob fallback (sizes always correct) |
 
 ## What Gets Captured
 
@@ -468,6 +560,7 @@ This includes **RTTI-only classes** that have no schema entry — things like `C
 13. Main exe reads JSON and generates consolidated `<module>.txt` (classes + flattened + enums), `_globals.txt` (all globals + recursive field trees), `_access-paths.txt` (schema globals only), and `_entity-paths.txt` (every entity class with full field trees)
 14. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
 15. **Optional**: `--headers` generates C++ SDK headers with padded structs
+16. **Optional**: `--sdk` invokes `import-schema.py` to generate cherry-pickable C++ SDK with v2-quality types
 16. Worker auto-unloads via `FreeLibraryAndExitThread`
 
 ### Vtable Discovery Detail

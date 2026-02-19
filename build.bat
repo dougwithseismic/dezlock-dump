@@ -75,6 +75,12 @@ if exist "!TOOL_DIR!\patterns.json" (
     echo   Copied: patterns.json
 )
 
+:: Copy SDK cherry-pick config to bin/
+if exist "!TOOL_DIR!\sdk-cherry-pick.json" (
+    copy /Y "!TOOL_DIR!\sdk-cherry-pick.json" "!OUTPUT_DIR!\sdk-cherry-pick.json" >nul
+    echo   Copied: sdk-cherry-pick.json
+)
+
 :: Clean up obj files
 del /q *.obj 2>nul
 del /q "!OUTPUT_DIR!\*.exp" 2>nul

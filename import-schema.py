@@ -2,20 +2,22 @@
 """
 import-schema.py — Import dezlock-dump JSON export into compilable C++ SDK headers
 
-Reads dezlock-dump's all-modules.json and generates:
-  generated/
-    _all-offsets.hpp     — Master offset constants for every class
-    _all-enums.hpp       — All enums as enum class
-    _all-vtables.hpp     — VTable RVAs and virtual function indices
+Reads dezlock-dump's all-modules.json and generates a cherry-pickable SDK:
+  sdk/
+    types.hpp                     — Base types (Vec3, QAngle, CHandle, Color, etc.)
+    {module}-offsets.hpp          — Per-module constexpr offset constants
+    {module}-enums.hpp            — Per-module scoped enum classes
+    _all-offsets.hpp              — Consolidated offsets include
+    _all-enums.hpp                — Consolidated enums include
+    _all-vtables.hpp              — VTable RVAs + function indices
     {module}/
-      {ClassName}.hpp    — Padded struct with static_asserts
+      {ClassName}.hpp             — Per-class padded struct with static_asserts
 
 Usage:
   python import-schema.py --game deadlock                              # auto-detect JSON from bin/
   python import-schema.py --game deadlock --json path/to/all-modules.json
   python import-schema.py --game deadlock --output ./my-sdk/
-  python import-schema.py --game cs2 --json path/to/all-modules.json   # CS2
-  python import-schema.py --game dota2 --json path/to/all-modules.json # Dota 2
+  python import-schema.py --game cs2 --json path/to/all-modules.json
 """
 
 import argparse
@@ -27,9 +29,20 @@ from datetime import datetime
 from pathlib import Path
 
 # ============================================================================
-# Type mapping (schema type -> C++ type)
+# v2-style type system — maps schema types to high-quality C++ types
 # ============================================================================
 
+# Types that get emitted as named structs in types.hpp
+RICH_TYPES = {
+    "Vector":           ("Vec3",        12),
+    "VectorWS":         ("Vec3",        12),
+    "QAngle":           ("QAngle",      12),
+    "Color":            ("Color",        4),
+    "Vector2D":         ("Vec2",         8),
+    "Vector4D":         ("Vec4",        16),
+}
+
+# Primitive type mapping (schema -> (cpp_type, size))
 PRIMITIVE_MAP = {
     "bool": ("bool", 1),
     "int8": ("int8_t", 1),
@@ -46,36 +59,30 @@ PRIMITIVE_MAP = {
 }
 
 # ALIAS_TABLE: schema type -> (cpp_type_or_None, size)
-# cpp_type=None means emit as uint8_t blob of the given size (preserves sizeof)
+# cpp_type=None means emit as uint8_t blob of the given size
 ALIAS_TABLE = {
-    # String / symbol types (opaque blobs — internal layout is engine-private)
+    # String / symbol types (opaque blobs)
     "CUtlString":           ("void*", 8),
     "CUtlSymbolLarge":      ("void*", 8),
     "CGlobalSymbol":        (None, 8),
     "CUtlStringToken":      ("uint32_t", 4),
     "CKV3MemberNameWithStorage": (None, 24),
 
-    # Math types
-    "Color":                ("uint32_t", 4),
-    "QAngle":               ("float[3]", 12),
-    "Vector":               ("float[3]", 12),
-    "Vector2D":             ("float[2]", 8),
-    "Vector4D":             ("float[4]", 16),
-    "VectorWS":             ("float[3]", 12),   # world-space Vector
-    "VectorAligned":        ("float[4]", 16),   # 16-byte aligned Vector
+    # Math types (non-rich — these get raw array fallback)
+    "VectorAligned":        ("float[4]", 16),
     "Quaternion":           ("float[4]", 16),
     "QuaternionStorage":    ("float[4]", 16),
     "RotationVector":       ("float[3]", 12),
     "matrix3x4_t":          ("float[12]", 48),
     "matrix3x4a_t":         ("float[12]", 48),
-    "CTransform":           (None, 32),         # pos + quat
+    "CTransform":           (None, 32),
 
     # Game time / tick types
     "GameTime_t":           ("float", 4),
     "GameTick_t":           ("int32_t", 4),
     "AnimationTimeFloat":   ("float", 4),
 
-    # Handle types (all are uint32 handles under the hood)
+    # Handle types
     "AttachmentHandle_t":   ("uint8_t", 1),
     "CAnimParamHandle":     ("uint16_t", 2),
     "CAnimParamHandleMap":  (None, 2),
@@ -116,7 +123,7 @@ ALIAS_TABLE = {
     "CPhysicsComponent":    (None, 8),
     "CRenderComponent":     (None, 8),
 
-    # Commonly-seen opaque structs (fixed sizes from dezlock-dump)
+    # Commonly-seen opaque structs
     "CPiecewiseCurve":      (None, 64),
     "CAnimGraphTagOptionalRef": (None, 32),
     "CAnimGraphTagRef":     (None, 32),
@@ -209,7 +216,6 @@ ALIAS_TABLE = {
     "AnimParamButton_t":    ("int32_t", 4),
     "AnimParamNetworkSetting": ("int32_t", 4),
     "CGroundIKSolverSettings": (None, 48),
-    "CAnimParamHandleMap":  (None, 2),
 }
 
 # CONTAINER_SIZES: template container outer name -> fixed size (or None = use field's size)
@@ -221,15 +227,15 @@ CONTAINER_SIZES = {
     "CUtlLeanVector":               16,
     "CUtlOrderedMap":               40,
     "CUtlHashtable":                40,
-    "CResourceNameTyped":           None,  # variable size, use field["size"]
+    "CResourceNameTyped":           None,
     "CEmbeddedSubclass":            16,
     "CStrongHandle":                8,
     "CWeakHandle":                  8,
     "CStrongHandleCopyable":        8,
     "CSmartPtr":                    8,
     "CSmartPropPtr":                8,
-    "CAnimGraphParamRef":           None,  # variable size
-    "CEntityOutputTemplate":        None,  # variable size
+    "CAnimGraphParamRef":           None,
+    "CEntityOutputTemplate":        None,
     "CEntityIOOutput":              None,
     "CAnimInputDamping":            None,
     "CRemapFloat":                  None,
@@ -241,7 +247,7 @@ CONTAINER_SIZES = {
     "CParticleModelInput":          None,
     "CParticleRemapFloatInput":     None,
     "CRandomNumberGeneratorParameters": None,
-    "CAnimGraph2ParamOptionalRef":  None,  # variable size
+    "CAnimGraph2ParamOptionalRef":  None,
     "CAnimGraph2ParamRef":          None,
     "CModifierHandleTyped":         None,
     "CSubclassName":                None,
@@ -249,12 +255,16 @@ CONTAINER_SIZES = {
 }
 
 
+# ============================================================================
 # Resolution statistics tracker
+# ============================================================================
+
 class ResolveStats:
     def __init__(self):
         self.counts = {
             "primitive": 0,
             "alias": 0,
+            "rich_type": 0,
             "template": 0,
             "embedded": 0,
             "handle": 0,
@@ -274,7 +284,7 @@ class ResolveStats:
         resolved = self.total - self.counts["unresolved"]
         pct = (resolved / self.total * 100) if self.total > 0 else 0
         print(f"\nType resolution: {resolved} / {self.total} ({pct:.1f}%)")
-        for cat in ["primitive", "alias", "template", "embedded", "handle",
+        for cat in ["primitive", "alias", "rich_type", "template", "embedded", "handle",
                      "enum", "pointer", "array", "bitfield", "unresolved"]:
             c = self.counts.get(cat, 0)
             if c > 0:
@@ -282,10 +292,11 @@ class ResolveStats:
                 print(f"  {cat + ':':14s}{c:>5d}{label}")
 
 
-# Global stats instance — set in main() before generation
+# Global state — set in main() before generation
 _stats = ResolveStats()
-_all_enums: dict[str, int] = {}   # enum_name -> size
-_all_classes: set[str] = set()    # known class names
+_all_enums: dict[str, int] = {}
+_all_classes: set[str] = set()
+_cherry_pick: dict = {}  # loaded from sdk-cherry-pick.json
 
 
 def schema_to_cpp_type(schema_type: str, size: int) -> tuple[str | None, str]:
@@ -294,77 +305,81 @@ def schema_to_cpp_type(schema_type: str, size: int) -> tuple[str | None, str]:
     Returns (cpp_type, category).
     - cpp_type is the C++ type string, or None to emit a sized blob.
     - category is the resolution category for stats tracking.
-    - For blobs, caller emits uint8_t name[size] with a comment.
     """
-    # 1. Primitives
+    # 1. Rich types (Vector -> Vec3, QAngle -> QAngle, etc.)
+    if schema_type in RICH_TYPES:
+        return RICH_TYPES[schema_type][0], "rich_type"
+
+    # 2. Primitives
     if schema_type in PRIMITIVE_MAP:
         return PRIMITIVE_MAP[schema_type][0], "primitive"
 
-    # 2. Alias table
+    # 3. Alias table
     if schema_type in ALIAS_TABLE:
         cpp, _ = ALIAS_TABLE[schema_type]
         return cpp, "alias"
 
-    # 3. CHandle<T> / CEntityHandle (always uint32)
+    # 4. CHandle<T> / CEntityHandle (always CHandle)
     if schema_type.startswith("CHandle<") or schema_type.startswith("CEntityHandle"):
-        return "uint32_t", "handle"
+        return "CHandle", "handle"
 
-    # 4. Pointers
+    # 5. Pointers
     if schema_type.endswith("*"):
         return "void*", "pointer"
 
-    # 5. Bitfields (size=0, type like "bitfield:3")
+    # 6. Bitfields (size=0, type like "bitfield:3")
     if schema_type.startswith("bitfield:"):
         return None, "bitfield"
 
-    # 6. char[N] arrays
+    # 7. char[N] arrays
     m = re.match(r"char\[(\d+)\]", schema_type)
     if m:
         return f"char[{m.group(1)}]", "array"
 
-    # 7. Fixed-size arrays of known types (e.g. int32[6], Vector[2], GameTime_t[4])
+    # 8. Fixed-size arrays of known types
     m = re.match(r"([\w:]+)\[(\d+)\]", schema_type)
     if m:
         base_type = m.group(1)
         count = m.group(2)
+        # Rich type arrays
+        if base_type in RICH_TYPES:
+            rich_name, _ = RICH_TYPES[base_type]
+            return f"{rich_name}[{count}]", "array"
         if base_type in PRIMITIVE_MAP:
             return f"{PRIMITIVE_MAP[base_type][0]}[{count}]", "array"
         if base_type in ALIAS_TABLE:
-            alias_cpp, alias_sz = ALIAS_TABLE[base_type]
+            alias_cpp, _ = ALIAS_TABLE[base_type]
             if alias_cpp is not None:
-                # Known concrete type — emit typed array
                 bracket = alias_cpp.find("[")
                 if bracket == -1:
                     return f"{alias_cpp}[{count}]", "array"
-                # alias is already an array (e.g. float[3]) — flatten
-                # Vector[2] → float[3][2] won't compile, use blob
                 return None, "array"
-            # alias is a blob — emit blob with correct total size
             return None, "array"
-        # CHandle arrays
         if base_type.startswith("CHandle"):
-            return f"uint32_t[{count}]", "array"
-        # Enum arrays
+            return f"CHandle[{count}]", "array"
         if base_type in _all_enums:
             enum_sz = _all_enums[base_type]
             int_type = {1: "uint8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
                 enum_sz, "int32_t"
             )
             return f"{int_type}[{count}]", "array"
-        # Unknown base type array — blob with comment
         return None, "array"
 
-    # 8. Template containers (CUtlVector<T>, CResourceNameTyped<...>, etc.)
+    # 9. Template containers
     lt = schema_type.find("<")
     if lt != -1:
         outer = schema_type[:lt]
+        # CNetworkUtlVectorBase<CHandle<T>> -> CHandleVector
+        if outer in ("CNetworkUtlVectorBase", "C_NetworkUtlVectorBase"):
+            inner = schema_type[lt + 1:-1] if schema_type.endswith(">") else ""
+            if inner.startswith("CHandle<"):
+                return "CHandleVector", "template"
         if outer in CONTAINER_SIZES:
             return None, "template"
-        # CHandle inside template
         if outer == "CHandle":
-            return "uint32_t", "handle"
+            return "CHandle", "handle"
 
-    # 9. Enum-typed fields
+    # 10. Enum-typed fields
     if schema_type in _all_enums:
         enum_sz = _all_enums[schema_type]
         int_type = {1: "uint8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
@@ -372,11 +387,11 @@ def schema_to_cpp_type(schema_type: str, size: int) -> tuple[str | None, str]:
         )
         return int_type, "enum"
 
-    # 10. Embedded schema classes (blob is correct, just categorize)
+    # 11. Embedded schema classes (blob)
     if schema_type in _all_classes:
         return None, "embedded"
 
-    # 11. Unresolved — fallback to blob
+    # 12. Unresolved — fallback to blob
     return None, "unresolved"
 
 
@@ -385,19 +400,8 @@ def schema_to_cpp_type(schema_type: str, size: int) -> tuple[str | None, str]:
 # ============================================================================
 
 def _strip_static_fields(raw: bytes) -> bytes:
-    """Remove all "static_fields": [...] sections from raw JSON bytes.
-
-    This operates on raw bytes before text decoding because the static_fields
-    arrays contain binary garbage (raw memory pointers with 0x22/quote bytes
-    embedded mid-string) that break both text decoders and regex parsers.
-
-    Strategy: find each `"static_fields"` key, then scan forward for the
-    closing `]` that sits at the correct indentation level (the line pattern
-    `\\n          ]` — newline + 10 spaces + bracket). Simple bracket-depth
-    counting won't work because the binary garbage contains literal [ and ] bytes.
-    """
+    """Remove all "static_fields": [...] sections from raw JSON bytes."""
     marker = b'"static_fields"'
-    # The closing bracket pattern: \r\n + 10 spaces + ]
     close_pattern = b"\n          ]"
     result = bytearray()
     pos = 0
@@ -408,18 +412,15 @@ def _strip_static_fields(raw: bytes) -> bytes:
             result.extend(raw[pos:])
             break
 
-        # Find the comma before "static_fields" (skip whitespace)
         comma_pos = idx - 1
         while comma_pos > pos and raw[comma_pos] in (0x20, 0x09, 0x0A, 0x0D):
             comma_pos -= 1
 
-        # Write everything up to (but not including) the comma
         if raw[comma_pos] == ord(","):
             result.extend(raw[pos:comma_pos])
         else:
             result.extend(raw[pos:idx])
 
-        # Find the closing bracket by searching for the indentation pattern
         bracket_start = raw.find(b"[", idx + len(marker))
         if bracket_start == -1:
             pos = idx + len(marker)
@@ -427,38 +428,28 @@ def _strip_static_fields(raw: bytes) -> bytes:
 
         close_idx = raw.find(close_pattern, bracket_start)
         if close_idx == -1:
-            # Couldn't find close — skip to next class boundary
-            # Look for the next `\n        {` or `\n      ]` (class/module end)
             fallback = raw.find(b"\n        }", bracket_start)
             if fallback == -1:
                 fallback = raw.find(b"\n      ]", bracket_start)
             if fallback == -1:
-                pos = bracket_start  # give up, include remaining
+                pos = bracket_start
                 continue
             pos = fallback
             continue
 
-        # Skip past the closing bracket + ]
         pos = close_idx + len(close_pattern)
 
     return bytes(result)
 
 
 def load_json(path: str) -> dict:
-    """Load dezlock-dump JSON export.
-
-    Tries clean UTF-8 parse first (works if dezlock-dump was built with the
-    seh_read_string + is_json_safe fixes). Falls back to byte-level sanitization
-    for older exports that have binary garbage in static_fields.
-    """
-    # Fast path: try clean parse
+    """Load dezlock-dump JSON export."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError):
         print("  (clean parse failed, applying byte-level sanitization...)")
 
-    # Slow path: strip static_fields + sanitize
     with open(path, "rb") as f:
         raw = f.read()
 
@@ -470,14 +461,158 @@ def load_json(path: str) -> dict:
     return json.loads(text, strict=False)
 
 
+def load_cherry_pick(script_dir: Path) -> dict:
+    """Load sdk-cherry-pick.json if it exists."""
+    for candidate in [
+        script_dir / "sdk-cherry-pick.json",
+        script_dir / "bin" / "sdk-cherry-pick.json",
+    ]:
+        if candidate.exists():
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"  Warning: Failed to parse {candidate}: {e}")
+    return {}
+
+
 # ============================================================================
-# Code generation
+# types.hpp generation
+# ============================================================================
+
+def generate_types_hpp(timestamp: str) -> str:
+    """Generate the base types.hpp with Vec3, QAngle, CHandle, etc."""
+    return f"""\
+// Auto-generated by import-schema.py from dezlock-dump — DO NOT EDIT
+// Base SDK types matching v2 hand-written quality
+// Generated: {timestamp}
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+
+namespace sdk {{
+
+// ---- Math types ----
+
+struct Vec2 {{
+    float x, y;
+
+    Vec2() : x(0), y(0) {{}}
+    Vec2(float x, float y) : x(x), y(y) {{}}
+
+    Vec2 operator+(const Vec2& o) const {{ return {{x + o.x, y + o.y}}; }}
+    Vec2 operator-(const Vec2& o) const {{ return {{x - o.x, y - o.y}}; }}
+    Vec2 operator*(float s) const {{ return {{x * s, y * s}}; }}
+}};
+
+struct Vec3 {{
+    float x, y, z;
+
+    Vec3() : x(0), y(0), z(0) {{}}
+    Vec3(float x, float y, float z) : x(x), y(y), z(z) {{}}
+
+    Vec3 operator+(const Vec3& o) const {{ return {{x + o.x, y + o.y, z + o.z}}; }}
+    Vec3 operator-(const Vec3& o) const {{ return {{x - o.x, y - o.y, z - o.z}}; }}
+    Vec3 operator*(float s) const {{ return {{x * s, y * s, z * s}}; }}
+
+    float length_sqr() const {{ return x * x + y * y + z * z; }}
+    float length_2d_sqr() const {{ return x * x + y * y; }}
+}};
+
+struct Vec4 {{
+    float x, y, z, w;
+}};
+
+struct QAngle {{
+    float pitch, yaw, roll;
+
+    QAngle() : pitch(0), yaw(0), roll(0) {{}}
+    QAngle(float p, float y, float r) : pitch(p), yaw(y), roll(r) {{}}
+}};
+
+// ---- Color ----
+
+struct Color {{
+    uint8_t r, g, b, a;
+}};
+
+// ---- Handles ----
+
+struct CHandle {{
+    uint32_t value;
+
+    bool is_valid() const {{ return value != 0xFFFFFFFF; }}
+    uint32_t index() const {{ return value & 0x7FFF; }}
+    uint32_t serial() const {{ return value >> 15; }}
+}};
+
+// CNetworkUtlVectorBase<CHandle<T>> — vector of entity handles
+struct CHandleVector {{
+    uint8_t _data[24]; // CNetworkUtlVectorBase internal layout
+
+    // Access as raw CHandle array (count at offset 0x0, data ptr at 0x8)
+    int32_t count() const {{ return *reinterpret_cast<const int32_t*>(_data); }}
+    const CHandle* data() const {{ return *reinterpret_cast<const CHandle* const*>(_data + 8); }}
+}};
+
+// ---- View matrix ----
+
+struct ViewMatrix {{
+    float m[4][4];
+}};
+
+// ---- Static asserts ----
+static_assert(sizeof(Vec2) == 8);
+static_assert(sizeof(Vec3) == 12);
+static_assert(sizeof(Vec4) == 16);
+static_assert(sizeof(QAngle) == 12);
+static_assert(sizeof(Color) == 4);
+static_assert(sizeof(CHandle) == 4);
+static_assert(sizeof(CHandleVector) == 24);
+static_assert(sizeof(ViewMatrix) == 64);
+
+}} // namespace sdk
+"""
+
+
+# ============================================================================
+# Per-class struct generation
 # ============================================================================
 
 def make_guard(name: str) -> str:
     guard = "SDK_GEN_" + name.upper()
     guard = re.sub(r"[^A-Z0-9_]", "_", guard)
     return guard + "_HPP"
+
+
+def safe_class_name(name: str) -> str:
+    """Convert a class name to a safe filename/identifier."""
+    return name.replace("::", "__")
+
+
+def needs_types_include(fields: list[dict]) -> bool:
+    """Check if any field uses a rich type that requires types.hpp."""
+    for f in fields:
+        schema_type = f["type"]
+        if schema_type in RICH_TYPES:
+            return True
+        # Check array of rich types
+        m = re.match(r"([\w:]+)\[(\d+)\]", schema_type)
+        if m and m.group(1) in RICH_TYPES:
+            return True
+        # CHandle fields
+        if schema_type.startswith("CHandle<") or schema_type.startswith("CEntityHandle"):
+            return True
+        # CHandleVector
+        lt = schema_type.find("<")
+        if lt != -1:
+            outer = schema_type[:lt]
+            if outer in ("CNetworkUtlVectorBase", "C_NetworkUtlVectorBase"):
+                inner = schema_type[lt + 1:-1] if schema_type.endswith(">") else ""
+                if inner.startswith("CHandle<"):
+                    return True
+    return False
 
 
 def emit_field(f: dict, cursor: int, lines: list[str]) -> int:
@@ -506,7 +641,7 @@ def emit_field(f: dict, cursor: int, lines: list[str]) -> int:
         m = re.match(r"bitfield:(\d+)", schema_type)
         bits = m.group(1) if m else "?"
         lines.append(f"    // bitfield {name} : {bits}; {comment}")
-        return cursor  # don't advance
+        return cursor
 
     if cpp_type is not None:
         bracket = cpp_type.find("[")
@@ -520,13 +655,34 @@ def emit_field(f: dict, cursor: int, lines: list[str]) -> int:
         lines.append(f"    uint8_t {name}[0x{size:X}]; {comment}")
     else:
         lines.append(f"    // 0x{offset:X} {name} ({schema_type}) — zero size")
-        return cursor  # don't advance
+        return cursor
 
     return offset + size if size > 0 else offset
 
 
+def get_parent_chain(cls_name: str, class_lookup: dict) -> list[str]:
+    """Get the full parent chain for include generation."""
+    chain = []
+    current = cls_name
+    seen = set()
+    while current and current in class_lookup:
+        if current in seen:
+            break
+        seen.add(current)
+        parent = class_lookup[current].get("parent")
+        if parent and parent in class_lookup:
+            chain.append(parent)
+        current = parent
+    return chain
+
+
+def find_include_module(class_name: str, class_to_module: dict) -> str | None:
+    """Find which module a class belongs to."""
+    return class_to_module.get(class_name)
+
+
 def generate_struct_header(cls: dict, module_name: str, class_lookup: dict,
-                           timestamp: str) -> str:
+                           class_to_module: dict, timestamp: str) -> str:
     """Generate a complete .hpp file for one class."""
     name = cls["name"]
     size = cls["size"]
@@ -551,9 +707,27 @@ def generate_struct_header(cls: dict, module_name: str, class_lookup: dict,
     lines.append(f"")
     lines.append(f"#include <cstdint>")
     lines.append(f"#include <cstddef>")
+
+    # Include types.hpp if any field uses rich types
+    use_types = needs_types_include(fields)
+    if use_types:
+        # Calculate relative path to types.hpp (up from module/ to sdk/)
+        lines.append(f'#include "../types.hpp"')
+
     if has_parent:
-        safe_parent = parent.replace("::", "__")
-        lines.append(f'#include "{safe_parent}.hpp"')
+        parent_safe = safe_class_name(parent)
+        parent_module = find_include_module(parent, class_to_module)
+        mod_clean = module_name.replace(".dll", "")
+        if parent_module and parent_module != mod_clean:
+            # Cross-module parent — include from sibling module dir
+            lines.append(f'#include "../{parent_module}/{parent_safe}.hpp"')
+        else:
+            lines.append(f'#include "{parent_safe}.hpp"')
+
+    lines.append(f"")
+
+    # Open namespace
+    lines.append(f"namespace sdk {{")
     lines.append(f"")
 
     # Struct definition
@@ -573,6 +747,14 @@ def generate_struct_header(cls: dict, module_name: str, class_lookup: dict,
         cursor = emit_field(f, cursor, lines)
         emitted_fields.append(f)
 
+    # Cherry-pick helper methods
+    helpers = _cherry_pick.get("helpers", {}).get(name, {})
+    if helpers and helpers.get("methods"):
+        lines.append(f"")
+        lines.append(f"    // --- Helper methods (from sdk-cherry-pick.json) ---")
+        for method in helpers["methods"]:
+            lines.append(f"    {method}")
+
     # Pad to class size
     if cursor < size:
         lines.append(f"    uint8_t _padEnd[0x{size - cursor:X}];")
@@ -586,8 +768,15 @@ def generate_struct_header(cls: dict, module_name: str, class_lookup: dict,
     for f in emitted_fields:
         fname = f["name"]
         foff = f["offset"]
+        fsize = f["size"]
+        schema_type = f["type"]
+        # Skip bitfields and zero-size entries
+        if schema_type.startswith("bitfield:") or fsize == 0:
+            continue
         lines.append(f"static_assert(offsetof({name}, {fname}) == 0x{foff:X}, \"{fname}\");")
 
+    lines.append(f"")
+    lines.append(f"}} // namespace sdk")
     lines.append(f"")
     lines.append(f"#endif // {guard}")
     lines.append(f"")
@@ -595,12 +784,18 @@ def generate_struct_header(cls: dict, module_name: str, class_lookup: dict,
     return "\n".join(lines)
 
 
-def generate_all_offsets(modules: list[dict], game: str, timestamp: str) -> str:
-    """Generate _all-offsets.hpp with every class from every module."""
-    guard = make_guard(f"{game}_all_offsets")
+# ============================================================================
+# Per-module offset constants
+# ============================================================================
+
+def generate_module_offsets(classes: list[dict], module_name: str,
+                            game: str, timestamp: str) -> str:
+    """Generate {module}/_offsets.hpp with constexpr offset constants."""
+    mod_clean = module_name.replace(".dll", "")
+    guard = make_guard(f"{game}_{mod_clean}_offsets")
     lines = []
     lines.append(f"// Auto-generated by import-schema.py from dezlock-dump — DO NOT EDIT")
-    lines.append(f"// All class field offsets from runtime schema dump")
+    lines.append(f"// Offset constants for module: {module_name}")
     lines.append(f"// Generated: {timestamp}")
     lines.append(f"#pragma once")
     lines.append(f"#ifndef {guard}")
@@ -608,38 +803,28 @@ def generate_all_offsets(modules: list[dict], game: str, timestamp: str) -> str:
     lines.append(f"")
     lines.append(f"#include <cstdint>")
     lines.append(f"")
-    lines.append(f"namespace {game}::generated::offsets {{")
+    lines.append(f"namespace sdk::offsets::{mod_clean} {{")
     lines.append(f"")
 
-    total_classes = 0
     total_fields = 0
+    for cls in sorted(classes, key=lambda c: c["name"]):
+        fields = cls.get("fields", [])
+        if not fields:
+            continue
 
-    for mod in modules:
-        mod_name = mod["name"].replace(".dll", "")
-        classes = sorted(mod.get("classes", []), key=lambda c: c["name"])
+        lines.append(f"namespace {cls['name']} {{")
+        for f in sorted(fields, key=lambda f: f["offset"]):
+            total_fields += 1
+            comment = f"// {f['type']} ({f['size']}b)"
+            lines.append(
+                f"    constexpr uint32_t {f['name']} = 0x{f['offset']:X}; {comment}"
+            )
+        lines.append(f"}} // {cls['name']}")
+        lines.append(f"")
 
-        for cls in classes:
-            fields = cls.get("fields", [])
-            if not fields:
-                continue
-
-            total_classes += 1
-            lines.append(f"namespace {cls['name']} {{")
-
-            sorted_fields = sorted(fields, key=lambda f: f["offset"])
-            for f in sorted_fields:
-                total_fields += 1
-                comment = f"// {f['type']} ({f['size']}b)"
-                lines.append(
-                    f"    constexpr uint32_t {f['name']} = 0x{f['offset']:X}; {comment}"
-                )
-
-            lines.append(f"}} // {cls['name']}")
-            lines.append(f"")
-
-    lines.append(f"}} // namespace {game}::generated::offsets")
+    lines.append(f"}} // namespace sdk::offsets::{mod_clean}")
     lines.append(f"")
-    lines.append(f"// Total: {total_classes} classes, {total_fields} fields")
+    lines.append(f"// Total: {total_fields} fields")
     lines.append(f"")
     lines.append(f"#endif // {guard}")
     lines.append(f"")
@@ -647,24 +832,99 @@ def generate_all_offsets(modules: list[dict], game: str, timestamp: str) -> str:
     return "\n".join(lines)
 
 
-def sanitize_cpp_identifier(name: str) -> str | None:
-    """Sanitize a class name into a valid C++ identifier.
+# ============================================================================
+# Per-module enums
+# ============================================================================
 
-    Returns None if the name is too mangled to be useful (template
-    instantiations with ?$ prefix, names with only special chars, etc.)
-    """
-    # Skip MSVC mangled template names (still have ?$ prefix)
+def generate_module_enums(enums: list[dict], module_name: str,
+                          game: str, timestamp: str) -> str:
+    """Generate {module}/_enums.hpp with scoped enum classes."""
+    mod_clean = module_name.replace(".dll", "")
+    guard = make_guard(f"{game}_{mod_clean}_enums")
+    lines = []
+    lines.append(f"// Auto-generated by import-schema.py from dezlock-dump — DO NOT EDIT")
+    lines.append(f"// Enums for module: {module_name}")
+    lines.append(f"// Generated: {timestamp}")
+    lines.append(f"#pragma once")
+    lines.append(f"#ifndef {guard}")
+    lines.append(f"#define {guard}")
+    lines.append(f"")
+    lines.append(f"#include <cstdint>")
+    lines.append(f"")
+    lines.append(f"namespace sdk::enums::{mod_clean} {{")
+    lines.append(f"")
+
+    for en in sorted(enums, key=lambda e: e["name"]):
+        sz = en.get("size", 4)
+        underlying = {1: "uint8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
+            sz, "int32_t"
+        )
+        lines.append(f"enum class {en['name']} : {underlying} {{")
+        for v in en.get("values", []):
+            lines.append(f"    {v['name']} = {v['value']},")
+        lines.append(f"}};")
+        lines.append(f"")
+
+    lines.append(f"}} // namespace sdk::enums::{mod_clean}")
+    lines.append(f"")
+    lines.append(f"// Total: {len(enums)} enums")
+    lines.append(f"")
+    lines.append(f"#endif // {guard}")
+    lines.append(f"")
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# Consolidated includes
+# ============================================================================
+
+def generate_all_offsets(module_names: list[str], game: str, timestamp: str) -> str:
+    """Generate _all-offsets.hpp that includes all per-module offset files."""
+    guard = make_guard(f"{game}_all_offsets")
+    lines = []
+    lines.append(f"// Auto-generated by import-schema.py from dezlock-dump — DO NOT EDIT")
+    lines.append(f"// Master include for all offset constants")
+    lines.append(f"// Generated: {timestamp}")
+    lines.append(f"#pragma once")
+    lines.append(f"#ifndef {guard}")
+    lines.append(f"#define {guard}")
+    lines.append(f"")
+    for mod_name in sorted(module_names):
+        lines.append(f'#include "{mod_name}/_offsets.hpp"')
+    lines.append(f"")
+    lines.append(f"#endif // {guard}")
+    lines.append(f"")
+    return "\n".join(lines)
+
+
+def generate_all_enums(module_names: list[str], game: str, timestamp: str) -> str:
+    """Generate _all-enums.hpp that includes all per-module enum files."""
+    guard = make_guard(f"{game}_all_enums")
+    lines = []
+    lines.append(f"// Auto-generated by import-schema.py from dezlock-dump — DO NOT EDIT")
+    lines.append(f"// Master include for all enums")
+    lines.append(f"// Generated: {timestamp}")
+    lines.append(f"#pragma once")
+    lines.append(f"#ifndef {guard}")
+    lines.append(f"#define {guard}")
+    lines.append(f"")
+    for mod_name in sorted(module_names):
+        lines.append(f'#include "{mod_name}/_enums.hpp"')
+    lines.append(f"")
+    lines.append(f"#endif // {guard}")
+    lines.append(f"")
+    return "\n".join(lines)
+
+
+def sanitize_cpp_identifier(name: str) -> str | None:
+    """Sanitize a class name into a valid C++ identifier."""
     if name.startswith("?$") or name.startswith("?"):
         return None
 
-    # Replace common invalid chars
     s = name.replace("::", "__").replace("<", "_").replace(">", "_")
     s = s.replace(",", "_").replace(" ", "_").replace("&", "_").replace("*", "_")
-
-    # Strip any remaining non-identifier chars
     s = re.sub(r"[^A-Za-z0-9_]", "_", s)
-
-    # Collapse multiple underscores and strip trailing
     s = re.sub(r"_+", "_", s).strip("_")
 
     if not s or not s[0].isalpha() and s[0] != "_":
@@ -674,7 +934,7 @@ def sanitize_cpp_identifier(name: str) -> str | None:
 
 
 def generate_all_vtables(modules: list[dict], game: str, timestamp: str) -> str:
-    """Generate _all-vtables.hpp with vtable RVAs and function indices."""
+    """Generate _all-vtables.hpp with vtable RVAs and virtual function indices."""
     guard = make_guard(f"{game}_all_vtables")
     lines = []
     lines.append(f"// Auto-generated by import-schema.py from dezlock-dump — DO NOT EDIT")
@@ -686,7 +946,7 @@ def generate_all_vtables(modules: list[dict], game: str, timestamp: str) -> str:
     lines.append(f"")
     lines.append(f"#include <cstdint>")
     lines.append(f"")
-    lines.append(f"namespace {game}::generated::vtables {{")
+    lines.append(f"namespace sdk::vtables {{")
     lines.append(f"")
 
     total_classes = 0
@@ -728,51 +988,11 @@ def generate_all_vtables(modules: list[dict], game: str, timestamp: str) -> str:
             lines.append(f"}} // {safe_name}")
             lines.append(f"")
 
-    lines.append(f"}} // namespace {game}::generated::vtables")
+    lines.append(f"}} // namespace sdk::vtables")
     lines.append(f"")
     lines.append(f"// Total: {total_classes} vtables, {total_funcs} virtual functions")
     if skipped:
         lines.append(f"// Skipped: {skipped} classes with unrepresentable names (templates, mangled)")
-    lines.append(f"")
-    lines.append(f"#endif // {guard}")
-    lines.append(f"")
-
-    return "\n".join(lines)
-
-
-def generate_all_enums(modules: list[dict], game: str, timestamp: str) -> str:
-    """Generate _all-enums.hpp with all enums from all modules."""
-    guard = make_guard(f"{game}_all_enums")
-    lines = []
-    lines.append(f"// Auto-generated by import-schema.py from dezlock-dump — DO NOT EDIT")
-    lines.append(f"// All enums from runtime schema dump")
-    lines.append(f"// Generated: {timestamp}")
-    lines.append(f"#pragma once")
-    lines.append(f"#ifndef {guard}")
-    lines.append(f"#define {guard}")
-    lines.append(f"")
-    lines.append(f"#include <cstdint>")
-    lines.append(f"")
-    lines.append(f"namespace {game}::generated::enums {{")
-    lines.append(f"")
-
-    total = 0
-    for mod in modules:
-        for en in sorted(mod.get("enums", []), key=lambda e: e["name"]):
-            total += 1
-            sz = en.get("size", 4)
-            underlying = {1: "uint8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
-                sz, "int32_t"
-            )
-            lines.append(f"enum class {en['name']} : {underlying} {{")
-            for v in en.get("values", []):
-                lines.append(f"    {v['name']} = {v['value']},")
-            lines.append(f"}};")
-            lines.append(f"")
-
-    lines.append(f"}} // namespace {game}::generated::enums")
-    lines.append(f"")
-    lines.append(f"// Total: {total} enums")
     lines.append(f"")
     lines.append(f"#endif // {guard}")
     lines.append(f"")
@@ -793,7 +1013,6 @@ def find_json_path(args) -> str:
         candidate = os.path.join(args.dir, "all-modules.json")
         if os.path.exists(candidate):
             return candidate
-        # Try dezlock-export.json in the dir
         candidate = os.path.join(args.dir, "dezlock-export.json")
         if os.path.exists(candidate):
             return candidate
@@ -823,7 +1042,7 @@ def main():
     parser.add_argument("--game", required=True, help="Game name (e.g. deadlock)")
     parser.add_argument("--json", help="Path to dezlock-export.json or all-modules.json")
     parser.add_argument("--dir", help="Path to directory containing all-modules.json")
-    parser.add_argument("--output", help="Output directory (default: ./generated/)")
+    parser.add_argument("--output", help="Output directory (default: ./generated/<game>/)")
     parser.add_argument("--modules", help="Comma-separated module filter (e.g. client,server)")
     args = parser.parse_args()
 
@@ -841,17 +1060,16 @@ def main():
     # Optional module filter
     if args.modules:
         allowed = set(m.strip() for m in args.modules.split(","))
-        # Match with or without .dll
         modules = [
             m for m in modules
             if m["name"] in allowed or m["name"].replace(".dll", "") in allowed
         ]
 
-    # Resolve output directory
+    # Resolve output directory (fixed: use args.game not bare 'game')
     if args.output:
         out_dir = Path(args.output)
     else:
-        out_dir = Path(__file__).parent / "generated" / game
+        out_dir = Path(__file__).parent / "generated" / args.game
 
     print(f"Output: {out_dir}")
     print(f"Modules: {len(modules)}")
@@ -860,7 +1078,6 @@ def main():
     print(f"Total enums: {data.get('total_enums', '?')}")
     print()
 
-    # Ensure output dirs exist
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Build global class lookup (for parent resolution across modules)
@@ -869,71 +1086,114 @@ def main():
         for cls in mod.get("classes", []):
             global_lookup[cls["name"]] = cls
 
-    # Build enum lookup for type resolution (Step 3: enum-typed fields)
-    global _all_enums, _all_classes, _stats
+    # Build class -> module mapping
+    class_to_module: dict[str, str] = {}
+    for mod in modules:
+        mod_clean = mod["name"].replace(".dll", "")
+        for cls in mod.get("classes", []):
+            class_to_module[cls["name"]] = mod_clean
+
+    # Build enum lookup for type resolution
+    global _all_enums, _all_classes, _stats, _cherry_pick
     _all_enums = {}
     for mod in modules:
         for en in mod.get("enums", []):
             _all_enums[en["name"]] = en.get("size", 4)
 
-    # Build class name set for embedded class categorization (Step 4)
+    # Build class name set
     _all_classes = set(global_lookup.keys())
+
+    # Load cherry-pick config
+    script_dir = Path(__file__).parent
+    _cherry_pick = load_cherry_pick(script_dir)
+    if _cherry_pick:
+        helper_count = len(_cherry_pick.get("helpers", {}))
+        print(f"Cherry-pick config loaded: {helper_count} classes with helpers")
+    else:
+        print("No sdk-cherry-pick.json found — generating plain structs for all classes")
+    print()
 
     # Reset stats tracker
     _stats = ResolveStats()
 
-    # Generate per-module struct headers
+    # 1. Generate types.hpp
+    types_content = generate_types_hpp(timestamp)
+    types_path = out_dir / "types.hpp"
+    types_path.write_text(types_content, encoding="utf-8")
+    print(f"  types.hpp (Vec3, QAngle, CHandle, Color, ViewMatrix, CHandleVector)")
+
+    # 2. Generate per-module struct headers + offset/enum files
     total_structs = 0
+    module_names = []
+
     for mod in modules:
         mod_name = mod["name"].replace(".dll", "")
         classes = mod.get("classes", [])
-        if not classes:
+        enums = mod.get("enums", [])
+
+        if not classes and not enums:
             continue
 
+        module_names.append(mod_name)
+
+        # Ensure module directory exists (offsets, enums, and structs all go here)
         mod_dir = out_dir / mod_name
         mod_dir.mkdir(exist_ok=True)
 
-        mod_count = 0
-        for cls in sorted(classes, key=lambda c: c["name"]):
-            if cls["size"] <= 0:
-                continue
-            if not cls.get("fields"):
-                continue
+        # Per-module offset constants
+        if classes:
+            offsets_content = generate_module_offsets(classes, mod["name"], args.game, timestamp)
+            offsets_path = mod_dir / "_offsets.hpp"
+            offsets_path.write_text(offsets_content, encoding="utf-8")
 
-            header = generate_struct_header(cls, mod["name"], global_lookup, timestamp)
-            # Sanitize filename (:: is invalid on Windows)
-            safe_name = cls["name"].replace("::", "__")
-            filepath = mod_dir / f"{safe_name}.hpp"
-            filepath.write_text(header, encoding="utf-8")
-            mod_count += 1
+        # Per-module enums
+        if enums:
+            enums_content = generate_module_enums(enums, mod["name"], args.game, timestamp)
+            enums_path = mod_dir / "_enums.hpp"
+            enums_path.write_text(enums_content, encoding="utf-8")
 
-        total_structs += mod_count
-        print(f"  {mod['name']:30s}  {mod_count:4d} structs")
+        # Per-class struct headers
+        if classes:
 
-    # Generate _all-offsets.hpp
-    offsets_content = generate_all_offsets(modules, args.game, timestamp)
-    offsets_path = out_dir / "_all-offsets.hpp"
-    offsets_path.write_text(offsets_content, encoding="utf-8")
+            mod_count = 0
+            for cls in sorted(classes, key=lambda c: c["name"]):
+                if cls["size"] <= 0:
+                    continue
+                if not cls.get("fields"):
+                    continue
 
-    # Count for summary
-    offset_lines = offsets_content.count("constexpr uint32_t")
-    print(f"\n  _all-offsets.hpp: {offset_lines} offset constants")
+                header = generate_struct_header(
+                    cls, mod["name"], global_lookup, class_to_module, timestamp
+                )
+                safe_name = safe_class_name(cls["name"])
+                filepath = mod_dir / f"{safe_name}.hpp"
+                filepath.write_text(header, encoding="utf-8")
+                mod_count += 1
 
-    # Generate _all-enums.hpp
-    enums_content = generate_all_enums(modules, args.game, timestamp)
-    enums_path = out_dir / "_all-enums.hpp"
-    enums_path.write_text(enums_content, encoding="utf-8")
+            total_structs += mod_count
 
-    enum_count = enums_content.count("enum class ")
-    print(f"  _all-enums.hpp: {enum_count} enums")
+        enum_count = len(enums) if enums else 0
+        cls_count = len([c for c in classes if c["size"] > 0 and c.get("fields")]) if classes else 0
+        print(f"  {mod['name']:30s}  {cls_count:4d} structs, {enum_count:4d} enums")
 
-    # Generate _all-vtables.hpp
+    # 3. Consolidated includes
+    if module_names:
+        # _all-offsets.hpp
+        all_offsets = generate_all_offsets(module_names, args.game, timestamp)
+        (out_dir / "_all-offsets.hpp").write_text(all_offsets, encoding="utf-8")
+
+        # _all-enums.hpp
+        all_enums = generate_all_enums(module_names, args.game, timestamp)
+        (out_dir / "_all-enums.hpp").write_text(all_enums, encoding="utf-8")
+
+    # 4. _all-vtables.hpp
     vtables_content = generate_all_vtables(modules, args.game, timestamp)
-    vtables_path = out_dir / "_all-vtables.hpp"
-    vtables_path.write_text(vtables_content, encoding="utf-8")
+    (out_dir / "_all-vtables.hpp").write_text(vtables_content, encoding="utf-8")
 
     vtable_count = vtables_content.count("constexpr uint32_t vtable_rva")
     vtable_func_count = vtables_content.count("constexpr int idx_")
+    print(f"\n  _all-offsets.hpp: includes {len(module_names)} modules")
+    print(f"  _all-enums.hpp: includes {len(module_names)} modules")
     print(f"  _all-vtables.hpp: {vtable_count} vtables, {vtable_func_count} functions")
 
     # Print type resolution statistics
