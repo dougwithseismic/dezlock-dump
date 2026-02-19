@@ -56,7 +56,7 @@ dezlock-dump.exe --process dota2.exe --all
 
 This dumps schema + generates SDK headers + pattern signatures in one shot. Output lands in `schema-dump/<game>/` next to the exe (e.g. `schema-dump/deadlock/`, `schema-dump/cs2/`).
 
-> **Note:** The schema dump itself finishes in seconds, but SDK header generation (`--headers`) and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions across 58+ DLLs. Let it run, don't close the window early.
+> **Note:** The schema dump itself finishes in seconds, but SDK header generation (`--headers`) and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions (128 bytes each) across 58+ DLLs. Let it run, don't close the window early.
 
 ### Build from Source
 
@@ -129,16 +129,21 @@ grep CCitadelInput bin/schema-dump/signatures/client.txt
 
 ### How It Works
 
-Each vtable function's first **64 bytes** are captured at dump time (SEH-protected for safety). The script then:
+Each vtable function's first **128 bytes** are captured at dump time (SEH-protected for safety). The script then:
 
-1. **Masks relocatable bytes** that change between builds:
+1. **Detects trivial stubs** — `ret`, `xor eax,eax; ret`, `xorps; ret`, `mov al,0/1; ret`, `lea rax,[rip+x]; ret`, `int3` padding, etc. These are labeled `[STUB:type]` and excluded from uniqueness computation.
+
+2. **Deduplicates by RVA** — COMDAT folding causes many vtable entries across different classes to point to the same function address. Entries sharing an RVA are grouped, with `shared_with` annotations showing which classes share the same function body.
+
+3. **Masks relocatable bytes** that change between builds:
    - `E8/E9 xx xx xx xx` — relative CALL/JMP targets
    - `0F 8x xx xx xx xx` — conditional jumps (near)
+   - `FF 15/FF 25 xx xx xx xx` — indirect CALL/JMP via `[RIP+disp32]`
    - RIP-relative addressing (`[RIP+disp32]`) — LEA, MOV, CMP, MOVSS, etc.
 
-2. **Finds the shortest unique prefix** for each function within its module. A function unique at 12 bytes doesn't need all 64 — signatures are trimmed to the minimum length that uniquely identifies them.
+4. **Finds the shortest unique prefix** for each function within its module. A function unique at 12 bytes doesn't need all 128 — signatures are trimmed to the minimum length that uniquely identifies them.
 
-3. **Marks duplicates** — genuinely identical functions (stubs like `ret`, `xor al,al; ret`) are flagged `[DUP]` since no byte count can differentiate them.
+5. **Computes per-class uniqueness** — functions that are unique within their class vtable (but not module-wide) are marked `[CLASS_UNIQUE]`. These are perfectly hookable since you typically know which vtable you're scanning.
 
 ### Usage
 
@@ -163,7 +168,7 @@ python generate-signatures.py --json bin/schema-dump/all-modules.json --min-leng
 | `bin/schema-dump/signatures/<module>.txt` | Greppable text | `ClassName::idx_N  48 89 5C 24 ? ...` |
 | `bin/schema-dump/signatures/_all-signatures.json` | JSON | Structured with pattern, uniqueness, and length |
 
-Signatures are trimmed to the shortest unique prefix. Patterns marked `[DUP]` are genuinely identical function bodies (stubs, trivial accessors) that can't be uniquely identified by bytes alone — use vtable index for these.
+Signatures are trimmed to the shortest unique prefix. Markers: `[STUB:type]` = trivial stub function, `[CLASS_UNIQUE]` = unique within class vtable (hookable), `[DUP]` = not uniquely signable anywhere. COMDAT-shared functions show `# shared: OtherClass::idx_N`.
 
 ### Key Hookable Classes with Signatures
 
@@ -303,8 +308,8 @@ The type resolver maps schema types to proper C++ types across 10 categories:
 | RTTI classes | MSVC x64 TypeDescriptor (all DLLs) | ~23,000 |
 | Vtables | RTTI COL → .rdata scan (58 DLLs) | ~23,000 |
 | Virtual functions | .text pointer entries | ~839,000 |
-| Function bytes | 64 bytes per function prologue | ~839,000 |
-| Unique signatures | After masking + prefix trimming | ~52,000 |
+| Function bytes | 128 bytes per function prologue | ~839,000 |
+| Hookable signatures | Module-unique + class-unique | ~359,000 (76%) |
 
 ### Vtable Counts by Module (Top 20)
 
@@ -343,7 +348,7 @@ This includes **RTTI-only classes** that have no schema entry — things like `C
 6. Walks RTTI (`_TypeDescriptor` + `_RTTICompleteObjectLocator`) in schema modules
 7. **Full DLL scan**: enumerates ALL loaded DLLs and RTTI-scans any not already covered (catches panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, etc. — skips Windows system DLLs)
 8. **Pass 4 — Vtable discovery**: scans `.rdata` for pointers to COL structures (vtable[-1]), reads consecutive `.text`-pointing entries as virtual function addresses
-9. **Function bytes**: reads 64 bytes from each function's prologue (SEH-protected) for signature generation
+9. **Function bytes**: reads 128 bytes from each function's prologue (SEH-protected) for signature generation
 10. Exports JSON to `%TEMP%`, signals completion via marker file
 11. Main exe reads JSON and generates all output formats per module
 12. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
@@ -361,7 +366,7 @@ Single linear scan of .rdata section:
   → Check each 8-byte value against COL hashset
   → Match = vtable[-1], so vtable[0] starts at match + 8
   → Read entries while they point into .text section (max 512)
-  → Store RVAs + first 64 bytes of each function
+  → Store RVAs + first 128 bytes of each function
 ```
 
 ## Output Format
@@ -426,22 +431,24 @@ CEntityComponent (0x8, 0 fields)
 }
 ```
 
-The `bytes` field contains 64 hex-encoded bytes from each function's prologue — used by `generate-signatures.py` to produce masked pattern signatures.
+The `bytes` field contains 128 hex-encoded bytes from each function's prologue — used by `generate-signatures.py` to produce masked pattern signatures.
 
 ### Signature text (`signatures/client.txt`)
 
 ```
-# --- CSource2Client (202 functions, 197 unique) ---
+# --- CSource2Client (202 functions, 197 unique, 3 class-unique, 2 stubs) ---
 CSource2Client::idx_0  40 53 56 57 48 81
 CSource2Client::idx_14  48 89 5C 24 18 56 48 83 EC 70 8B
+CSource2Client::idx_42  33 C0 C3  [STUB:xor_eax_ret]
 
-# --- CCitadelInput (30 functions, 5 unique) ---
+# --- CCitadelInput (30 functions, 5 unique, 18 class-unique, 4 stubs) ---
 CCitadelInput::idx_4  E9 ? ? ? ? CC CC CC CC CC CC CC CC CC CC CC 40 55 53 57 48
 CCitadelInput::idx_17  40 55 53 57 48 8D 6C 24 B9 48 81 EC C0
-CCitadelInput::idx_5  85 D2 0F 85 ? ? ? ? 48 8B C4 44 88 40 18 ... [DUP]
+CCitadelInput::idx_5  48 83 EC 28 ...  [CLASS_UNIQUE]
+CCitadelInput::idx_8  48 89 5C 24 08 ...  [DUP]  # shared: CInput::idx_8
 ```
 
-`?` = masked byte (relocation target). `[DUP]` = identical function body, not uniquely signable. Signatures are trimmed to the shortest unique prefix.
+`?` = masked byte (relocation). `[STUB:type]` = trivial stub. `[CLASS_UNIQUE]` = unique within class. `[DUP]` = not uniquely signable. `# shared:` = COMDAT-folded. Signatures trimmed to shortest unique prefix.
 
 ## Why Not source2gen?
 

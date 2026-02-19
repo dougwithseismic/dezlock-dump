@@ -320,7 +320,7 @@ build_rtti_hierarchy(uintptr_t base, size_t size) {
         std::vector<uint32_t> func_rvas;
         std::vector<std::vector<uint8_t>> func_bytes;
         constexpr int MAX_VTABLE_ENTRIES = 512;
-        constexpr int FUNC_BYTES_SIZE = 64;
+        constexpr int FUNC_BYTES_SIZE = 128;
 
         for (int idx = 0; idx < MAX_VTABLE_ENTRIES; idx++) {
             uintptr_t slot_addr = vtable_start + idx * 8;
