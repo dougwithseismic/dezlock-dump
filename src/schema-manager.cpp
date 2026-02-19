@@ -48,6 +48,7 @@
 #include <Psapi.h>
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 
 namespace schema {
 
@@ -607,399 +608,330 @@ bool SchemaManager::get_flat_layout(const char* module, const char* class_name, 
 }
 
 // ============================================================================
-// CUtlTSHash enumeration (SEH-protected)
+// CUtlTSHash enumeration (V2 bucket-walking, SEH-protected)
 //
-// TypeScope+0x0560 = CUtlTSHash<CSchemaClassBinding*>
+// TypeScope+0x0560 = CUtlTSHash<CSchemaClassBinding*, uint64, 256>
 //
-// The CUtlTSHash starts with a CUtlMemoryPool for entry allocation:
-//   +0x00  m_nBlockSize (int32)        = 32 (bytes per hash entry)
-//   +0x04  m_nBlocksPerBlob (int32)    = 256 (entries per allocation blob)
-//   +0x08  m_nGrowMode (int32)         = 2
-//   +0x0C  m_nBlocksAllocated (int32)  = total entry count (our class count!)
-//   +0x10  m_nPeakAlloc (int32)        = peak allocation
-//   +0x14  (alignment/flags)
-//   +0x18  m_pFreeListHead (ptr)       = free list (usually null when full)
-//   +0x20  m_pBlobHead (ptr)           = head of blob linked list
+// CUtlTSHash V2 layout (Win x64):
+//   +0x00  CUtlMemoryPoolBase (0x80 bytes)
+//     +0x0C  m_BlocksAllocated (int32) — committed entry count
+//     +0x10  m_PeakAlloc (int32) — total ever allocated
+//     +0x20  m_FreeBlocks.m_Head.Next (ptr) — unallocated chain head
+//   +0x80  HashBucket_t[256] (0x18 each = 0x1800 total)
+//     +0x00  m_AddLock* (ptr)
+//     +0x08  m_pFirst (HashFixedData_t*)
+//     +0x10  m_pFirstUncommitted (HashFixedData_t*) — walk THIS
 //
-// Each CBlob:
-//   +0x00  m_pNext (CBlob*)
-//   +0x08  m_nBlobSize (int32)         = data size in bytes
-//   +0x10  data[] starts here          = blocksPerBlob * blockSize bytes
+// HashFixedData_t (linked list node):
+//   +0x00  m_uiKey (uint64)
+//   +0x08  m_pNext (HashFixedData_t*)
+//   +0x10  m_Data  (CSchemaClassInfo* / CSchemaEnumBinding*)
 //
-// Each 32-byte hash entry (HashFixedData_t):
-//   We probe for the CSchemaClassInfo* pointer at offsets 0, 8, 16, 24
-//   by checking if candidate+0x08 is a valid class name string.
+// Enumeration (matching cs2-dumper + source2gen):
+//   Phase 1: Walk all 256 bucket chains via m_pFirstUncommitted
+//   Phase 2: Walk m_FreeBlocks chain for unallocated-but-valid entries
+//   Deduplicate by pointer address
 //
-// Confirmed via `schema raw` + `schema scope` debug commands (2026-02-17).
+// Reference: a2x/cs2-dumper utl_ts_hash.rs, neverlosecc/source2gen CUtlTSHash.h
 // ============================================================================
 
-// SEH-isolated: probe a 32-byte hash entry for a CSchemaClassInfo* pointer
-// Returns the valid class_info pointer, or 0 if none found.
-static uintptr_t seh_probe_hash_entry(uintptr_t entry_addr) {
+static constexpr int UTLTSHASH_BUCKET_COUNT = 256;
+static constexpr uintptr_t UTLTSHASH_BUCKET_STRIDE = 0x18; // sizeof(HashBucket_t) on Win64
+
+// SEH-isolated: read the data pointer from a HashFixedData_t node
+// Returns the m_Data pointer (e.g. CSchemaClassInfo*), or 0 on failure
+static uintptr_t seh_read_hash_node_data(uintptr_t node_addr) {
     __try {
-        // Try each 8-byte slot in the 32-byte entry
-        for (int off = 0; off < 32; off += 8) {
-            uintptr_t candidate = *reinterpret_cast<uintptr_t*>(entry_addr + off);
-            if (!candidate || candidate < 0x10000) continue;
-
-            // Check if candidate+0x08 is a valid class name string pointer
-            uintptr_t name_ptr = *reinterpret_cast<uintptr_t*>(candidate + 0x08);
-            if (!name_ptr || name_ptr < 0x10000) continue;
-
-            const char* name = reinterpret_cast<const char*>(name_ptr);
-            // Validate: first char is uppercase letter or underscore (class name convention)
-            if ((name[0] >= 'A' && name[0] <= 'Z') || name[0] == '_' || name[0] == 'C') {
-                // Extra validation: check a few more chars are printable
-                bool valid = true;
-                for (int i = 1; i < 4 && name[i]; ++i) {
-                    char c = name[i];
-                    if (c < 0x20 || c > 0x7E) { valid = false; break; }
-                }
-                if (valid) return candidate;
-            }
-        }
-        return 0;
+        return *reinterpret_cast<uintptr_t*>(node_addr + 0x10); // m_Data at +0x10
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
 }
 
-// SEH-isolated: read a pointer at an offset within a blob
-static bool seh_read_blob_ptr(uintptr_t blob_addr, int offset, uintptr_t* out) {
+// SEH-isolated: read the next pointer from a HashFixedData_t node
+static uintptr_t seh_read_hash_node_next(uintptr_t node_addr) {
     __try {
-        *out = *reinterpret_cast<uintptr_t*>(blob_addr + offset);
+        return *reinterpret_cast<uintptr_t*>(node_addr + 0x08); // m_pNext at +0x08
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// SEH-isolated: validate that a pointer looks like a CSchemaClassInfo*
+// (has a valid class name string at +0x08)
+static bool seh_validate_class_info(uintptr_t candidate) {
+    __try {
+        if (!candidate || candidate < 0x10000) return false;
+        uintptr_t name_ptr = *reinterpret_cast<uintptr_t*>(candidate + 0x08);
+        if (!name_ptr || name_ptr < 0x10000) return false;
+        const char* name = reinterpret_cast<const char*>(name_ptr);
+        // Class names start with uppercase letter or underscore
+        char c0 = name[0];
+        if (c0 < 0x20 || c0 > 0x7E) return false;
+        if (!((c0 >= 'A' && c0 <= 'Z') || c0 == '_')) return false;
+        // Check a few more chars are printable
+        for (int i = 1; i < 4 && name[i]; ++i) {
+            char c = name[i];
+            if (c < 0x20 || c > 0x7E) return false;
+        }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
-bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
-    if (!type_scope || !module_name) return false;
-
-    uintptr_t scope = reinterpret_cast<uintptr_t>(type_scope);
-
-    // CUtlTSHash is at TypeScope + 0x0560
-    // It starts with a CUtlMemoryPool that allocates hash entries in blobs.
-    uintptr_t pool_base = scope + 0x0560;
-
-    // Read CUtlMemoryPool header
-    int32_t block_size = 0, blocks_per_blob = 0, blocks_allocated = 0;
-    seh_read_i32(pool_base + 0x00, &block_size);
-    seh_read_i32(pool_base + 0x04, &blocks_per_blob);
-    seh_read_i32(pool_base + 0x0C, &blocks_allocated);
-
-    LOG_I("CUtlMemoryPool: block_size=%d, blocks_per_blob=%d, allocated=%d",
-          block_size, blocks_per_blob, blocks_allocated);
-
-    // Validate pool parameters
-    if (block_size < 16 || block_size > 256 || blocks_per_blob <= 0 ||
-        blocks_per_blob > 4096 || blocks_allocated <= 0 || blocks_allocated > 100000) {
-        LOG_W("pool parameters look invalid, falling back to vtable lookups only");
+// SEH-isolated: validate that a pointer looks like a SchemaEnumInfoData_t*
+// (has a valid enum name string at +0x08, less restrictive than class names)
+static bool seh_validate_enum_info(uintptr_t candidate) {
+    __try {
+        if (!candidate || candidate < 0x10000) return false;
+        uintptr_t name_ptr = *reinterpret_cast<uintptr_t*>(candidate + 0x08);
+        if (!name_ptr || name_ptr < 0x10000) return false;
+        const char* name = reinterpret_cast<const char*>(name_ptr);
+        char c0 = name[0];
+        if (c0 < 0x20 || c0 > 0x7E) return false;
+        if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_')) return false;
+        for (int i = 1; i < 4 && name[i]; ++i) {
+            char c = name[i];
+            if (c < 0x20 || c > 0x7E) return false;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-
-    // Read blob head pointer at pool+0x20
-    uintptr_t first_blob = 0;
-    if (!seh_read_ptr(pool_base + 0x20, &first_blob) || !first_blob) {
-        LOG_W("blob head pointer is null");
-        return false;
-    }
-
-    int classes_found = 0;
-    int max_blobs = (blocks_allocated / blocks_per_blob) + 2;
-
-    // ---- Probe blob layout ----
-    // CBlob may be: { next(8), size(4), pad(4), data... }    → next at +0x00, data at +0x10
-    //           or: { prev(8), next(8), data... }              → next at +0x08, data at +0x10
-    //           or: { prev(8), next(8), size(4), pad(4), data } → next at +0x08, data at +0x18
-    // We probe by:
-    //   1. Find which data offset has valid hash entries
-    //   2. Find which "next" offset leads to another blob with valid entries at same data offset
-
-    int blob_data_offset = -1;
-    int blob_next_offset = -1;
-
-    // Try data offsets
-    static const int data_offsets[] = { 0x10, 0x18, 0x20 };
-    for (int d : data_offsets) {
-        if (seh_probe_hash_entry(first_blob + d)) {
-            blob_data_offset = d;
-            break;
-        }
-    }
-
-    if (blob_data_offset < 0) {
-        LOG_W("could not find valid data offset in first blob at %p", (void*)first_blob);
-        return false;
-    }
-
-    // Try next-pointer offsets (0x00 and 0x08)
-    // A valid "next" pointer should lead to another blob with valid entries
-    for (int n : { 0x00, 0x08 }) {
-        uintptr_t candidate_next = 0;
-        if (!seh_read_blob_ptr(first_blob, n, &candidate_next)) continue;
-        if (!candidate_next || candidate_next == first_blob) continue;
-        if (candidate_next < 0x10000) continue;
-
-        // Check if candidate_next + blob_data_offset has a valid hash entry
-        if (seh_probe_hash_entry(candidate_next + blob_data_offset)) {
-            blob_next_offset = n;
-            break;
-        }
-    }
-
-    if (blob_next_offset < 0) {
-        // Only one blob accessible — walk just the first one
-        LOG_I("single blob mode (next probe failed), data at +0x%X", blob_data_offset);
-        blob_next_offset = 0x00; // won't matter, we'll stop after first blob
-    } else {
-        LOG_I("blob layout: next at +0x%X, data at +0x%X", blob_next_offset, blob_data_offset);
-    }
-
-    // ---- Walk all blobs ----
-    uintptr_t blob_ptr = first_blob;
-    int blobs_walked = 0;
-    int entries_total = 0;
-
-    while (blob_ptr && blobs_walked < max_blobs) {
-        blobs_walked++;
-
-        // Walk entries in this blob
-        int entries_in_blob = blocks_per_blob;
-        int remaining = blocks_allocated - entries_total;
-        if (remaining <= 0) break;
-        if (entries_in_blob > remaining) entries_in_blob = remaining;
-
-        uintptr_t data_start = blob_ptr + blob_data_offset;
-        for (int i = 0; i < entries_in_blob; ++i) {
-            uintptr_t entry_addr = data_start + i * block_size;
-
-            uintptr_t class_info = seh_probe_hash_entry(entry_addr);
-            if (!class_info) continue;
-
-            RuntimeClass cls = {};
-            if (resolve_class(reinterpret_cast<void*>(class_info), module_name, cls)) {
-                std::string key = std::string(module_name) + "::" + cls.name;
-                if (m_cache.find(key) == m_cache.end()) {
-                    m_cache.emplace(key, std::move(cls));
-                    classes_found++;
-                }
-            }
-        }
-
-        entries_total += entries_in_blob;
-
-        // Follow next blob
-        uintptr_t next_blob = 0;
-        if (!seh_read_blob_ptr(blob_ptr, blob_next_offset, &next_blob)) break;
-        if (!next_blob || next_blob == blob_ptr || next_blob == first_blob) break;
-        blob_ptr = next_blob;
-    }
-
-    LOG_I("blob walk: %d blobs, %d entries scanned, %d classes resolved from %s",
-          blobs_walked, entries_total, classes_found, module_name);
-
-    return classes_found > 0;
 }
 
-// ============================================================================
-// CUtlTSHash enumeration for enums (SEH-protected)
-//
-// TypeScope+0x0BE8 = CUtlTSHash<CSchemaEnumBinding*>
-//
-// Same CUtlMemoryPool + blob structure as class bindings at +0x0560.
-// Each hash entry contains a SchemaEnumInfoData_t* pointer.
-// We probe candidate+0x08 for a valid enum name string.
-// ============================================================================
-
-// SEH-isolated: probe a hash entry for a SchemaEnumInfoData_t* pointer
-// Enum names can start with uppercase, lowercase, or underscore.
-static uintptr_t seh_probe_enum_hash_entry(uintptr_t entry_addr) {
+// SEH-isolated: check if a given offset into the hash looks like a valid bucket
+// by trying to follow the m_pFirstUncommitted chain and validating data pointers.
+static int seh_probe_bucket_at(uintptr_t candidate_bucket, bool (*validator)(uintptr_t)) {
     __try {
-        for (int off = 0; off < 32; off += 8) {
-            uintptr_t candidate = *reinterpret_cast<uintptr_t*>(entry_addr + off);
-            if (!candidate || candidate < 0x10000) continue;
-
-            // Check if candidate+0x08 is a valid enum name string pointer
-            uintptr_t name_ptr = *reinterpret_cast<uintptr_t*>(candidate + 0x08);
-            if (!name_ptr || name_ptr < 0x10000) continue;
-
-            const char* name = reinterpret_cast<const char*>(name_ptr);
-            // Validate: first char is letter or underscore (enum names are less restrictive)
-            char c0 = name[0];
-            if ((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_') {
-                bool valid = true;
-                for (int i = 1; i < 4 && name[i]; ++i) {
-                    char c = name[i];
-                    if (c < 0x20 || c > 0x7E) { valid = false; break; }
-                }
-                if (valid) return candidate;
-            }
+        // Try m_pFirstUncommitted at +0x10 within the bucket
+        uintptr_t node = *reinterpret_cast<uintptr_t*>(candidate_bucket + 0x10);
+        if (!node || node < 0x10000) {
+            // Also try m_pFirst at +0x08
+            node = *reinterpret_cast<uintptr_t*>(candidate_bucket + 0x08);
+            if (!node || node < 0x10000) return 0;
         }
+
+        // Check if node looks like a HashFixedData_t: data at +0x10
+        uintptr_t data = *reinterpret_cast<uintptr_t*>(node + 0x10);
+        if (data && data > 0x10000 && validator(data)) return 1;
+
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
 }
 
+// Auto-detect where hash buckets start by probing candidate offsets.
+// The CUtlMemoryPoolBase size varies between builds (0x28 on V1, 0x80 on V2, etc.)
+// We try candidate pool sizes and check if buckets contain valid entries.
+static uintptr_t find_bucket_base(uintptr_t hash_base, bool (*validator)(uintptr_t)) {
+    // Known pool sizes: V1=0x28, V2=0x80, but can vary. Probe a range.
+    static const int pool_sizes[] = { 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0 };
+
+    for (int ps : pool_sizes) {
+        uintptr_t candidate = hash_base + ps;
+        // Check several buckets for valid entries (most buckets may be empty,
+        // so scan a good sample)
+        int hits = 0;
+        for (int i = 0; i < UTLTSHASH_BUCKET_COUNT; ++i) {
+            if (seh_probe_bucket_at(candidate + i * UTLTSHASH_BUCKET_STRIDE, validator)) {
+                hits++;
+                if (hits >= 3) {
+                    LOG_I("bucket base found at hash+0x%X (pool_size=0x%X, %d bucket hits in scan)",
+                          ps, ps, hits);
+                    return candidate;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Collect all data pointers from a CUtlTSHash by walking hash buckets + free list.
+// validator: function to check if a data pointer is valid (class or enum)
+// Returns vector of unique data pointers.
+static std::vector<uintptr_t> collect_utltshash_entries(
+    uintptr_t hash_base,
+    bool (*validator)(uintptr_t),
+    const char* label)
+{
+    std::vector<uintptr_t> results;
+    std::unordered_set<uintptr_t> seen;
+
+    // Read pool header
+    int32_t blocks_allocated = 0, peak_alloc = 0;
+    seh_read_i32(hash_base + 0x0C, &blocks_allocated);
+    seh_read_i32(hash_base + 0x10, &peak_alloc);
+
+    LOG_I("%s: blocks_allocated=%d, peak_alloc=%d", label, blocks_allocated, peak_alloc);
+
+    if (blocks_allocated <= 0 && peak_alloc <= 0) {
+        LOG_W("%s: empty hash table", label);
+        return results;
+    }
+
+    // Phase 1: Walk all 256 hash bucket chains
+    // Auto-detect bucket base (pool size varies between builds)
+    uintptr_t buckets_base = find_bucket_base(hash_base, validator);
+    int bucket_entries = 0;
+
+    if (buckets_base) {
+        for (int i = 0; i < UTLTSHASH_BUCKET_COUNT; ++i) {
+            uintptr_t bucket_addr = buckets_base + i * UTLTSHASH_BUCKET_STRIDE;
+
+            // Try m_pFirstUncommitted at +0x10, then m_pFirst at +0x08
+            for (int chain_off : { 0x10, 0x08 }) {
+                uintptr_t node = 0;
+                if (!seh_read_ptr(bucket_addr + chain_off, &node)) continue;
+
+                int chain_len = 0;
+                while (node && node > 0x10000 && chain_len < 4096) {
+                    chain_len++;
+                    uintptr_t data = seh_read_hash_node_data(node);
+                    if (data && data > 0x10000 && validator(data)) {
+                        if (seen.insert(data).second) {
+                            results.push_back(data);
+                            bucket_entries++;
+                        }
+                    }
+                    node = seh_read_hash_node_next(node);
+                }
+
+                // If this chain had entries, don't try the other offset
+                if (chain_len > 0) break;
+            }
+        }
+    }
+
+    LOG_I("%s: phase 1 (buckets) found %d entries", label, bucket_entries);
+
+    // Phase 2: Walk free-blocks chain for unallocated entries
+    // Try multiple candidate offsets for the free list head pointer
+    // V1: m_pFreeListHead at +0x18, V2: m_FreeBlocks.m_Head.Next at +0x20
+    int free_entries = 0;
+    for (int free_off : { 0x18, 0x20, 0x28 }) {
+        uintptr_t free_node = 0;
+        if (!seh_read_ptr(hash_base + free_off, &free_node)) continue;
+        if (!free_node || free_node < 0x10000) continue;
+
+        // Validate: first node should have valid data at +0x10
+        uintptr_t first_data = 0;
+        if (!seh_read_ptr(free_node + 0x10, &first_data)) continue;
+        if (!first_data || !validator(first_data)) continue;
+
+        LOG_I("%s: free list head at pool+0x%X", label, free_off);
+
+        int chain_len = 0;
+        uintptr_t node = free_node;
+        while (node && node > 0x10000 && chain_len < 100000) {
+            chain_len++;
+            uintptr_t data = 0;
+            if (seh_read_ptr(node + 0x10, &data) && data && data > 0x10000 && validator(data)) {
+                if (seen.insert(data).second) {
+                    results.push_back(data);
+                    free_entries++;
+                }
+            }
+            uintptr_t next = 0;
+            if (!seh_read_ptr(node + 0x00, &next)) break;
+            if (next == node) break;
+            node = next;
+        }
+        break; // Found a valid free list, stop trying offsets
+    }
+
+    if (free_entries > 0) {
+        LOG_I("%s: phase 2 (free list) found %d additional entries", label, free_entries);
+    }
+
+    LOG_I("%s: total %d unique entries", label, (int)results.size());
+    return results;
+}
+
+bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
+    if (!type_scope || !module_name) return false;
+
+    uintptr_t scope = reinterpret_cast<uintptr_t>(type_scope);
+    uintptr_t hash_base = scope + 0x0560;
+
+    auto entries = collect_utltshash_entries(hash_base, seh_validate_class_info, module_name);
+
+    int classes_found = 0;
+    for (uintptr_t class_info : entries) {
+        RuntimeClass cls = {};
+        if (resolve_class(reinterpret_cast<void*>(class_info), module_name, cls)) {
+            std::string key = std::string(module_name) + "::" + cls.name;
+            if (m_cache.find(key) == m_cache.end()) {
+                m_cache.emplace(key, std::move(cls));
+                classes_found++;
+            }
+        }
+    }
+
+    LOG_I("enumerate_scope: %d classes resolved from %s", classes_found, module_name);
+    return classes_found > 0;
+}
+
+// ============================================================================
+// CUtlTSHash enumeration for enums (V2 bucket-walking)
+//
+// The enum hash table is a second CUtlTSHash inside the TypeScope.
+// Its offset varies between builds. We scan for it by probing known offsets
+// and validating the pool header + bucket entries.
+//
+// The class hash is at TypeScope+0x0560, size 0x80 (pool) + 256*0x18 (buckets)
+// = 0x1880 bytes. So the class hash occupies 0x0560..0x1DE0.
+// The enum hash should be after that, typically around 0x1DE0 or later.
+// But some builds put it at 0x0BE8 (overlapping with class bucket area??)
+// — in V2 that can't be right since the class buckets extend to 0x1DE0.
+//
+// Strategy: try the area after the class hash (0x1DE0+), then fall back to
+// a broader scan looking for valid CUtlTSHash headers with enum-like entries.
+// ============================================================================
+
 bool SchemaManager::enumerate_enums(void* type_scope, const char* module_name) {
     if (!type_scope || !module_name) return false;
 
     uintptr_t scope = reinterpret_cast<uintptr_t>(type_scope);
 
-    // The enum CUtlTSHash location varies between builds.
-    // Known offsets: 0x0BE8 (older), but can shift.
-    // Strategy: try known offsets, then probe around the class hash (+0x0560)
-    // looking for a valid CUtlMemoryPool with enum-like entries.
-    static const int enum_offsets[] = { 0x0BE8, 0x0C00, 0x0C08, 0x0C10, 0x0C18, 0x0C20,
-                                        0x0BD0, 0x0BD8, 0x0BE0, 0x0BF0, 0x0BF8 };
+    // Class CUtlTSHash ends at 0x0560 + 0x80 (pool) + 256*0x18 (buckets) = 0x1DE0
+    // The enum hash should be somewhere after that.
+    // Also try legacy offset 0x0BE8 in case V1 layout is in use.
+    // Additionally try offsets that source2gen uses.
+    static const int enum_offsets[] = {
+        // V2: after the class hash buckets
+        0x1DE0, 0x1DE8, 0x1DF0, 0x1DF8, 0x1E00, 0x1E08, 0x1E10, 0x1E18,
+        0x1E20, 0x1E28, 0x1E30, 0x1E38, 0x1E40, 0x1E48, 0x1E50,
+        // V1 legacy
+        0x0BE8, 0x0BF0, 0x0BF8, 0x0C00, 0x0C08, 0x0C10,
+    };
 
-    uintptr_t pool_base = 0;
-    int32_t block_size = 0, blocks_per_blob = 0, blocks_allocated = 0;
-
+    // Try each candidate: look for a valid CUtlTSHash header that has
+    // bucket entries validating as enum info pointers
     for (int candidate_offset : enum_offsets) {
-        uintptr_t candidate = scope + candidate_offset;
+        uintptr_t hash_base = scope + candidate_offset;
 
-        int32_t bs = 0, bpb = 0, ba = 0;
-        if (!seh_read_i32(candidate + 0x00, &bs)) continue;
-        if (!seh_read_i32(candidate + 0x04, &bpb)) continue;
-        if (!seh_read_i32(candidate + 0x0C, &ba)) continue;
+        int32_t blocks_allocated = 0, peak_alloc = 0;
+        if (!seh_read_i32(hash_base + 0x0C, &blocks_allocated)) continue;
+        if (!seh_read_i32(hash_base + 0x10, &peak_alloc)) continue;
 
-        // Valid pool: block_size 16-256, blocks_per_blob 1-4096, allocated > 0
-        if (bs >= 16 && bs <= 256 && bpb > 0 && bpb <= 4096 && ba > 0 && ba <= 100000) {
-            // Extra validation: check blob head pointer exists
-            uintptr_t blob_head = 0;
-            if (!seh_read_ptr(candidate + 0x20, &blob_head) || !blob_head) continue;
+        if (blocks_allocated <= 0 || blocks_allocated > 100000) continue;
 
-            // Try to probe for an enum entry in the first blob
-            for (int d : { 0x10, 0x18, 0x20 }) {
-                if (seh_probe_enum_hash_entry(blob_head + d)) {
-                    pool_base = candidate;
-                    block_size = bs;
-                    blocks_per_blob = bpb;
-                    blocks_allocated = ba;
-                    LOG_I("enum CUtlTSHash found at scope+0x%X (block_size=%d, per_blob=%d, allocated=%d)",
-                          candidate_offset, bs, bpb, ba);
-                    goto found_enum_pool;
-                }
-            }
-        }
-    }
+        // Auto-detect bucket base for this candidate hash
+        uintptr_t buckets_base = find_bucket_base(hash_base, seh_validate_enum_info);
+        if (!buckets_base) continue;
 
-    // Not found via known offsets — do a broader scan
-    // Scan the entire TypeScope structure (up to 0x2000) in 8-byte steps
-    // The class hash is at +0x0560 so enums should be after it, but be thorough
-    {
-        int pools_found = 0;
-        for (int off = 0x0560; off <= 0x2000; off += 8) {
-            // Skip the class hash itself (already used by enumerate_scope)
-            if (off == 0x0560) continue;
+        LOG_I("enum CUtlTSHash found at scope+0x%X (allocated=%d, peak=%d)",
+              candidate_offset, blocks_allocated, peak_alloc);
 
-            uintptr_t candidate = scope + off;
+        // Found it — collect entries using the standard bucket walker
+        std::string label = std::string(module_name) + " enums";
+        auto entries = collect_utltshash_entries(hash_base, seh_validate_enum_info, label.c_str());
 
-            int32_t bs = 0, bpb = 0, ba = 0;
-            if (!seh_read_i32(candidate + 0x00, &bs)) continue;
-            if (!seh_read_i32(candidate + 0x04, &bpb)) continue;
-            if (!seh_read_i32(candidate + 0x0C, &ba)) continue;
-
-            if (bs >= 16 && bs <= 256 && bpb > 0 && bpb <= 4096 && ba > 0 && ba <= 100000) {
-                uintptr_t blob_head = 0;
-                if (!seh_read_ptr(candidate + 0x20, &blob_head) || !blob_head) continue;
-
-                pools_found++;
-
-                for (int d : { 0x10, 0x18, 0x20 }) {
-                    if (seh_probe_enum_hash_entry(blob_head + d)) {
-                        pool_base = candidate;
-                        block_size = bs;
-                        blocks_per_blob = bpb;
-                        blocks_allocated = ba;
-                        LOG_I("enum CUtlTSHash discovered at scope+0x%X (block_size=%d, per_blob=%d, allocated=%d)",
-                              off, bs, bpb, ba);
-                        goto found_enum_pool;
-                    }
-                }
-
-                // Log pools that look valid but don't have enum entries (diagnostic)
-                LOG_D("pool at scope+0x%X (bs=%d, bpb=%d, ba=%d) — no enum entries", off, bs, bpb, ba);
-            }
-        }
-
-        LOG_W("enum CUtlTSHash not found for %s (scanned 0x0560-0x2000, found %d non-enum pools)",
-              module_name, pools_found);
-    }
-    return false;
-
-found_enum_pool:
-    if (!pool_base) return false;
-
-    // Read blob head pointer at pool+0x20
-    uintptr_t first_blob = 0;
-    if (!seh_read_ptr(pool_base + 0x20, &first_blob) || !first_blob) {
-        LOG_W("enum blob head pointer is null");
-        return false;
-    }
-
-    int enums_found = 0;
-    int max_blobs = (blocks_allocated / blocks_per_blob) + 2;
-
-    // Probe blob layout (same approach as enumerate_scope)
-    int blob_data_offset = -1;
-    int blob_next_offset = -1;
-
-    static const int data_offsets[] = { 0x10, 0x18, 0x20 };
-    for (int d : data_offsets) {
-        if (seh_probe_enum_hash_entry(first_blob + d)) {
-            blob_data_offset = d;
-            break;
-        }
-    }
-
-    if (blob_data_offset < 0) {
-        LOG_W("could not find valid data offset in first enum blob at %p", (void*)first_blob);
-        return false;
-    }
-
-    for (int n : { 0x00, 0x08 }) {
-        uintptr_t candidate_next = 0;
-        if (!seh_read_blob_ptr(first_blob, n, &candidate_next)) continue;
-        if (!candidate_next || candidate_next == first_blob) continue;
-        if (candidate_next < 0x10000) continue;
-
-        if (seh_probe_enum_hash_entry(candidate_next + blob_data_offset)) {
-            blob_next_offset = n;
-            break;
-        }
-    }
-
-    if (blob_next_offset < 0) {
-        LOG_I("enum: single blob mode, data at +0x%X", blob_data_offset);
-        blob_next_offset = 0x00;
-    } else {
-        LOG_I("enum blob layout: next at +0x%X, data at +0x%X", blob_next_offset, blob_data_offset);
-    }
-
-    // Walk all blobs
-    uintptr_t blob_ptr = first_blob;
-    int blobs_walked = 0;
-    int entries_total = 0;
-
-    while (blob_ptr && blobs_walked < max_blobs) {
-        blobs_walked++;
-
-        int entries_in_blob = blocks_per_blob;
-        int remaining = blocks_allocated - entries_total;
-        if (remaining <= 0) break;
-        if (entries_in_blob > remaining) entries_in_blob = remaining;
-
-        uintptr_t data_start = blob_ptr + blob_data_offset;
-        for (int i = 0; i < entries_in_blob; ++i) {
-            uintptr_t entry_addr = data_start + i * block_size;
-
-            uintptr_t enum_info = seh_probe_enum_hash_entry(entry_addr);
-            if (!enum_info) continue;
-
+        int enums_found = 0;
+        for (uintptr_t enum_info : entries) {
             RuntimeEnum enm = {};
             if (resolve_enum(reinterpret_cast<void*>(enum_info), module_name, enm)) {
                 std::string key = std::string(module_name) + "::" + enm.name;
@@ -1010,18 +942,45 @@ found_enum_pool:
             }
         }
 
-        entries_total += entries_in_blob;
-
-        uintptr_t next_blob = 0;
-        if (!seh_read_blob_ptr(blob_ptr, blob_next_offset, &next_blob)) break;
-        if (!next_blob || next_blob == blob_ptr || next_blob == first_blob) break;
-        blob_ptr = next_blob;
+        LOG_I("enumerate_enums: %d enums resolved from %s", enums_found, module_name);
+        return enums_found > 0;
     }
 
-    LOG_I("enum blob walk: %d blobs, %d entries scanned, %d enums resolved from %s",
-          blobs_walked, entries_total, enums_found, module_name);
+    // Broader scan if known offsets didn't work
+    LOG_I("enum hash not at known offsets for %s, scanning 0x1D00..0x2800...", module_name);
+    for (int off = 0x1D00; off <= 0x2800; off += 8) {
+        uintptr_t hash_base = scope + off;
 
-    return enums_found > 0;
+        int32_t blocks_allocated = 0;
+        if (!seh_read_i32(hash_base + 0x0C, &blocks_allocated)) continue;
+        if (blocks_allocated <= 0 || blocks_allocated > 100000) continue;
+
+        uintptr_t buckets_base = find_bucket_base(hash_base, seh_validate_enum_info);
+        if (!buckets_base) continue;
+
+        LOG_I("enum CUtlTSHash discovered at scope+0x%X (allocated=%d)", off, blocks_allocated);
+
+        std::string label = std::string(module_name) + " enums";
+        auto entries = collect_utltshash_entries(hash_base, seh_validate_enum_info, label.c_str());
+
+        int enums_found = 0;
+        for (uintptr_t enum_info : entries) {
+            RuntimeEnum enm = {};
+            if (resolve_enum(reinterpret_cast<void*>(enum_info), module_name, enm)) {
+                std::string key = std::string(module_name) + "::" + enm.name;
+                if (m_enum_cache.find(key) == m_enum_cache.end()) {
+                    m_enum_cache.emplace(key, std::move(enm));
+                    enums_found++;
+                }
+            }
+        }
+
+        LOG_I("enumerate_enums: %d enums resolved from %s", enums_found, module_name);
+        return enums_found > 0;
+    }
+
+    LOG_W("enum CUtlTSHash not found for %s", module_name);
+    return false;
 }
 
 bool SchemaManager::dump_module(const char* module) {
