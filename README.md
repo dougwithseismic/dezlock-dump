@@ -12,6 +12,52 @@ Runtime schema + RTTI + vtable + global singleton + signature extraction tool fo
 
 No source2gen required — reads directly from the game's `SchemaSystem` and MSVC x64 RTTI at runtime.
 
+### What You Get
+
+**Every entity class, fully expanded** (`_entity-paths.txt`) — grep any class and see the complete field tree with pointer chains resolved:
+```
+# C_CitadelPlayerPawn (size=0x1990)
+# chain: C_CitadelPlayerPawn -> CCitadelPlayerPawnBase -> C_BasePlayerPawn -> ... -> CEntityInstance
+  +0x10   m_pEntity                      -> CEntityIdentity*
+            +0x18   m_name                         (CUtlSymbolLarge)
+            +0x20   m_designerName                 (CUtlSymbolLarge)
+  +0x30   m_CBodyComponent               -> CBodyComponent*
+            +0x8    m_pSceneNode                   -> CGameSceneNode*
+                      +0xC8   m_vecAbsOrigin                 (VectorWS)
+                      +0x103  m_bDormant                     (bool)
+  +0x354  m_iHealth                      (int32, C_BaseEntity)
+  +0x3F3  m_iTeamNum                     (uint8, C_BaseEntity)
+  +0x11B0 m_angEyeAngles                 (QAngle)
+  +0x12D4 m_nLevel                       (int32)
+  +0x14C0 m_CCitadelAbilityComponent     [embedded CCitadelAbilityComponent, +0x14C0]
+            +0x68   m_vecAbilities                 (CHandle vector)
+```
+
+**Every field offset, greppable** (`client.txt`) — classes + flattened inherited fields + enums, all in one file:
+```
+C_CitadelPlayerPawn.m_angEyeAngles = 0x11B0 (QAngle, 12) [MNetworkEnable]
+C_CitadelPlayerPawn.m_nLevel = 0x12D4 (int32, 4) [MNetworkEnable]
+C_CitadelPlayerPawn.m_nCurrencies = 0x12D8 (int32[6], 24) [MNetworkEnable]
+CCitadelAbilityComponent.m_vecAbilities = 0x68 (CHandle vector, 24) [MNetworkEnable]
+```
+
+**11,000+ global singletons auto-discovered** (`_globals.txt`) — found by scanning `.data` sections against the RTTI vtable catalog:
+```
+client.dll::CCitadelCameraManager = 0x31F05F0 (static)
+client.dll::CCitadelMatchMetadataManager = 0x31EF288 (pointer)
+engine2.dll::CGameEntitySystem = 0x623AA8 (pointer)
+engine2.dll::CNetworkService = 0x623BC0 (static)
+server.dll::CCitadelGameRules = 0x3A09558 (pointer) [schema]
+```
+
+**Pattern signatures for every virtual function** (`signatures/`) — IDA-style byte patterns for hooking:
+```
+CCitadelInput::CreateMove = 48 89 5C 24 ? 55 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 48 8B D9
+CGameEntitySystem::GetEntityByIndex = 81 FA ? ? ? ? 77 ? 4C 8B 81 ? ? ? ? 4D 85 C0
+```
+
+---
+
 **Scans every loaded DLL** — walks all modules for schema data (client.dll, server.dll, engine2.dll, etc.) and RTTI vtables (panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, and 50+ more).
 
 **Auto-discovers global singletons** — scans `.data` sections of every loaded module and cross-references against the RTTI vtable catalog to find every typed singleton instance. No hardcoded patterns — globals are discovered automatically from the same data the tool already collects.
