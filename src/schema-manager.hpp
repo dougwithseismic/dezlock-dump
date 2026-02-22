@@ -19,6 +19,13 @@
 
 namespace schema {
 
+// Extract bare class name from a composite "module::ClassName" key.
+// If the key has no "::" prefix, returns the full string unchanged.
+inline std::string rtti_class_name(const std::string& key) {
+    auto pos = key.rfind("::");
+    return (pos != std::string::npos) ? key.substr(pos + 2) : key;
+}
+
 struct RuntimeField {
     const char* name;           // field name (engine-owned string, do not free)
     const char* type_name;      // type name from CSchemaType (engine-owned)
@@ -115,7 +122,7 @@ public:
     // RTTI-backed inheritance (call after init, before any lookups)
     // module_name is the DLL name (e.g. "client.dll") — stored in each InheritanceInfo
     void load_rtti(uintptr_t module_base, size_t module_size, const char* module_name = nullptr);
-    const InheritanceInfo* get_inheritance(const char* class_name) const;
+    const InheritanceInfo* get_inheritance(const char* class_name, const char* module = nullptr) const;
     int rtti_class_count() const { return static_cast<int>(m_rtti_map.size()); }
     const std::unordered_map<std::string, InheritanceInfo>& rtti_map() const { return m_rtti_map; }
 
@@ -131,7 +138,7 @@ public:
 private:
     void* m_schema_system = nullptr;
     std::unordered_map<std::string, RuntimeClass> m_cache;
-    std::unordered_map<std::string, InheritanceInfo> m_rtti_map;
+    std::unordered_map<std::string, InheritanceInfo> m_rtti_map;  // keyed by "module::ClassName"
     std::unordered_map<std::string, RuntimeEnum> m_enum_cache;
     std::vector<std::string> m_dumped_modules;
 

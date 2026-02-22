@@ -135,7 +135,7 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
     std::vector<std::string> modules = mgr.dumped_modules();
     {
         std::unordered_set<std::string> known(modules.begin(), modules.end());
-        for (const auto& [name, info] : mgr.rtti_map()) {
+        for (const auto& [key, info] : mgr.rtti_map()) {
             if (!info.source_module.empty() && !known.count(info.source_module)) {
                 known.insert(info.source_module);
                 modules.push_back(info.source_module);
@@ -189,7 +189,7 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
                 fprintf(fp, "],\n");
             }
 
-            auto* rtti = mgr.get_inheritance(cls.name);
+            auto* rtti = mgr.get_inheritance(cls.name, mod.c_str());
             if (rtti && !rtti->parent.empty()) {
                 fprintf(fp, "          \"parent\": \"%s\",\n", json_escape(rtti->parent.c_str()).c_str());
                 fprintf(fp, "          \"inheritance\": [");
@@ -280,17 +280,20 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
         {
             const auto& rtti_map = mgr.rtti_map();
             int vt_idx = 0;
-            for (const auto& [name, info] : rtti_map) {
+            for (const auto& [key, info] : rtti_map) {
                 if (info.vtable_rva == 0 || info.vtable_func_rvas.empty())
                     continue;
-                if (!is_json_safe(name.c_str())) continue;
+
+                // key is now "module::ClassName" — extract bare class name
+                std::string bare_name = schema::rtti_class_name(key);
+                if (!is_json_safe(bare_name.c_str())) continue;
 
                 // Match by source_module (set during load_rtti)
                 if (info.source_module != mod) continue;
 
                 if (vt_idx > 0) fprintf(fp, ",\n");
                 fprintf(fp, "        {\n");
-                fprintf(fp, "          \"class\": \"%s\",\n", json_escape(name.c_str()).c_str());
+                fprintf(fp, "          \"class\": \"%s\",\n", json_escape(bare_name.c_str()).c_str());
                 fprintf(fp, "          \"vtable_rva\": \"0x%X\",\n", info.vtable_rva);
                 fprintf(fp, "          \"functions\": [");
                 for (size_t fi = 0; fi < info.vtable_func_rvas.size(); fi++) {
@@ -622,10 +625,11 @@ void worker_thread(HMODULE hModule) {
         {
             int resolved = 0;
             const auto& rtti_map = mgr.rtti_map();
-            for (const auto& [name, info] : rtti_map) {
+            for (const auto& [key, info] : rtti_map) {
+                std::string bare = schema::rtti_class_name(key);
                 // Try each dumped module
                 for (const auto& mod_name : mgr.dumped_modules()) {
-                    auto* cls = mgr.find_class(mod_name.c_str(), name.c_str());
+                    auto* cls = mgr.find_class(mod_name.c_str(), bare.c_str());
                     if (cls) { resolved++; break; }
                 }
             }
@@ -694,8 +698,8 @@ void worker_thread(HMODULE hModule) {
         // ---- Scan for string references + code xrefs ----
         LOG_I("Scanning string references...");
         std::unordered_set<std::string> rtti_class_names;
-        for (const auto& [name, info] : mgr.rtti_map()) {
-            rtti_class_names.insert(name);
+        for (const auto& [key, info] : mgr.rtti_map()) {
+            rtti_class_names.insert(schema::rtti_class_name(key));
         }
         strings::StringMap string_map = strings::scan(rtti_class_names);
         {

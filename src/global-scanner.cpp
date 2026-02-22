@@ -1,6 +1,7 @@
 #define LOG_TAG "global-scanner"
 
 #include "global-scanner.hpp"
+#include "schema-manager.hpp"
 #include "log.hpp"
 
 #include <Windows.h>
@@ -79,7 +80,7 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
     };
     std::unordered_map<std::string, ModuleCtx> modules;
 
-    for (const auto& [class_name, info] : rtti_map) {
+    for (const auto& [key, info] : rtti_map) {
         if (info.vtable_rva == 0 || info.source_module.empty()) continue;
         if (modules.count(info.source_module)) continue;
 
@@ -96,20 +97,23 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
         modules[info.source_module] = ctx;
     }
 
-    // Build absolute-vtable-addr -> class name map (across all modules)
-    // vtable_abs_addr = module_base + vtable_rva
+    // Build absolute-vtable-addr -> bare class name map (across all modules).
+    // Absolute addresses are unique per module, so no collision.
+    // class_to_vtable_rva is keyed by composite "module::ClassName" to avoid
+    // collisions when the same class exists in multiple modules.
     std::unordered_map<uint64_t, std::string> vtable_to_class;
     std::unordered_map<std::string, uint32_t> class_to_vtable_rva;
 
-    for (const auto& [class_name, info] : rtti_map) {
+    for (const auto& [key, info] : rtti_map) {
         if (info.vtable_rva == 0 || info.source_module.empty()) continue;
 
         auto mit = modules.find(info.source_module);
         if (mit == modules.end()) continue;
 
+        std::string bare_name = schema::rtti_class_name(key);
         uint64_t vtable_abs = mit->second.base + info.vtable_rva;
-        vtable_to_class[vtable_abs] = class_name;
-        class_to_vtable_rva[class_name] = info.vtable_rva;
+        vtable_to_class[vtable_abs] = bare_name;
+        class_to_vtable_rva[key] = info.vtable_rva;  // composite key
     }
 
     LOG_I("Vtable catalog: %d entries across %d modules",
@@ -144,13 +148,16 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
                     auto it = vtable_to_class.find(val);
                     if (it != vtable_to_class.end()) {
                         const std::string& cls = it->second;
-                        std::string key = cls + ":direct";
-                        if (!found_classes.count(key)) {
-                            found_classes.insert(key);
+                        std::string dedup_key = cls + ":direct";
+                        if (!found_classes.count(dedup_key)) {
+                            found_classes.insert(dedup_key);
                             uint32_t global_rva = (uint32_t)(addr - mod.base);
+                            std::string composite = mod_name + "::" + cls;
+                            auto rva_it = class_to_vtable_rva.find(composite);
+                            uint32_t vt_rva = (rva_it != class_to_vtable_rva.end()) ? rva_it->second : 0;
                             mod_results.push_back({
                                 cls, mod_name, global_rva,
-                                class_to_vtable_rva[cls], false,
+                                vt_rva, false,
                                 schema_classes.count(cls) > 0
                             });
                         }
@@ -169,13 +176,16 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
                 auto it = vtable_to_class.find(vtable_ptr);
                 if (it != vtable_to_class.end()) {
                     const std::string& cls = it->second;
-                    std::string key = cls + ":pointer";
-                    if (!found_classes.count(key)) {
-                        found_classes.insert(key);
+                    std::string dedup_key = cls + ":pointer";
+                    if (!found_classes.count(dedup_key)) {
+                        found_classes.insert(dedup_key);
                         uint32_t global_rva = (uint32_t)(addr - mod.base);
+                        std::string composite = mod_name + "::" + cls;
+                        auto rva_it = class_to_vtable_rva.find(composite);
+                        uint32_t vt_rva = (rva_it != class_to_vtable_rva.end()) ? rva_it->second : 0;
                         mod_results.push_back({
                             cls, mod_name, global_rva,
-                            class_to_vtable_rva[cls], true,
+                            vt_rva, true,
                             schema_classes.count(cls) > 0
                         });
                     }

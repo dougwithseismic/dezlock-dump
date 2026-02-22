@@ -540,24 +540,38 @@ void* SchemaManager::get_class_info(const char* module, const char* class_name) 
 void SchemaManager::load_rtti(uintptr_t module_base, size_t module_size, const char* module_name) {
     auto map = build_rtti_hierarchy(module_base, module_size);
 
-    // Tag each entry with source module and merge into global map
+    // Tag each entry with source module and merge into global map.
+    // Key is "module::ClassName" so shared classes get per-module entries.
     std::string mod_str = module_name ? module_name : "";
     int added = 0;
     for (auto& [name, info] : map) {
         info.source_module = mod_str;
-        // Only insert if not already present (first module wins for duplicates)
-        if (m_rtti_map.find(name) == m_rtti_map.end()) {
-            m_rtti_map[name] = std::move(info);
+        std::string composite_key = mod_str + "::" + name;
+        if (m_rtti_map.find(composite_key) == m_rtti_map.end()) {
+            m_rtti_map[composite_key] = std::move(info);
             added++;
         }
     }
     LOG_I("RTTI hierarchy: +%d from %s (%d total)", added, mod_str.c_str(), (int)m_rtti_map.size());
 }
 
-const InheritanceInfo* SchemaManager::get_inheritance(const char* class_name) const {
+const InheritanceInfo* SchemaManager::get_inheritance(const char* class_name, const char* module) const {
     if (!class_name) return nullptr;
-    auto it = m_rtti_map.find(class_name);
-    return (it != m_rtti_map.end()) ? &it->second : nullptr;
+
+    // If module is provided, try exact composite key first
+    if (module) {
+        std::string composite = std::string(module) + "::" + class_name;
+        auto it = m_rtti_map.find(composite);
+        if (it != m_rtti_map.end()) return &it->second;
+    }
+
+    // Fallback: linear scan for any entry matching the bare class name.
+    // Used by get_offset where only the parent chain matters (same across modules).
+    for (const auto& [key, info] : m_rtti_map) {
+        if (rtti_class_name(key) == class_name)
+            return &info;
+    }
+    return nullptr;
 }
 
 int32_t SchemaManager::get_offset(const char* module, const char* class_name, const char* field_name) {
@@ -915,6 +929,13 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
             const char* entry_mod = nullptr;
             if (seh_read_string(mod_ptr, &entry_mod)
                 && entry_mod && _stricmp(entry_mod, module_name) != 0) {
+                // Log individual cross-module skips at debug level
+                uintptr_t xmod_name_ptr = 0;
+                if (seh_read_ptr(class_info + 0x08, &xmod_name_ptr) && xmod_name_ptr) {
+                    const char* xmod_cls = nullptr;
+                    if (seh_read_string(xmod_name_ptr, &xmod_cls) && xmod_cls)
+                        LOG_D("enumerate_scope: skip %s (belongs to %s, not %s)", xmod_cls, entry_mod, module_name);
+                }
                 skipped_xmod++;
                 continue;
             }
