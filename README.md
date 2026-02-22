@@ -1,8 +1,16 @@
 # dezlock-dump
 
+[![GitHub Release](https://img.shields.io/github/v/release/dougwithseismic/dezlock-dump?label=Version)](../../releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/dougwithseismic/dezlock-dump/build.yml?label=Build)](../../actions/workflows/build.yml)
 [![Discord](https://img.shields.io/discord/1469694564683088168?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sjcsVkE8ur)
 
 Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2).
+
+## What's New
+
+**v1.3.0** — `--depth` flag for configurable field expansion, parallel module processing in signature and SDK generators.
+
+See the full [Changelog](CHANGELOG.md) for all releases.
 
 ## What
 

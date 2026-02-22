@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.0] - 2025-06-15
+
 ### Added
 - `--depth <N>` CLI flag to configure field expansion depth for globals and entity trees (default: 3, max: 32)
 - Parallel per-module processing in `generate-signatures.py` and `import-schema.py` using ThreadPoolExecutor
