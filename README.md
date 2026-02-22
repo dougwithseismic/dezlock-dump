@@ -8,7 +8,7 @@ Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2)
 
 ## What's New
 
-**v1.3.0** — `--depth` flag for configurable field expansion, parallel module processing in signature and SDK generators.
+**v1.4.0** — Signature and SDK generation ported to C++ — zero external dependencies, no Python required. Single exe does everything.
 
 See the full [Changelog](CHANGELOG.md) for all releases.
 
@@ -45,8 +45,8 @@ Output lands in `schema-dump/<game>/` next to the exe.
 |------|---------|-------------|
 | `--process <name>` | `deadlock.exe` | Target process |
 | `--output <dir>` | `schema-dump/<game>/` | Output directory |
-| `--signatures` | off | Generate byte pattern signatures (requires Python 3) |
-| `--sdk` | off | Generate cherry-pickable C++ SDK headers (requires Python 3) |
+| `--signatures` | off | Generate byte pattern signatures |
+| `--sdk` | off | Generate cherry-pickable C++ SDK headers |
 | `--all` | off | Enable all generators |
 
 > **Note:** Schema dump finishes in seconds. Signature generation (`--signatures` / `--all`) processes 800k+ functions and can take several minutes.
@@ -145,7 +145,6 @@ Or just run `build.bat`. Output lands in `build/bin/Release/`.
 - Windows 10/11 (x64)
 - Target Source 2 game running with `client.dll` loaded
 - Run as **administrator**
-- Python 3 for `--signatures` and `--sdk`
 
 ## Contributing
 

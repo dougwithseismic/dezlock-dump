@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2025-06-22
+
+### Changed
+- Port `generate-signatures.py` and `import-schema.py` to C++ — signature and SDK generation are now built into the exe
+- Python 3 is no longer required for `--signatures` or `--sdk`
+- Shared data structures (`Field`, `ClassInfo`, `ModuleData`, etc.) moved to `src/import-schema.hpp`
+- Python scripts remain in the repo as standalone tools for processing JSON independently
+
+### Removed
+- `find_python()` / `run_python_script()` subprocess infrastructure in `main.cpp`
+- Python scripts no longer copied to output directory at build time
+
 ## [1.3.0] - 2025-06-15
 
 ### Added

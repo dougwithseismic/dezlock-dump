@@ -31,12 +31,16 @@ if(MSVC)
 endif()
 
 # --- dezlock-dump (CLI orchestrator exe) ---
-add_executable(dezlock-dump main.cpp)
+add_executable(dezlock-dump
+    main.cpp
+    src/generate-signatures.cpp
+    src/import-schema.cpp
+)
 target_include_directories(dezlock-dump PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(dezlock-dump PRIVATE user32 advapi32)
 
 # --- Copy config files and scripts to output directory ---
-foreach(cfg patterns.json sdk-cherry-pick.json generate-signatures.py import-schema.py)
+foreach(cfg patterns.json sdk-cherry-pick.json)
     if(EXISTS ${CMAKE_SOURCE_DIR}/${cfg})
         add_custom_command(TARGET dezlock-dump POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

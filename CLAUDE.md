@@ -30,12 +30,13 @@ dezlock-dump.exe                          dezlock-worker.dll (injected into game
   ├─ Wait for %TEMP%/dezlock-done           ├─ Build RTTI hierarchy (all loaded DLLs)
   ├─ Read %TEMP%/dezlock-export.json        ├─ Scan .rdata for vtables, capture function bytes
   ├─ Generate text output files             ├─ Scan .data for global singletons
-  ├─ [Optional] invoke Python scripts       ├─ Resolve pattern-based globals
-  └─ Cleanup                                └─ Write JSON + marker file, auto-unload
+  ├─ Generate signatures (built-in)         ├─ Resolve pattern-based globals
+  ├─ Generate SDK headers (built-in)        └─ Write JSON + marker file, auto-unload
+  └─ Cleanup
 ```
 
-### main.cpp (~2300 lines)
-CLI entry point. Handles PE manual-mapping (section copy, relocations, imports, SEH registration), DLL injection via `VirtualAllocEx`/`WriteProcessMemory`, output file generation (text dumps, hierarchy trees, globals, entity paths), and Python script orchestration. Uses colored console output with progress steps.
+### main.cpp (~2200 lines)
+CLI entry point. Handles PE manual-mapping (section copy, relocations, imports, SEH registration), DLL injection via `VirtualAllocEx`/`WriteProcessMemory`, output file generation (text dumps, hierarchy trees, globals, entity paths), and orchestrates signature/SDK generation. Uses colored console output with progress steps.
 
 ### worker.cpp (~600 lines)
 The injected DLL. Runs `worker_thread` on `DLL_PROCESS_ATTACH`. Orchestrates all data collection phases in sequence, writes the complete JSON export to `%TEMP%/dezlock-export.json`, then signals via `%TEMP%/dezlock-done` and auto-unloads with `FreeLibraryAndExitThread`.
@@ -55,9 +56,15 @@ Supplementary pattern-based global resolution from `patterns.json`. Two modes: R
 ### src/log.{hpp,cpp}
 Thread-safe file logger for the worker DLL. Writes to `%TEMP%/dezlock-worker.txt`. Macros: `LOG_D/I/W/E`.
 
-### Python scripts (optional, require Python 3)
-- **generate-signatures.py** — Converts vtable function bytes into masked IDA-style pattern signatures with stub detection, COMDAT deduplication, and shortest-unique-prefix trimming.
-- **import-schema.py** — Generates cherry-pickable C++ SDK headers with v2-style types (Vec3, QAngle, CHandle), constexpr offsets, scoped enums, and static_asserts. Type mappings and helper methods configured via `sdk-cherry-pick.json`.
+### src/generate-signatures.{hpp,cpp}
+Converts vtable function bytes into masked IDA-style pattern signatures with stub detection, COMDAT deduplication, and shortest-unique-prefix trimming. Multi-threaded per-module processing. Entry point: `generate_signatures(data, output_dir)`.
+
+### src/import-schema.{hpp,cpp}
+Generates cherry-pickable C++ SDK headers with v2-style types (Vec3, QAngle, CHandle), constexpr offsets, scoped enums, and static_asserts. Also defines shared data structures (Field, ClassInfo, ModuleData, etc.) used by main.cpp. Type mappings and helper methods configured via `sdk-cherry-pick.json`. Entry point: `generate_sdk(data, modules, class_lookup, output_dir, game_name, exe_dir)`.
+
+### Python scripts (standalone, no longer required)
+- **generate-signatures.py** — Standalone Python version of signature generation (useful for processing JSON independently).
+- **import-schema.py** — Standalone Python version of SDK generation (useful for processing JSON independently).
 
 ## Key Conventions
 

@@ -29,6 +29,8 @@
 #include <unordered_set>
 
 #include "vendor/json.hpp"
+#include "src/generate-signatures.hpp"
+#include "src/import-schema.hpp"
 using json = nlohmann::json;
 
 // ============================================================================
@@ -489,42 +491,8 @@ static bool create_directory_recursive(const char* path) {
 // Output generation
 // ============================================================================
 
-struct Field {
-    std::string name;
-    std::string type;
-    int offset = 0;
-    int size = 0;
-    std::string defined_in;
-    std::vector<std::string> metadata;
-};
-
-struct EnumValue {
-    std::string name;
-    long long value = 0;
-};
-
-struct EnumInfo {
-    std::string name;
-    int size = 0;
-    std::vector<EnumValue> values;
-};
-
-struct ClassInfo {
-    std::string name;
-    int size = 0;
-    std::string parent;
-    std::vector<std::string> inheritance;
-    std::vector<std::string> metadata;
-    std::vector<Field> fields;
-    std::vector<Field> static_fields;
-    std::vector<std::pair<std::string, int>> components;
-};
-
-struct ModuleData {
-    std::string name;
-    std::vector<ClassInfo> classes;
-    std::vector<EnumInfo> enums;
-};
+// Data structures (Field, EnumValue, EnumInfo, ClassInfo, ModuleData)
+// are defined in src/import-schema.hpp
 
 static std::vector<Field> parse_fields(const json& arr) {
     std::vector<Field> result;
@@ -1152,52 +1120,6 @@ static bool is_elevated() {
 }
 
 // ============================================================================
-// Python script runner
-// ============================================================================
-
-// Find Python executable (tries python, python3, py in PATH)
-static bool find_python(char* out_path, size_t out_size) {
-    const char* candidates[] = {"python", "python3", "py"};
-    for (const char* name : candidates) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "where %s > nul 2>&1", name);
-        if (system(cmd) == 0) {
-            snprintf(out_path, out_size, "%s", name);
-            return true;
-        }
-    }
-    return false;
-}
-
-// Run a Python script with arguments. Returns true on success (exit code 0).
-static bool run_python_script(const char* python, const char* script_path,
-                               const char* args) {
-    char cmdline[2048];
-    snprintf(cmdline, sizeof(cmdline), "\"%s\" \"%s\" %s", python, script_path, args);
-
-    STARTUPINFOA si = {};
-    si.cb = sizeof(si);
-    // Inherit our console so Python output is visible
-    si.dwFlags = 0;
-
-    PROCESS_INFORMATION pi = {};
-    if (!CreateProcessA(nullptr, cmdline, nullptr, nullptr, TRUE,
-                        0, nullptr, nullptr, &si, &pi)) {
-        con_fail("CreateProcess failed (err=%lu): %s", GetLastError(), cmdline);
-        return false;
-    }
-
-    WaitForSingleObject(pi.hProcess, 120000); // 2 min timeout
-
-    DWORD exit_code = 1;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    return exit_code == 0;
-}
-
-// ============================================================================
 // Main
 // ============================================================================
 
@@ -1240,8 +1162,8 @@ int main(int argc, char* argv[]) {
             con_print("  --output      Output directory (default: schema-dump/<game>/ next to exe)\n");
             con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
             con_print("  --depth       Field expansion depth for globals/entity trees (default: 3, max: 32)\n");
-            con_print("  --sdk         Generate cherry-pickable C++ SDK (requires Python 3)\n");
-            con_print("  --signatures  Generate byte pattern signatures (requires Python 3)\n");
+            con_print("  --sdk         Generate cherry-pickable C++ SDK headers\n");
+            con_print("  --signatures  Generate byte pattern signatures\n");
             con_print("  --all         Enable all generators (sdk + signatures)\n");
             wait_for_keypress();
             return 0;
@@ -1255,7 +1177,7 @@ int main(int argc, char* argv[]) {
     con_color(CLR_TITLE);
     con_print("  dezlock-dump");
     con_color(CLR_DIM);
-    con_print("  v1.2.0\n");
+    con_print("  v1.4.0\n");
     con_color(CLR_DEFAULT);
     con_print("  Runtime schema + RTTI extraction for Source 2 games\n");
     con_color(CLR_DIM);
@@ -1583,18 +1505,12 @@ int main(int argc, char* argv[]) {
         con_color(CLR_TITLE);
         con_print("    [2] ");
         con_color(CLR_DEFAULT);
-        con_print("C++ SDK");
-        con_color(CLR_DIM);
-        con_print("                  requires Python\n");
-        con_color(CLR_DEFAULT);
+        con_print("C++ SDK\n");
 
         con_color(CLR_TITLE);
         con_print("    [3] ");
         con_color(CLR_DEFAULT);
-        con_print("Byte signatures");
-        con_color(CLR_DIM);
-        con_print("          requires Python\n");
-        con_color(CLR_DEFAULT);
+        con_print("Byte signatures\n");
 
         con_color(CLR_TITLE);
         con_print("    [4] ");
@@ -2211,124 +2127,28 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Signature generation (optional) ----
-    int sig_unique = 0, sig_total = 0;
+    SignatureStats sig_stats = {};
     if (gen_signatures) {
         con_print("\n");
         con_step("SIG", "Generating byte pattern signatures...");
 
-        // Find Python
-        char python[256] = {};
-        if (!find_python(python, sizeof(python))) {
-            con_fail("Python not found in PATH. Install Python 3.x to use --signatures.");
-            con_info("You can still run manually: python generate-signatures.py --json %s",
-                     json_out.c_str());
-        } else {
-            // Find generate-signatures.py: check next to exe, then parent dir
-            char script_path[MAX_PATH];
-            snprintf(script_path, MAX_PATH, "%sgenerate-signatures.py", exe_path);
-
-            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
-                // Try parent directory (exe in bin/, script in repo root)
-                char parent_path[MAX_PATH];
-                snprintf(parent_path, MAX_PATH, "%s..\\generate-signatures.py", exe_path);
-                char resolved[MAX_PATH];
-                if (GetFullPathNameA(parent_path, MAX_PATH, resolved, nullptr) > 0 &&
-                    GetFileAttributesA(resolved) != INVALID_FILE_ATTRIBUTES) {
-                    snprintf(script_path, MAX_PATH, "%s", resolved);
-                }
-            }
-
-            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
-                con_fail("generate-signatures.py not found.");
-                con_info("Searched: %sgenerate-signatures.py", exe_path);
-                con_info("Searched: %s..\\generate-signatures.py", exe_path);
-            } else {
-                std::string sig_output = output_dir + "\\signatures";
-                char args[2048];
-                snprintf(args, sizeof(args), "--json \"%s\" --output \"%s\"",
-                         json_out.c_str(), sig_output.c_str());
-
-                con_info("Running: %s %s %s", python, script_path, args);
-                if (run_python_script(python, script_path, args)) {
-                    con_ok("Signatures generated -> %s\\", sig_output.c_str());
-
-                    // Try to read the summary JSON for stats
-                    std::string sig_json = sig_output + "\\_all-signatures.json";
-                    FILE* sfp = fopen(sig_json.c_str(), "rb");
-                    if (sfp) {
-                        fseek(sfp, 0, SEEK_END);
-                        long ssize = ftell(sfp);
-                        fseek(sfp, 0, SEEK_SET);
-                        std::string sbuf(ssize, '\0');
-                        fread(&sbuf[0], 1, ssize, sfp);
-                        fclose(sfp);
-
-                        try {
-                            auto sdata = json::parse(sbuf);
-                            if (sdata.contains("modules")) {
-                                for (const auto& [mod_name, mod_sigs] : sdata["modules"].items()) {
-                                    for (const auto& [cls_name, funcs] : mod_sigs.items()) {
-                                        for (const auto& f : funcs) {
-                                            sig_total++;
-                                            if (f.value("unique", false)) sig_unique++;
-                                        }
-                                    }
-                                }
-                            }
-                        } catch (...) {}
-                    }
-                } else {
-                    con_fail("Signature generation failed. Check output above.");
-                }
-            }
-        }
+        std::string sig_output = output_dir + "\\signatures";
+        sig_stats = generate_signatures(data, sig_output);
+        con_ok("Signatures generated -> %s\\", sig_output.c_str());
     }
 
     // ---- SDK generation (optional) ----
+    SdkStats sdk_stats = {};
     bool sdk_ok = false;
     if (gen_sdk) {
         con_print("\n");
         con_step("SDK", "Generating cherry-pickable C++ SDK...");
 
-        char python[256] = {};
-        if (!find_python(python, sizeof(python))) {
-            con_fail("Python not found in PATH. Install Python 3.x to use --sdk.");
-            con_info("You can still run manually: python import-schema.py --game %s --json %s",
-                     game_name.c_str(), json_out.c_str());
-        } else {
-            // Find import-schema.py: check next to exe, then parent dir
-            char script_path[MAX_PATH];
-            snprintf(script_path, MAX_PATH, "%simport-schema.py", exe_path);
-
-            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
-                char parent_path[MAX_PATH];
-                snprintf(parent_path, MAX_PATH, "%s..\\import-schema.py", exe_path);
-                char resolved[MAX_PATH];
-                if (GetFullPathNameA(parent_path, MAX_PATH, resolved, nullptr) > 0 &&
-                    GetFileAttributesA(resolved) != INVALID_FILE_ATTRIBUTES) {
-                    snprintf(script_path, MAX_PATH, "%s", resolved);
-                }
-            }
-
-            if (GetFileAttributesA(script_path) == INVALID_FILE_ATTRIBUTES) {
-                con_fail("import-schema.py not found.");
-                con_info("Searched: %simport-schema.py", exe_path);
-                con_info("Searched: %s..\\import-schema.py", exe_path);
-            } else {
-                std::string sdk_output = output_dir + "\\sdk";
-                char args[2048];
-                snprintf(args, sizeof(args), "--game \"%s\" --json \"%s\" --output \"%s\"",
-                         game_name.c_str(), json_out.c_str(), sdk_output.c_str());
-
-                con_info("Running: %s %s %s", python, script_path, args);
-                if (run_python_script(python, script_path, args)) {
-                    con_ok("SDK generated -> %s\\", sdk_output.c_str());
-                    sdk_ok = true;
-                } else {
-                    con_fail("SDK generation failed. Check output above.");
-                }
-            }
-        }
+        std::string sdk_output = output_dir + "\\sdk";
+        sdk_stats = generate_sdk(data, modules, global_class_lookup, sdk_output,
+                                  game_name, std::string(exe_path));
+        sdk_ok = true;
+        con_ok("SDK generated -> %s\\", sdk_output.c_str());
     }
 
     // Clean up temp files
@@ -2366,11 +2186,19 @@ int main(int argc, char* argv[]) {
         if (pat_count > 0)
             con_print("  %-20s %d (from patterns.json)\n", "Pattern globals:", pat_count);
     }
-    if (sig_total > 0) {
-        con_print("  %-20s %d (%d unique)\n", "Signatures:", sig_total, sig_unique);
+    if (sig_stats.total > 0) {
+        con_print("  %-20s %d (%d unique, %d class-unique, %d stubs)\n",
+                  "Signatures:", sig_stats.total, sig_stats.unique,
+                  sig_stats.class_unique, sig_stats.stubs);
     }
     if (sdk_ok) {
-        con_print("  %-20s %s\\sdk\\\n", "SDK:", output_dir.c_str());
+        con_print("  %-20s %d structs, %d enums, %d vtables\n",
+                  "SDK:", sdk_stats.structs, sdk_stats.enums, sdk_stats.vtables);
+        if (sdk_stats.globals > 0)
+            con_print("  %-20s %d globals, %d patterns\n", "", sdk_stats.globals, sdk_stats.patterns);
+        if (sdk_stats.total_fields > 0)
+            con_print("  %-20s %d/%d fields resolved\n", "Type resolution:",
+                      sdk_stats.resolved, sdk_stats.total_fields);
     }
     con_print("\n");
 
@@ -2384,7 +2212,7 @@ int main(int argc, char* argv[]) {
     con_print("    grep m_iHealth %s\\client.txt\n", output_dir.c_str());
     con_print("    grep FLATTENED %s\\client.txt\n", output_dir.c_str());
     con_print("    grep EAbilitySlots %s\\client.txt\n", output_dir.c_str());
-    if (gen_signatures && sig_total > 0) {
+    if (gen_signatures && sig_stats.total > 0) {
         con_print("    grep CCitadelInput %s\\signatures\\client.txt\n", output_dir.c_str());
     }
     if (sdk_ok) {
