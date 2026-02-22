@@ -16,7 +16,7 @@ See the full [Changelog](CHANGELOG.md) for all releases.
 
 ## What
 
-A single exe that injects a read-only worker DLL into a running Source 2 game and dumps everything you need to build cheats, mods, or analysis tools — in seconds, with zero configuration.
+A single exe that injects a read-only worker DLL into a running Source 2 game and extracts the complete schema, RTTI, and runtime layout data — in seconds, with zero configuration. Built for educational purposes and reverse engineering research.
 
 **One command, full extraction:**
 
