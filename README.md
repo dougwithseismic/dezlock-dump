@@ -128,6 +128,24 @@ Optional `patterns.json` for untyped globals that vtable scanning can't find (`d
 | `sdk/_all-vtables.hpp` | VTable RVAs + function indices |
 | `sdk/_globals.hpp` | Resolved global pointer RVAs |
 | `sdk/_patterns.hpp` | Runtime-scannable byte patterns for globals |
+| `viewer/index.html` | Interactive browser-based viewer for `_all-modules.json` |
+
+## Interactive Viewer
+
+A browser-based viewer for exploring dump output interactively. Open `viewer/index.html` in any browser — no server, no build step, no dependencies.
+
+1. Open `viewer/index.html` directly from your filesystem
+2. Drop your `_all-modules.json` onto the landing page (or use the file picker)
+3. Browse classes, fields, enums, globals, and inheritance trees
+
+**Features:**
+- Searchable class/field/enum browser with module filtering (Ctrl+K to focus)
+- Sortable field offset tables with own/flattened inherited field toggle
+- Clickable inheritance chains — click any parent class to navigate
+- Global singletons browser with module grouping and pattern globals
+- Full inheritance tree with collapsible nodes
+- Dark/light theme toggle
+- Works offline with 150MB+ JSON files (parses in a Web Worker)
 
 ## Build from Source
 
