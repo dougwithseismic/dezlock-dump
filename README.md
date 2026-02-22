@@ -6,6 +6,8 @@
 
 Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2).
 
+![dezlock-dump viewer](assets/viewer-preview.png)
+
 ## What's New
 
 **v1.4.0** — Signature and SDK generation ported to C++ — zero external dependencies, no Python required. Single exe does everything.
