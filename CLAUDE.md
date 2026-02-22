@@ -4,15 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build
 
-Requires Visual Studio 2022 with C++ desktop workload (MSVC x64). Single command:
+Requires Visual Studio 2022 with C++ desktop workload (MSVC x64) and CMake 3.20+ (ships with VS2022).
 
 ```bat
-build.bat
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 ```
 
-Produces `bin/dezlock-dump.exe` and `bin/dezlock-worker.dll`. No package manager, no dependencies beyond MSVC and the vendored `vendor/json.hpp` (nlohmann/json).
+Or simply run `build.bat` which wraps the above commands.
 
-Compiler flags: `/std:c++17 /O2 /MT /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS`. Worker DLL links `user32.lib psapi.lib`; main exe links `user32.lib advapi32.lib`.
+Produces `dezlock-dump.exe` and `dezlock-worker.dll` in `build/bin/Release/`. No package manager, no dependencies beyond MSVC and the vendored `vendor/json.hpp` (nlohmann/json). Config files (`patterns.json`, `sdk-cherry-pick.json`) are copied to the output directory automatically.
+
+Compiler flags (set in `CMakeLists.txt`): `/std:c++17 /O2 /MT /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS`. Worker DLL links `user32.lib psapi.lib` with `/GUARD:NO`; main exe links `user32.lib advapi32.lib`.
 
 CI: `.github/workflows/build.yml` (push/PR), `.github/workflows/release.yml` (version tags `v*`).
 

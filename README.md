@@ -24,7 +24,7 @@ dezlock-dump.exe --all
 
 ## How
 
-1. Download from [Releases](../../releases) (or build with `build.bat` — requires VS 2022 with C++ desktop workload)
+1. Download from [Releases](../../releases) (or [build from source](#build-from-source))
 2. Launch your game and load into a match or lobby
 3. Run as administrator:
 
@@ -128,6 +128,17 @@ Optional `patterns.json` for untyped globals that vtable scanning can't find (`d
 | `sdk/_all-vtables.hpp` | VTable RVAs + function indices |
 | `sdk/_globals.hpp` | Resolved global pointer RVAs |
 | `sdk/_patterns.hpp` | Runtime-scannable byte patterns for globals |
+
+## Build from Source
+
+Requires Visual Studio 2022 with C++ desktop workload and CMake 3.20+ (ships with VS2022).
+
+```bash
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+Or just run `build.bat`. Output lands in `build/bin/Release/`.
 
 ## Requirements
 

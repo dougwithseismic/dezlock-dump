@@ -12,24 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Build
-        shell: cmd
-        run: |
-          cl.exe /nologo /std:c++17 /O2 /MP /MT /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /I"." worker.cpp src/schema-manager.cpp src/rtti-hierarchy.cpp src/log.cpp src/global-scanner.cpp src/pattern-scanner.cpp /LD /Fe:"dezlock-worker.dll" /link /GUARD:NO user32.lib psapi.lib || exit /b 1
-          cl.exe /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /I"." main.cpp /Fe:"dezlock-dump.exe" /link user32.lib advapi32.lib || exit /b 1
-          del /q *.obj 2>nul
-          del /q *.exp 2>nul
-          del /q *.lib 2>nul
+        run: cmake --build build --config Release
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dezlock-dump
           path: |
-            dezlock-dump.exe
-            dezlock-worker.dll
+            build/bin/Release/dezlock-dump.exe
+            build/bin/Release/dezlock-worker.dll

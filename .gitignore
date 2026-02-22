@@ -20,6 +20,9 @@ generated/
 # Python
 __pycache__/
 
+# CMake
+build/
+
 # Temp files
 *.log
 bin/
