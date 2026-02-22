@@ -44,7 +44,7 @@ set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\log.cpp"
 set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\global-scanner.cpp"
 set "WORKER_SRC=!WORKER_SRC! !SRC_DIR!\pattern-scanner.cpp"
 
-set "CFLAGS=/nologo /std:c++17 /O2 /MP /MT /EHsc /W3 /DUNICODE /D_UNICODE"
+set "CFLAGS=/nologo /std:c++17 /O2 /MP /MT /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS"
 set "CFLAGS=!CFLAGS! /I"!TOOL_DIR!""
 
 cl.exe !CFLAGS! !WORKER_SRC! /LD /Fe:"!OUTPUT_DIR!\dezlock-worker.dll" /link /GUARD:NO user32.lib psapi.lib
@@ -59,7 +59,7 @@ echo [2/2] Building dezlock-dump.exe...
 
 :: Main exe sources (standalone — only needs json.hpp from vendor/)
 set "MAIN_SRC=!TOOL_DIR!\main.cpp"
-set "MAIN_CFLAGS=/nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE"
+set "MAIN_CFLAGS=/nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS"
 set "MAIN_CFLAGS=!MAIN_CFLAGS! /I"!TOOL_DIR!""
 
 cl.exe !MAIN_CFLAGS! !MAIN_SRC! /Fe:"!OUTPUT_DIR!\dezlock-dump.exe" /link user32.lib advapi32.lib

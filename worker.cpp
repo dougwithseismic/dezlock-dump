@@ -106,7 +106,8 @@ static bool write_field_json(FILE* fp, const schema::RuntimeField& f, bool first
 
 bool write_export(schema::SchemaManager& mgr, const char* path,
                   const globals::GlobalMap& discovered,
-                  const pattern::ResultMap& pattern_globals) {
+                  const pattern::ResultMap& pattern_globals,
+                  const pattern::PatternConfig& pattern_config) {
     FILE* fp = fopen(path, "w");
     if (!fp) {
         LOG_E("Failed to open %s for writing", path);
@@ -346,6 +347,13 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
             }
             if (has_any) break;
         }
+
+        // Build lookup from pattern name -> PatternEntry for metadata
+        std::unordered_map<std::string, const pattern::PatternEntry*> entry_lookup;
+        for (const auto& e : pattern_config.entries) {
+            entry_lookup[e.name] = &e;
+        }
+
         if (has_any) {
             fprintf(fp, ",\n  \"pattern_globals\": {\n");
             int mod_idx = 0;
@@ -362,7 +370,31 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
                 for (const auto& r : results) {
                     if (!r.found) continue;
                     if (entry_idx > 0) fprintf(fp, ",\n");
-                    fprintf(fp, "      \"%s\": \"0x%X\"", r.name.c_str(), r.rva);
+
+                    auto it = entry_lookup.find(r.name);
+                    if (it != entry_lookup.end()) {
+                        const auto* pe = it->second;
+                        fprintf(fp, "      \"%s\": {\n", r.name.c_str());
+                        fprintf(fp, "        \"rva\": \"0x%X\"", r.rva);
+                        if (pe->mode == pattern::ResolveMode::Derived) {
+                            fprintf(fp, ",\n        \"mode\": \"derived\"");
+                            fprintf(fp, ",\n        \"derived_from\": \"%s\"",
+                                    json_escape(pe->derived_from.c_str()).c_str());
+                            fprintf(fp, ",\n        \"chain_pattern\": \"%s\"",
+                                    json_escape(pe->chain_pattern.c_str()).c_str());
+                            fprintf(fp, ",\n        \"chain_extract_offset\": %d",
+                                    pe->chain_extract_offset);
+                        } else {
+                            fprintf(fp, ",\n        \"pattern\": \"%s\"",
+                                    json_escape(pe->signature.c_str()).c_str());
+                            fprintf(fp, ",\n        \"rip_offset\": %d", pe->rip_offset);
+                        }
+                        fprintf(fp, "\n      }");
+                    } else {
+                        // Fallback: no config entry found, emit RVA only
+                        fprintf(fp, "      \"%s\": {\"rva\": \"0x%X\"}",
+                                r.name.c_str(), r.rva);
+                    }
                     entry_idx++;
                 }
                 fprintf(fp, "\n    }");
@@ -547,14 +579,14 @@ void worker_thread(HMODULE hModule) {
 
         // ---- Optional: pattern-based globals (supplementary) ----
         pattern::ResultMap pattern_globals;
+        pattern::PatternConfig pattern_config;
         {
             char patterns_path[MAX_PATH];
             snprintf(patterns_path, MAX_PATH, "%sdezlock-patterns.json", temp_dir);
 
-            pattern::PatternConfig pcfg;
-            if (pattern::load_config(patterns_path, pcfg)) {
-                LOG_I("Running supplementary pattern scan (%d patterns)...", (int)pcfg.entries.size());
-                pattern_globals = pattern::resolve_all(pcfg);
+            if (pattern::load_config(patterns_path, pattern_config)) {
+                LOG_I("Running supplementary pattern scan (%d patterns)...", (int)pattern_config.entries.size());
+                pattern_globals = pattern::resolve_all(pattern_config);
 
                 int found = 0, total = 0;
                 for (const auto& [mod, results] : pattern_globals) {
@@ -571,7 +603,7 @@ void worker_thread(HMODULE hModule) {
 
         // Export to JSON (all modules)
         LOG_I("Writing JSON export...");
-        write_export(mgr, json_path, discovered, pattern_globals);
+        write_export(mgr, json_path, discovered, pattern_globals, pattern_config);
     }
 
 done:

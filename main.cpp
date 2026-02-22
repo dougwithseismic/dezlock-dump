@@ -1910,10 +1910,17 @@ int main(int argc, char* argv[]) {
                 fprintf(gfp, "# ================================================================\n\n");
                 for (const auto& [mod_name, mod_pats] : data["pattern_globals"].items()) {
                     if (!mod_pats.is_object()) continue;
-                    for (const auto& [name, rva] : mod_pats.items()) {
+                    for (const auto& [name, val] : mod_pats.items()) {
+                        std::string rva_str;
+                        if (val.is_object() && val.contains("rva"))
+                            rva_str = val["rva"].get<std::string>();
+                        else if (val.is_string())
+                            rva_str = val.get<std::string>();
+                        else
+                            continue;
                         fprintf(gfp, "%s::%s = %s (pattern)\n",
                                 mod_name.c_str(), name.c_str(),
-                                rva.get<std::string>().c_str());
+                                rva_str.c_str());
                         total_written++;
                     }
                 }

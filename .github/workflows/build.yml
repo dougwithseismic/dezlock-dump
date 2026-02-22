@@ -20,8 +20,8 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cl.exe /nologo /std:c++17 /O2 /MP /MT /EHsc /W3 /DUNICODE /D_UNICODE /I"." worker.cpp src/schema-manager.cpp src/rtti-hierarchy.cpp src/log.cpp /LD /Fe:"dezlock-worker.dll" /link /GUARD:NO user32.lib psapi.lib
-          cl.exe /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /I"." main.cpp /Fe:"dezlock-dump.exe" /link user32.lib advapi32.lib
+          cl.exe /nologo /std:c++17 /O2 /MP /MT /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /I"." worker.cpp src/schema-manager.cpp src/rtti-hierarchy.cpp src/log.cpp /LD /Fe:"dezlock-worker.dll" /link /GUARD:NO user32.lib psapi.lib
+          cl.exe /nologo /std:c++17 /O2 /MT /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /I"." main.cpp /Fe:"dezlock-dump.exe" /link user32.lib advapi32.lib
           del /q *.obj 2>nul
           del /q *.exp 2>nul
           del /q *.lib 2>nul

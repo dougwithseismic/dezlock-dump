@@ -2,106 +2,22 @@
 
 [![Discord](https://img.shields.io/discord/1469694564683088168?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sjcsVkE8ur)
 
-> **Join the community!** Got questions, want to share your setups, or just hang out? Jump into our Discord:
->
-> **[discord.gg/sjcsVkE8ur](https://discord.gg/sjcsVkE8ur)**
+Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2).
 
----
+## What
 
-Runtime schema + RTTI + vtable + global singleton + signature extraction tool for Source 2 games (Deadlock, CS2, Dota 2). Injects a minimal worker DLL into a running game process and dumps the complete class hierarchy, field offsets, metadata annotations, static fields, enums, inheritance chains, **every virtual function table**, **global singleton instances**, and **pattern signatures** for all virtual functions.
+A single exe that injects a read-only worker DLL into a running Source 2 game and dumps everything you need to build cheats, mods, or analysis tools — in seconds, with zero configuration.
 
-No source2gen required — reads directly from the game's `SchemaSystem` and MSVC x64 RTTI at runtime.
+**One command, full extraction:**
 
-### What You Get
-
-**Every entity class, fully expanded** (`_entity-paths.txt`) — grep any class and see the complete field tree with pointer chains resolved:
-```
-# C_CitadelPlayerPawn (size=0x1990)
-# chain: C_CitadelPlayerPawn -> CCitadelPlayerPawnBase -> C_BasePlayerPawn -> ... -> CEntityInstance
-  +0x10   m_pEntity                      -> CEntityIdentity*
-            +0x18   m_name                         (CUtlSymbolLarge)
-            +0x20   m_designerName                 (CUtlSymbolLarge)
-  +0x30   m_CBodyComponent               -> CBodyComponent*
-            +0x8    m_pSceneNode                   -> CGameSceneNode*
-                      +0xC8   m_vecAbsOrigin                 (VectorWS)
-                      +0x103  m_bDormant                     (bool)
-  +0x354  m_iHealth                      (int32, C_BaseEntity)
-  +0x3F3  m_iTeamNum                     (uint8, C_BaseEntity)
-  +0x11B0 m_angEyeAngles                 (QAngle)
-  +0x12D4 m_nLevel                       (int32)
-  +0x14C0 m_CCitadelAbilityComponent     [embedded CCitadelAbilityComponent, +0x14C0]
-            +0x68   m_vecAbilities                 (CHandle vector)
+```bash
+dezlock-dump.exe --all
 ```
 
-**Every field offset, greppable** (`client.txt`) — classes + flattened inherited fields + enums, all in one file:
-```
-C_CitadelPlayerPawn.m_angEyeAngles = 0x11B0 (QAngle, 12) [MNetworkEnable]
-C_CitadelPlayerPawn.m_nLevel = 0x12D4 (int32, 4) [MNetworkEnable]
-C_CitadelPlayerPawn.m_nCurrencies = 0x12D8 (int32[6], 24) [MNetworkEnable]
-CCitadelAbilityComponent.m_vecAbilities = 0x68 (CHandle vector, 24) [MNetworkEnable]
-```
+## How
 
-**11,000+ global singletons auto-discovered** (`_globals.txt`) — found by scanning `.data` sections against the RTTI vtable catalog:
-```
-client.dll::CCitadelCameraManager = 0x31F05F0 (static)
-client.dll::CCitadelMatchMetadataManager = 0x31EF288 (pointer)
-engine2.dll::CGameEntitySystem = 0x623AA8 (pointer)
-engine2.dll::CNetworkService = 0x623BC0 (static)
-server.dll::CCitadelGameRules = 0x3A09558 (pointer) [schema]
-```
-
-**Pattern signatures for every virtual function** (`signatures/`) — IDA-style byte patterns for hooking:
-```
-CCitadelInput::CreateMove = 48 89 5C 24 ? 55 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 48 8B D9
-CGameEntitySystem::GetEntityByIndex = 81 FA ? ? ? ? 77 ? 4C 8B 81 ? ? ? ? 4D 85 C0
-```
-
----
-
-**Scans every loaded DLL** — walks all modules for schema data (client.dll, server.dll, engine2.dll, etc.) and RTTI vtables (panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, and 50+ more).
-
-**Auto-discovers global singletons** — scans `.data` sections of every loaded module and cross-references against the RTTI vtable catalog to find every typed singleton instance. No hardcoded patterns — globals are discovered automatically from the same data the tool already collects.
-
-## Output
-
-For each module with schema data (e.g. `client.dll` → `client`), output is organized per-game:
-
-| File | Format | Description |
-|------|--------|-------------|
-| `schema-dump/<game>/<module>.txt` | Greppable text | Classes + flattened inherited fields + enums (all in one file) |
-| `schema-dump/<game>/<module>/hierarchy/` | Tree | Per-class files organized by inheritance |
-| `schema-dump/<game>/_globals.txt` | Access guide | Global singletons with recursive field trees and pointer chains |
-| `schema-dump/<game>/_access-paths.txt` | Quick ref | Schema globals only — full offset paths for every field (the important stuff) |
-| `schema-dump/<game>/_entity-paths.txt` | Quick ref | Every entity class with full recursive field trees (C_CitadelPlayerPawn, etc.) |
-| `schema-dump/<game>/_all-modules.json` | JSON | Full structured export for tooling (all modules) |
-
-For signature generation (all modules with vtables):
-
-| File | Format | Description |
-|------|--------|-------------|
-| `schema-dump/<game>/signatures/<module>.txt` | Greppable text | Pattern signatures per function |
-| `schema-dump/<game>/signatures/_all-signatures.json` | JSON | Structured signatures for tooling |
-
-For SDK generation (`--sdk`):
-
-| File | Format | Description |
-|------|--------|-------------|
-| `schema-dump/<game>/sdk/types.hpp` | C++ header | Base types (Vec3, QAngle, CHandle, etc.) |
-| `schema-dump/<game>/sdk/<module>/_offsets.hpp` | C++ header | Per-module constexpr offset constants |
-| `schema-dump/<game>/sdk/<module>/_enums.hpp` | C++ header | Per-module scoped enum classes |
-| `schema-dump/<game>/sdk/<module>/<Class>.hpp` | C++ header | Per-class padded struct with static_asserts |
-| `schema-dump/<game>/sdk/_all-offsets.hpp` | C++ header | Master include for all module offsets |
-| `schema-dump/<game>/sdk/_all-enums.hpp` | C++ header | Master include for all module enums |
-| `schema-dump/<game>/sdk/_all-vtables.hpp` | C++ header | VTable RVAs + function indices |
-
-Additionally, `%TEMP%\dezlock-export.json` contains the complete JSON export with vtable data and function bytes.
-
-## Quick Start
-
-### Pre-built (Releases)
-
-1. Download `dezlock-dump.zip` from [Releases](../../releases)
-2. Launch your Source 2 game and enter a match or lobby
+1. Download from [Releases](../../releases) (or build with `build.bat` — requires VS 2022 with C++ desktop workload)
+2. Launch your game and load into a match or lobby
 3. Run as administrator:
 
 ```bash
@@ -115,522 +31,107 @@ dezlock-dump.exe --process cs2.exe --all
 dezlock-dump.exe --process dota2.exe --all
 ```
 
-This dumps schema + generates SDK headers + cherry-pickable SDK + pattern signatures in one shot. Output lands in `schema-dump/<game>/` next to the exe (e.g. `schema-dump/deadlock/`, `schema-dump/cs2/`).
-
-> **Note:** The schema dump itself finishes in seconds, but SDK generation (`--sdk`) and especially signature generation (`--signatures` / `--all`) can take **several minutes** — the signature pass processes 800k+ virtual functions (128 bytes each) across 58+ DLLs. Let it run, don't close the window early.
-
-### Build from Source
-
-Requires Visual Studio 2022 (any edition with C++ desktop workload).
-
-```bat
-build.bat
-```
-
-Produces `bin/dezlock-dump.exe` and `bin/dezlock-worker.dll`.
-
-## Usage
-
-```
-dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--signatures] [--sdk] [--all]
-```
+Output lands in `schema-dump/<game>/` next to the exe.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--process <name>` | `deadlock.exe` | Target process (e.g. `cs2.exe`, `dota2.exe`) |
-| `--output <dir>` | `schema-dump/<game>/` next to exe | Output directory (auto per-game) |
-| `--wait <seconds>` | `30` | Max time to wait for worker DLL |
+| `--process <name>` | `deadlock.exe` | Target process |
+| `--output <dir>` | `schema-dump/<game>/` | Output directory |
 | `--signatures` | off | Generate byte pattern signatures (requires Python 3) |
-| `--sdk` | off | Generate cherry-pickable C++ SDK with v2-quality structs (requires Python 3) |
-| `--all` | off | Enable all generators (signatures + sdk) |
+| `--sdk` | off | Generate cherry-pickable C++ SDK headers (requires Python 3) |
+| `--all` | off | Enable all generators |
 
-### Requirements
+> **Note:** Schema dump finishes in seconds. Signature generation (`--signatures` / `--all`) processes 800k+ functions and can take several minutes.
+
+## Benefits
+
+### Full SDK generation
+Cherry-pickable C++ headers with v2-style types (`Vec3`, `QAngle`, `CHandle`), `constexpr` offsets, scoped enums, and `static_assert` validation on every field. Include only what you need — each class gets its own `.hpp`.
+
+```cpp
+#include "sdk/client/C_BaseEntity.hpp"
+```
+
+### Complete field offsets
+Every class with every field — own and inherited — greppable in one file per module.
+
+```
+C_CitadelPlayerPawn.m_iHealth = 0x354 (int32, 4) [MNetworkEnable]
+C_CitadelPlayerPawn.m_angEyeAngles = 0x11B0 (QAngle, 12)
+```
+
+### Entity access paths
+Full recursive field trees with pointer chains resolved — grep any class and see the complete offset path to any nested field.
+
+```
+# C_CitadelPlayerPawn (size=0x1990)
+  +0x10   m_pEntity                -> CEntityIdentity*
+            +0x18   m_name                   (CUtlSymbolLarge)
+  +0x354  m_iHealth                (int32, C_BaseEntity)
+  +0x11B0 m_angEyeAngles           (QAngle)
+```
+
+### 10,000+ global singletons auto-discovered
+Scans `.data` sections of every loaded module and cross-references against the RTTI vtable catalog. No hardcoded patterns needed.
+
+```
+client.dll::CCitadelCameraManager = 0x31F05F0 (static)
+engine2.dll::CGameEntitySystem = 0x623AA8 (pointer)
+```
+
+### Pattern signatures for every virtual function
+IDA-style byte patterns across 58+ DLLs — survive game patches where RVAs shift. Stubs detected, COMDAT deduplication handled, signatures trimmed to shortest unique prefix.
+
+```
+CCitadelInput::CreateMove = 48 89 5C 24 ? 55 48 8D AC 24
+CSource2Client::idx_0 = 40 53 56 57 48 81
+```
+
+### Full RTTI inheritance
+23,000+ classes with complete parent chains and vtable RVAs from MSVC x64 RTTI — including internal engine classes with no schema entry (CCitadelInput, CPanoramaUIEngine, CInputSystem, etc.).
+
+### Runtime-scannable patterns in SDK
+Global pointer patterns from `patterns.json` are exported as `_patterns.hpp` — drop them into your project and scan at runtime without hardcoded offsets. RIP-relative and derived patterns both supported.
+
+```cpp
+#include "sdk/_patterns.hpp"
+
+// Scan at runtime — survives game patches
+auto match = find_pattern(client_base, client_size, patterns::client::dwEntityList::sig);
+auto addr = resolve_rip(match, patterns::client::dwEntityList::rip_offset);
+```
+
+### Supplementary pattern scanning
+Optional `patterns.json` for untyped globals that vtable scanning can't find (`dwViewMatrix`, `dwEntityList`, etc.).
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `<module>.txt` | Classes + flattened inherited fields + enums |
+| `_globals.txt` | All global singletons with recursive field trees |
+| `_access-paths.txt` | Schema globals only — fast offset grep |
+| `_entity-paths.txt` | Every entity class with full field trees |
+| `_all-modules.json` | Complete structured JSON export |
+| `signatures/<module>.txt` | Pattern signatures per module |
+| `sdk/<Class>.hpp` | Per-class C++ SDK headers |
+| `sdk/_all-offsets.hpp` | All offset constants |
+| `sdk/_all-enums.hpp` | All scoped enums |
+| `sdk/_all-vtables.hpp` | VTable RVAs + function indices |
+| `sdk/_globals.hpp` | Resolved global pointer RVAs |
+| `sdk/_patterns.hpp` | Runtime-scannable byte patterns for globals |
+
+## Requirements
 
 - Windows 10/11 (x64)
-- Target Source 2 game must be running (with `client.dll` loaded)
-- Run as **administrator** (required for process injection)
-
-### Example Workflow
-
-```bash
-# Dump schema (all modules auto-discovered)
-dezlock-dump.exe
-
-# Find a field offset
-grep m_iHealth schema-dump/client.txt
-
-# Find all fields on a class (including inherited — in FLATTENED section)
-grep "C_CitadelPlayerPawn\." schema-dump/client.txt
-
-# Find an enum and its values (in ENUMS section)
-grep EAbilitySlots schema-dump/client.txt
-
-# Find networked fields
-grep MNetworkEnable schema-dump/client.txt
-
-# Find static fields
-grep "= static" schema-dump/client.txt
-
-# Search across all modules
-grep -r m_iHealth schema-dump/*.txt
-
-# Quick offset lookup (schema globals with full field trees only)
-grep m_iHealth schema-dump/_access-paths.txt
-
-# Find a specific system's global pointer
-grep CGameEntitySystem schema-dump/_globals.txt
-
-# Get the full class layout
-cat schema-dump/hierarchy/C_BaseEntity/C_CitadelPlayerPawn.txt
-
-# Generate pattern signatures
-python generate-signatures.py --json bin/schema-dump/_all-modules.json
-
-# Find a signature for a specific class
-grep CCitadelInput bin/schema-dump/signatures/client.txt
-```
-
-## Global Singleton Discovery
-
-dezlock-dump automatically finds global singleton instances by scanning `.data` sections of every loaded module and cross-referencing pointer values against the RTTI vtable catalog. No hardcoded patterns or config files needed — it uses the same vtable data the tool already collects.
-
-### How It Works
-
-1. Builds a map of every known vtable address from the RTTI scan (18,000+ classes)
-2. Walks writable `.data` sections of each module (8-byte aligned)
-3. **Direct match**: value at address IS a known vtable → object lives in `.data` (static global)
-4. **Indirect match**: value is a pointer, dereference it, check if the pointed-to object's vtable is known → pointer to heap-allocated singleton
-5. Tags each result with `has_schema` — whether the class has SchemaSystem field data (known layout)
-
-### Output
-
-`_globals.txt` — a complete access guide. Schema-tagged globals get **recursive field trees** showing every field you can reach, with pointer chains expanded up to 3 levels deep:
-
-```
-# C_CSPlayerPawn @ client.dll+0x2064AE0 (pointer) [schema]
-# chain: C_CSPlayerPawn -> C_CSPlayerPawnBase -> ... -> C_BaseEntity -> CEntityInstance
-  +0x10   m_pEntity                      -> CEntityIdentity*
-            +0x18   m_name                         (CUtlSymbolLarge)
-            +0x20   m_designerName                 (CUtlSymbolLarge)
-  +0x38   m_CBodyComponent               -> CBodyComponent*
-            +0x8    m_pSceneNode                   -> CGameSceneNode*
-                      +0xC8   m_vecAbsOrigin                 (VectorWS)
-                      +0x10B  m_bDormant                     (bool)
-  +0x2D8  m_iHealth                      (int32, CBaseEntity)
-  +0x344  m_iTeamNum                     (uint8, CBaseEntity)
-  +0x3D8  m_pCollision                   -> CCollisionProperty*
-            +0x40   m_vecMins                      (Vector)
-            +0x4C   m_vecMaxs                      (Vector)
-```
-
-Legend:
-- `->` = pointer dereference (follow pointer, then read sub-fields at shown offsets)
-- `[embedded X, +0xN]` = struct is inline at that offset (add offsets together)
-- `[handle -> X]` = CHandle entity reference (resolve via entity list)
-- `(type, ClassName)` = which parent class defines the field
-
-Non-schema globals are still listed as simple entries in `_globals.txt` for completeness.
-
-**`_access-paths.txt`** — the same schema globals with field trees, but *nothing else*. No non-schema noise, no module clutter. Open this file when you just want to grep an offset path fast.
-
-The JSON export (`_all-modules.json`) includes the full globals section:
-
-```json
-"globals": {
-  "client.dll": [
-    {"class": "C_CSGameRules", "rva": "0x2308DA0", "vtable_rva": "0x1F9C2A8", "type": "pointer", "has_schema": true}
-  ]
-}
-```
-
-### Supplementary Pattern Scanning
-
-An optional `patterns.json` file can be placed next to the exe for supplementary pattern-based global resolution. This covers untyped globals that vtable scanning can't find (e.g. `dwViewMatrix`, `dwBuildNumber`, `dwWindowWidth`). If present, results appear in a separate `"pattern_globals"` section in the JSON.
-
-## Signature Generation
-
-`generate-signatures.py` converts vtable function bytes into masked pattern signatures suitable for runtime pattern scanning. Signatures survive game patches where RVAs shift but instruction sequences stay the same.
-
-### How It Works
-
-Each vtable function's first **128 bytes** are captured at dump time (SEH-protected for safety). The script then:
-
-1. **Detects trivial stubs** — `ret`, `xor eax,eax; ret`, `xorps; ret`, `mov al,0/1; ret`, `lea rax,[rip+x]; ret`, `int3` padding, etc. These are labeled `[STUB:type]` and excluded from uniqueness computation.
-
-2. **Deduplicates by RVA** — COMDAT folding causes many vtable entries across different classes to point to the same function address. Entries sharing an RVA are grouped, with `shared_with` annotations showing which classes share the same function body.
-
-3. **Masks relocatable bytes** that change between builds:
-   - `E8/E9 xx xx xx xx` — relative CALL/JMP targets
-   - `0F 8x xx xx xx xx` — conditional jumps (near)
-   - `FF 15/FF 25 xx xx xx xx` — indirect CALL/JMP via `[RIP+disp32]`
-   - RIP-relative addressing (`[RIP+disp32]`) — LEA, MOV, CMP, MOVSS, etc.
-
-4. **Finds the shortest unique prefix** for each function within its module. A function unique at 12 bytes doesn't need all 128 — signatures are trimmed to the minimum length that uniquely identifies them.
-
-5. **Computes per-class uniqueness** — functions that are unique within their class vtable (but not module-wide) are marked `[CLASS_UNIQUE]`. These are perfectly hookable since you typically know which vtable you're scanning.
-
-### Usage
-
-```bash
-# Generate signatures for all modules (58+ DLLs)
-python generate-signatures.py --json bin/schema-dump/_all-modules.json
-
-# Filter to a specific class
-python generate-signatures.py --json bin/schema-dump/_all-modules.json --class CCitadelInput
-
-# Filter to a specific module
-python generate-signatures.py --json bin/schema-dump/_all-modules.json --module client.dll
-
-# Require longer patterns (default: 6 bytes minimum)
-python generate-signatures.py --json bin/schema-dump/_all-modules.json --min-length 8
-```
-
-### Output
-
-| File | Format | Description |
-|------|--------|-------------|
-| `bin/schema-dump/signatures/<module>.txt` | Greppable text | `ClassName::idx_N  48 89 5C 24 ? ...` |
-| `bin/schema-dump/signatures/_all-signatures.json` | JSON | Structured with pattern, uniqueness, and length |
-
-Signatures are trimmed to the shortest unique prefix. Markers: `[STUB:type]` = trivial stub function, `[CLASS_UNIQUE]` = unique within class vtable (hookable), `[DUP]` = not uniquely signable anywhere. COMDAT-shared functions show `# shared: OtherClass::idx_N`.
-
-### Key Hookable Classes with Signatures
-
-| Class | Module | Functions | Unique | Notes |
-|-------|--------|-----------|--------|-------|
-| `CSource2Client` | client.dll | 202 | **197** | FrameStageNotify, LevelInit, etc. |
-| `CInputSystem` | inputsystem.dll | 107 | **97** | Input processing, key events |
-| `CNetworkSystem` | networksystem.dll | 55 | **48** | Network layer |
-| `CCitadelGameRules` | server.dll | 128 | **41** | Game rules |
-| `CSchemaSystem` | schemasystem.dll | 40 | **31** | Schema type scopes, class lookup |
-| `CGameEntitySystem` | server.dll | 24 | **20** | Entity add/remove |
-| `CPanoramaUIEngine` | panorama.dll | 18 | **15** | RunScript, panel management |
-| `ClientModeCitadelNormal` | client.dll | 40 | **10** | Client mode hooks |
-| `CCitadelInput` | client.dll | 30 | **5** | CreateMove (idx_5), input processing |
-
-### Example
-
-```
-# --- CSource2Client (202 functions, 197 unique) ---
-CSource2Client::idx_0  40 53 56 57 48 81
-CSource2Client::idx_14  48 89 5C 24 18 56 48 83 EC 70 8B
-
-# --- CPanoramaUIEngine (18 functions, 15 unique) ---
-CPanoramaUIEngine::idx_0  48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 48
-CPanoramaUIEngine::idx_11  40 53 48 83 EC 20 48 8B D9 E8
-
-# --- CSchemaSystem (40 functions, 31 unique) ---
-CSchemaSystem::idx_0  40 53 48 83 EC 20 48 8B D9 C6
-CSchemaSystem::idx_12  48 89 5C 24 10 55 56 57 48
-```
-
-Use in your pattern scanner:
-```cpp
-// Find CSource2Client vtable function by signature
-auto addr = pattern_scan(client_dll, "40 53 56 57 48 81");
-
-// Find CPanoramaUIEngine function in panorama.dll
-auto addr = pattern_scan(panorama_dll, "48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 48");
-```
-
-## Cherry-Pickable SDK Generation (`--sdk`)
-
-The `--sdk` flag generates a high-quality, cherry-pickable C++ SDK with v2-style types (`Vec3`, `QAngle`, `CHandle`), proper `namespace sdk {}` wrapping, and `static_assert` validation on every field. Each class gets its own `.hpp` file — include only what you need.
-
-```bash
-# Integrated (runs automatically after schema dump)
-dezlock-dump.exe --sdk
-dezlock-dump.exe --all    # includes --sdk
-
-# Standalone (from existing JSON export)
-python import-schema.py --game deadlock --json schema-dump/deadlock/_all-modules.json
-python import-schema.py --game cs2 --json schema-dump/cs2/_all-modules.json
-```
-
-### Output Structure
-
-```
-schema-dump/<game>/sdk/
-  types.hpp                    — Base types (Vec3, QAngle, CHandle, Color, ViewMatrix)
-  _all-offsets.hpp             — Master include for all offset constants
-  _all-enums.hpp               — Master include for all enums
-  _all-vtables.hpp             — VTable RVAs + function indices
-  client/
-    _offsets.hpp               — constexpr offset constants for client.dll
-    _enums.hpp                 — Scoped enum classes for client.dll
-    C_BaseEntity.hpp           — Padded struct with static_asserts
-    C_BasePlayerPawn.hpp
-    C_CitadelPlayerPawn.hpp
-    ...
-  server/
-    _offsets.hpp
-    _enums.hpp
-    CEntityInstance.hpp
-    ...
-```
-
-Cherry-pick a single class: `#include "sdk/client/C_BaseEntity.hpp"` — pulls just that class and its parent chain. No barrel files.
-
-### v2-Style Types
-
-Schema types are mapped to proper named structs instead of raw arrays:
-
-| Schema Type | SDK Type | Size |
-|-------------|----------|------|
-| `Vector` / `VectorWS` | `Vec3` | 12 |
-| `QAngle` | `QAngle` | 12 |
-| `Color` | `Color` | 4 |
-| `Vector2D` | `Vec2` | 8 |
-| `CHandle<T>` | `CHandle` | 4 |
-| `CNetworkUtlVectorBase<CHandle<T>>` | `CHandleVector` | 24 |
-| `GameTime_t` | `float` | 4 |
-
-`types.hpp` includes operator overloads, helper methods (`CHandle::is_valid()`, `CHandle::index()`, `Vec3::length_sqr()`), and static_asserts.
-
-### Generated Struct Example
-
-```cpp
-#include "../types.hpp"
-#include "../server/CEntityInstance.hpp"
-
-namespace sdk {
-
-#pragma pack(push, 1)
-struct C_BaseEntity : CEntityInstance {
-    void* m_CBodyComponent;        // 0x38
-    uint8_t _pad0040[0x2F0];
-    void* m_pGameSceneNode;        // 0x338
-    int32_t m_iMaxHealth;          // 0x350
-    int32_t m_iHealth;             // 0x354
-    uint8_t m_lifeState;           // 0x35C
-    CHandle m_hOwnerEntity;        // 0x528
-    Vec3 m_vecAbsVelocity;         // 0x404
-    // ...
-
-    // --- Helper methods (from sdk-cherry-pick.json) ---
-    bool is_alive() const { return m_lifeState == 0 && m_iHealth > 0; }
-    int team() const { return static_cast<int>(m_iTeamNum); }
-};
-#pragma pack(pop)
-
-static_assert(sizeof(C_BaseEntity) == 0x608, "C_BaseEntity size");
-static_assert(offsetof(C_BaseEntity, m_iHealth) == 0x354, "m_iHealth");
-
-} // namespace sdk
-```
-
-### Cherry-Pick Helpers (`sdk-cherry-pick.json`)
-
-Classes listed in `sdk-cherry-pick.json` get inline helper methods injected into their struct. Classes NOT listed still get generated — just without helpers.
-
-```json
-{
-  "helpers": {
-    "C_BaseEntity": {
-      "methods": [
-        "bool is_alive() const { return m_lifeState == 0 && m_iHealth > 0; }",
-        "int team() const { return static_cast<int>(m_iTeamNum); }"
-      ]
-    }
-  }
-}
-```
-
-### Offset Constants
-
-Per-module offset files live inside each module's folder:
-
-```cpp
-// sdk/client/_offsets.hpp
-namespace sdk::offsets::client {
-namespace C_BaseEntity {
-    constexpr uint32_t m_iHealth = 0x354;
-    constexpr uint32_t m_iMaxHealth = 0x350;
-}
-}
-```
-
-### Type Resolution (~96%)
-
-| Category | Description | Example |
-|----------|-------------|---------|
-| primitive | Built-in types | `int32` → `int32_t` |
-| rich_type | Named math/handle types | `Vector` → `Vec3`, `CHandle<T>` → `CHandle` |
-| alias | Known Source 2 types (~100) | `GameTime_t` → `float` |
-| template | Container types (~25) | `CUtlVector<T>` → sized blob |
-| embedded | Nested schema classes | Sized blob |
-| handle | Entity handles | `CHandle<T>` → `CHandle` |
-| enum | Enum-typed fields | Resolved to sized integer |
-| pointer | Pointer types | `T*` → `void*` |
-| array | Fixed-size arrays | `Vector[2]` → `Vec3[2]` |
-| bitfield | Bit fields (size=0) | Emitted as comments |
-| unresolved | Remaining (~3%) | Sized blob fallback (sizes always correct) |
-
-## What Gets Captured
-
-| Data | Source | Example Count |
-|------|--------|---------------|
-| Classes | SchemaSystem CUtlTSHash | ~5,000 |
-| Fields | SchemaClassFieldData_t | ~21,000 |
-| Enums | SchemaEnumInfoData_t | ~24 |
-| RTTI classes | MSVC x64 TypeDescriptor (all DLLs) | ~23,000 |
-| Vtables | RTTI COL → .rdata scan (58 DLLs) | ~23,000 |
-| Global singletons | .data vtable cross-reference | ~10,000 (~30 with schema) |
-| Virtual functions | .text pointer entries | ~839,000 |
-| Function bytes | 128 bytes per function prologue | ~839,000 |
-| Hookable signatures | Module-unique + class-unique | ~359,000 (76%) |
-
-### Vtable Counts by Module (Top 20)
-
-| Module | Vtables | Functions | Unique Sigs |
-|--------|---------|-----------|-------------|
-| server.dll | 7,323 | 515,909 | 18,410 |
-| client.dll | 2,459 | 128,443 | 6,474 |
-| steamclient64.dll | 5,182 | 85,325 | 8,334 |
-| animationsystem.dll | 1,102 | 16,211 | 2,193 |
-| particles.dll | 793 | 16,496 | 1,908 |
-| v8.dll | 1,861 | 15,640 | 1,070 |
-| soundsystem.dll | 736 | 15,060 | 1,685 |
-| engine2.dll | 876 | 10,525 | 2,505 |
-| nvcuda64.dll | 91 | 5,231 | 275 |
-| vphysics2.dll | 179 | 3,297 | 1,449 |
-| scenesystem.dll | 175 | 3,257 | 1,209 |
-| steamnetworkingsockets.dll | 157 | 2,544 | 500 |
-| panorama.dll | 81 | 1,677 | 766 |
-| rendersystemdx11.dll | 73 | 1,703 | 399 |
-| tier0.dll | 84 | 951 | 331 |
-| inputsystem.dll | 2 | 137 | 118 |
-| networksystem.dll | 39 | 484 | 290 |
-| schemasystem.dll | 17 | 282 | 105 |
-| materialsystem2.dll | 40 | 462 | 274 |
-| panoramauiclient.dll | 9 | 218 | 45 |
-
-This includes **RTTI-only classes** that have no schema entry — things like `CCitadelInput`, `CPanoramaUIEngine`, `CInputSystem`, `CNetworkSystem`, `CSchemaSystem`. These are often the most important for hooking.
-
-## How It Works
-
-1. Finds target process (default: `deadlock.exe`, configurable via `--process`)
-2. Manual-maps `dezlock-worker.dll` into the target process (PE mapping, relocations, import resolution, SEH registration — no `LoadLibraryA` call)
-3. Worker auto-discovers all loaded modules with schema data via `EnumProcessModules`
-4. For each schema module, walks `SchemaSystem_001` — enumerates classes (CUtlTSHash at +0x0560) and enums (+0x0BE8)
-5. Reads field metadata, class metadata, and static fields from each class
-6. Walks RTTI (`_TypeDescriptor` + `_RTTICompleteObjectLocator`) in schema modules
-7. **Full DLL scan**: enumerates ALL loaded DLLs and RTTI-scans any not already covered (catches panorama.dll, tier0.dll, inputsystem.dll, networksystem.dll, schemasystem.dll, etc. — skips Windows system DLLs)
-8. **Pass 4 — Vtable discovery**: scans `.rdata` for pointers to COL structures (vtable[-1]), reads consecutive `.text`-pointing entries as virtual function addresses
-9. **Function bytes**: reads 128 bytes from each function's prologue (SEH-protected) for signature generation
-10. **Pass 5 — Global discovery**: scans writable `.data` sections of every module, cross-references 8-byte values against the vtable catalog (direct match = static object, indirect dereference = pointer to heap singleton), tags results with `has_schema`
-11. **Optional**: supplementary pattern scan from `patterns.json` for untyped globals (dwViewMatrix, etc.)
-12. Exports JSON to `%TEMP%`, signals completion via marker file
-13. Main exe reads JSON and generates consolidated `<module>.txt` (classes + flattened + enums), `_globals.txt` (all globals + recursive field trees), `_access-paths.txt` (schema globals only), and `_entity-paths.txt` (every entity class with full field trees)
-14. **Optional**: `--signatures` invokes `generate-signatures.py` to produce pattern signatures
-15. **Optional**: `--sdk` invokes `import-schema.py` to generate cherry-pickable C++ SDK with v2-quality types
-16. Worker auto-unloads via `FreeLibraryAndExitThread`
-
-### Vtable Discovery Detail
-
-```
-For each CompleteObjectLocator found via RTTI:
-  → Compute absolute address of COL in memory
-  → Build hashset of all COL addresses
-
-Single linear scan of .rdata section:
-  → Check each 8-byte value against COL hashset
-  → Match = vtable[-1], so vtable[0] starts at match + 8
-  → Read entries while they point into .text section (max 512)
-  → Store RVAs + first 128 bytes of each function
-```
-
-## Output Format
-
-### Module text (`client.txt`)
-
-One file per module with three sections — classes, flattened, and enums:
-
-```
-# ================================================================
-# CLASSES — own fields per class
-# ================================================================
-
-# --- C_BaseEntity (size=0x560, parent=CEntityInstance)
-#     chain: C_BaseEntity -> CEntityInstance -> CEntityComponent
-C_BaseEntity.m_iHealth = 0x354 (int32, 4) [MNetworkEnable] [MNetworkChangeCallback]
-C_BaseEntity.m_iMaxHealth = 0x350 (int32, 4) [MNetworkEnable]
-
-# ================================================================
-# FLATTENED — full memory layout (own + inherited fields)
-# ================================================================
-
-# === C_CitadelPlayerPawn (size=0x1800, 156 total fields) ===
-C_CitadelPlayerPawn.m_iHealth = 0x354 (int32, 4, C_BaseEntity)
-C_CitadelPlayerPawn.m_hPawn = 0x6BC (CHandle, 4, CBasePlayerController)
-
-# ================================================================
-# ENUMS — 4 enum definitions
-# ================================================================
-
-# --- EAbilitySlots_t (size=4 bytes, 23 values)
-EAbilitySlots_t::ESlot_Signature_1 = 0
-EAbilitySlots_t::ESlot_Signature_2 = 1
-```
-
-### Hierarchy tree (`hierarchy/_index.txt`)
-
-```
-CEntityComponent (0x8, 0 fields)
-`-- CEntityInstance (0x38, 4 fields)
-    `-- C_BaseEntity (0x560, 42 fields)
-        `-- C_BasePlayerPawn (0x1100, 18 fields)
-            `-- C_CitadelPlayerPawn (0x1800, 31 fields)
-```
-
-### JSON (`_all-modules.json`)
-
-```json
-{
-  "modules": [{
-    "name": "client.dll",
-    "vtables": [{
-      "class": "CCitadelInput",
-      "vtable_rva": "0x22A4A58",
-      "functions": [
-        {"index": 0, "rva": "0x508F10", "bytes": "48895C240857484883EC20488BD9E8..."},
-        {"index": 5, "rva": "0x15AF360", "bytes": "85D20F85..."}
-      ]
-    }]
-  }]
-}
-```
-
-The `bytes` field contains 128 hex-encoded bytes from each function's prologue — used by `generate-signatures.py` to produce masked pattern signatures.
-
-### Signature text (`signatures/client.txt`)
-
-```
-# --- CSource2Client (202 functions, 197 unique, 3 class-unique, 2 stubs) ---
-CSource2Client::idx_0  40 53 56 57 48 81
-CSource2Client::idx_14  48 89 5C 24 18 56 48 83 EC 70 8B
-CSource2Client::idx_42  33 C0 C3  [STUB:xor_eax_ret]
-
-# --- CCitadelInput (30 functions, 5 unique, 18 class-unique, 4 stubs) ---
-CCitadelInput::idx_4  E9 ? ? ? ? CC CC CC CC CC CC CC CC CC CC CC 40 55 53 57 48
-CCitadelInput::idx_17  40 55 53 57 48 8D 6C 24 B9 48 81 EC C0
-CCitadelInput::idx_5  48 83 EC 28 ...  [CLASS_UNIQUE]
-CCitadelInput::idx_8  48 89 5C 24 08 ...  [DUP]  # shared: CInput::idx_8
-```
-
-`?` = masked byte (relocation). `[STUB:type]` = trivial stub. `[CLASS_UNIQUE]` = unique within class. `[DUP]` = not uniquely signable. `# shared:` = COMDAT-folded. Signatures trimmed to shortest unique prefix.
-
-## Why Not source2gen?
-
-source2gen works great but requires building and injecting a separate loader, generates thousands of SDK header files you then have to parse, and doesn't give you vtables, RTTI inheritance, or global pointers. dezlock-dump gives you one JSON file with everything — schema + RTTI + vtables + globals + signatures — in ~2 seconds. Use whatever fits your workflow.
+- Target Source 2 game running with `client.dll` loaded
+- Run as **administrator**
+- Python 3 for `--signatures` and `--sdk`
 
 ## Contributing
 
-Contributions are welcome! Feel free to:
-
-- Open an [issue](../../issues) for bugs, feature requests, or offset discrepancies
-- Submit a [pull request](../../pulls) with improvements
+Open an [issue](../../issues) or submit a [pull request](../../pulls). Join the [Discord](https://discord.gg/sjcsVkE8ur) for questions and discussion.
 
 ---
 
-If you find this tool useful, consider giving it a star — it helps others discover it.
+If you find this tool useful, consider giving it a star.
