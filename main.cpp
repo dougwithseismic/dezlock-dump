@@ -1208,6 +1208,7 @@ int main(int argc, char* argv[]) {
     std::string output_dir;
     std::string target_process;  // empty = interactive selection
     int timeout_sec = 180;
+    int field_depth = 3;
     bool gen_signatures = false;
     bool gen_sdk = false;
     bool gen_all = false;
@@ -1219,6 +1220,10 @@ int main(int argc, char* argv[]) {
             target_process = argv[++i];
         } else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) {
             timeout_sec = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
+            field_depth = atoi(argv[++i]);
+            if (field_depth < 1) field_depth = 1;
+            if (field_depth > 32) field_depth = 32;
         } else if (strcmp(argv[i], "--headers") == 0) {
             // Legacy alias — now handled by --sdk
             gen_sdk = true;
@@ -1229,11 +1234,12 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--all") == 0) {
             gen_all = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--sdk] [--signatures] [--all]\n\n");
+            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--depth <N>] [--sdk] [--signatures] [--all]\n\n");
             con_print("  --process     Target process name (skips game selection menu)\n");
             con_print("                Examples: --process cs2.exe, --process dota2.exe\n");
             con_print("  --output      Output directory (default: schema-dump/<game>/ next to exe)\n");
             con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
+            con_print("  --depth       Field expansion depth for globals/entity trees (default: 3, max: 32)\n");
             con_print("  --sdk         Generate cherry-pickable C++ SDK (requires Python 3)\n");
             con_print("  --signatures  Generate byte pattern signatures (requires Python 3)\n");
             con_print("  --all         Enable all generators (sdk + signatures)\n");
@@ -1874,7 +1880,7 @@ int main(int argc, char* argv[]) {
 
                     // Expand field tree
                     if (cit != all_classes.end()) {
-                        TreeWriter tw{gfp, all_classes, 2};
+                        TreeWriter tw{gfp, all_classes, field_depth};
                         std::unordered_set<std::string> expanded;
                         expanded.insert(cls_name);
                         tw.write(cls_name, 0, expanded);
@@ -2189,7 +2195,7 @@ int main(int argc, char* argv[]) {
                         }
                     };
 
-                    TW tw{epfp, ent_lookup, 2};
+                    TW tw{epfp, ent_lookup, field_depth};
                     std::unordered_set<std::string> expanded;
                     expanded.insert(cls->name);
                     tw.write(cls->name, 0, expanded);

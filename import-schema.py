@@ -26,6 +26,8 @@ import json
 import os
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -262,6 +264,7 @@ CONTAINER_SIZES = {
 
 class ResolveStats:
     def __init__(self):
+        self._lock = threading.Lock()
         self.counts = {
             "primitive": 0,
             "alias": 0,
@@ -278,8 +281,9 @@ class ResolveStats:
         self.total = 0
 
     def record(self, category: str):
-        self.counts[category] = self.counts.get(category, 0) + 1
-        self.total += 1
+        with self._lock:
+            self.counts[category] = self.counts.get(category, 0) + 1
+            self.total += 1
 
     def print_summary(self):
         resolved = self.total - self.counts["unresolved"]
@@ -1183,6 +1187,72 @@ def generate_all_vtables(modules: list[dict], game: str, timestamp: str) -> str:
 
 
 # ============================================================================
+# Per-module worker (for parallel SDK generation)
+# ============================================================================
+
+def _process_sdk_module(mod, game, global_lookup, class_to_module, out_dir, timestamp):
+    """Process one module for SDK generation. Returns (mod_name, struct_count) or None."""
+    mod_name = mod["name"].replace(".dll", "")
+    classes = mod.get("classes", [])
+    enums = mod.get("enums", [])
+
+    useful_classes = [c for c in classes if c["size"] > 0 and c.get("fields")]
+    has_content = bool(useful_classes) or bool(enums)
+
+    if not has_content:
+        return None
+
+    mod_dir = out_dir / mod_name
+    mod_dir.mkdir(exist_ok=True)
+
+    subfolders_used = set(get_class_subfolder(c["name"]) for c in useful_classes)
+    subfolders_used.discard("")
+    for sub in subfolders_used:
+        (mod_dir / sub).mkdir(exist_ok=True)
+
+    if useful_classes:
+        offsets_content = generate_module_offsets(useful_classes, mod["name"], game, timestamp)
+        (mod_dir / "_offsets.hpp").write_text(offsets_content, encoding="utf-8")
+
+    if enums:
+        enums_content = generate_module_enums(enums, mod["name"], game, timestamp)
+        (mod_dir / "_enums.hpp").write_text(enums_content, encoding="utf-8")
+
+    mod_count = 0
+    entity_count = 0
+    struct_count = 0
+    for cls in sorted(useful_classes, key=lambda c: c["name"]):
+        header = generate_struct_header(
+            cls, mod["name"], global_lookup, class_to_module, timestamp
+        )
+        safe_name = safe_class_name(cls["name"])
+        sub = get_class_subfolder(cls["name"])
+        if sub:
+            filepath = mod_dir / sub / f"{safe_name}.hpp"
+            if sub == "entities":
+                entity_count += 1
+            else:
+                struct_count += 1
+        else:
+            filepath = mod_dir / f"{safe_name}.hpp"
+            struct_count += 1
+        filepath.write_text(header, encoding="utf-8")
+        mod_count += 1
+
+    parts = []
+    if entity_count:
+        parts.append(f"{entity_count} entities")
+    if struct_count:
+        parts.append(f"{struct_count} structs")
+    enum_count = len(enums) if enums else 0
+    if enum_count:
+        parts.append(f"{enum_count} enums")
+    print(f"  {mod['name']:30s}  {', '.join(parts)}")
+
+    return mod_name, mod_count
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -1327,80 +1397,29 @@ def main():
     types_path.write_text(types_content, encoding="utf-8")
     print(f"  types.hpp (Vec3, QAngle, CHandle, Color, ViewMatrix, CHandleVector)")
 
-    # 2. Generate per-module struct headers + offset/enum files
+    # 2. Generate per-module struct headers + offset/enum files (parallel)
     total_structs = 0
     module_names = []
 
-    for mod in modules:
-        mod_name = mod["name"].replace(".dll", "")
-        classes = mod.get("classes", [])
-        enums = mod.get("enums", [])
+    workers = min(os.cpu_count() or 4, max(len(modules), 1))
+    print(f"Processing {len(modules)} modules with {workers} threads...")
 
-        # Filter to classes that actually have fields worth generating
-        useful_classes = [c for c in classes if c["size"] > 0 and c.get("fields")]
-        has_content = bool(useful_classes) or bool(enums)
-
-        if not has_content:
-            continue
-
-        module_names.append(mod_name)
-
-        # Create module directory
-        mod_dir = out_dir / mod_name
-        mod_dir.mkdir(exist_ok=True)
-
-        # Create subdirectories if needed
-        subfolders_used = set(get_class_subfolder(c["name"]) for c in useful_classes)
-        subfolders_used.discard("")
-        for sub in subfolders_used:
-            (mod_dir / sub).mkdir(exist_ok=True)
-
-        # Per-module offset constants (only if classes have fields)
-        if useful_classes:
-            offsets_content = generate_module_offsets(useful_classes, mod["name"], args.game, timestamp)
-            offsets_path = mod_dir / "_offsets.hpp"
-            offsets_path.write_text(offsets_content, encoding="utf-8")
-
-        # Per-module enums
-        if enums:
-            enums_content = generate_module_enums(enums, mod["name"], args.game, timestamp)
-            enums_path = mod_dir / "_enums.hpp"
-            enums_path.write_text(enums_content, encoding="utf-8")
-
-        # Per-class struct headers — write to correct subfolder
-        mod_count = 0
-        entity_count = 0
-        struct_count = 0
-        for cls in sorted(useful_classes, key=lambda c: c["name"]):
-            header = generate_struct_header(
-                cls, mod["name"], global_lookup, class_to_module, timestamp
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _process_sdk_module, mod, args.game,
+                global_lookup, class_to_module, out_dir, timestamp
             )
-            safe_name = safe_class_name(cls["name"])
-            sub = get_class_subfolder(cls["name"])
-            if sub:
-                filepath = mod_dir / sub / f"{safe_name}.hpp"
-                if sub == "entities":
-                    entity_count += 1
-                else:
-                    struct_count += 1
-            else:
-                filepath = mod_dir / f"{safe_name}.hpp"
-                struct_count += 1
-            filepath.write_text(header, encoding="utf-8")
-            mod_count += 1
+            for mod in modules
+        ]
 
-        total_structs += mod_count
-
-        # Show breakdown
-        parts = []
-        if entity_count:
-            parts.append(f"{entity_count} entities")
-        if struct_count:
-            parts.append(f"{struct_count} structs")
-        enum_count = len(enums) if enums else 0
-        if enum_count:
-            parts.append(f"{enum_count} enums")
-        print(f"  {mod['name']:30s}  {', '.join(parts)}")
+        for future in as_completed(futures):
+            result = future.result()
+            if result is None:
+                continue
+            mod_name, mod_count = result
+            module_names.append(mod_name)
+            total_structs += mod_count
 
     # 3. Consolidated includes
     if module_names:

@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # =============================================================================
@@ -539,6 +540,58 @@ def write_json_output(all_modules: dict, output_dir: str):
         json.dump(output, f, indent=2)
 
 
+def _process_module_task(module, class_filter, min_length, output_dir):
+    """Process a single module's signatures in a worker thread."""
+    mod_name = module.get("name", "unknown")
+    vtables = module.get("vtables", [])
+    if not vtables:
+        return None
+
+    has_bytes = any(
+        func.get("bytes")
+        for vt in vtables
+        for func in vt.get("functions", [])
+    )
+    if not has_bytes:
+        print(f"  {mod_name}: no bytes data (run updated dezlock-dump first)")
+        return None
+
+    print(f"  Processing {mod_name}...")
+
+    class _Args:
+        pass
+    fake_args = _Args()
+    fake_args.class_filter = class_filter
+    fake_args.min_length = min_length
+
+    signatures = process_module(module, fake_args)
+    if not signatures:
+        print(f"    {mod_name}: no signatures generated")
+        return None
+
+    total, unique, class_unique, stubs, dup = write_text_output(
+        mod_name, signatures, output_dir
+    )
+
+    parts = [f"{unique} unique"]
+    if class_unique:
+        parts.append(f"{class_unique} class-unique")
+    if stubs:
+        parts.append(f"{stubs} stubs")
+    parts.append(f"{dup} dup")
+    print(f"    {mod_name}: {total} signatures ({', '.join(parts)})")
+
+    return {
+        "mod_name": mod_name,
+        "signatures": signatures,
+        "total": total,
+        "unique": unique,
+        "class_unique": class_unique,
+        "stubs": stubs,
+        "dup": dup,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate byte pattern signatures from dezlock-dump JSON"
@@ -585,50 +638,34 @@ def main():
     grand_stubs = 0
     grand_dup = 0
 
-    for module in modules:
-        mod_name = module.get("name", "unknown")
-        if args.module and mod_name != args.module:
-            continue
+    # Filter modules
+    work_modules = [
+        m for m in modules
+        if not args.module or m.get("name", "unknown") == args.module
+    ]
 
-        vtables = module.get("vtables", [])
-        if not vtables:
-            continue
+    workers = min(os.cpu_count() or 4, max(len(work_modules), 1))
+    print(f"Processing {len(work_modules)} modules with {workers} threads...")
 
-        # Check if any function has bytes data
-        has_bytes = any(
-            func.get("bytes")
-            for vt in vtables
-            for func in vt.get("functions", [])
-        )
-        if not has_bytes:
-            print(f"  {mod_name}: no bytes data (run updated dezlock-dump first)")
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _process_module_task, mod,
+                args.class_filter, args.min_length, args.output
+            )
+            for mod in work_modules
+        ]
 
-        print(f"  Processing {mod_name}...")
-        signatures = process_module(module, args)
-
-        if not signatures:
-            print(f"    No signatures generated")
-            continue
-
-        total, unique, class_unique, stubs, dup = write_text_output(
-            mod_name, signatures, args.output
-        )
-        all_module_sigs[mod_name] = signatures
-
-        grand_total += total
-        grand_unique += unique
-        grand_class_unique += class_unique
-        grand_stubs += stubs
-        grand_dup += dup
-
-        parts = [f"{unique} unique"]
-        if class_unique:
-            parts.append(f"{class_unique} class-unique")
-        if stubs:
-            parts.append(f"{stubs} stubs")
-        parts.append(f"{dup} dup")
-        print(f"    {total} signatures ({', '.join(parts)})")
+        for future in as_completed(futures):
+            result = future.result()
+            if result is None:
+                continue
+            all_module_sigs[result["mod_name"]] = result["signatures"]
+            grand_total += result["total"]
+            grand_unique += result["unique"]
+            grand_class_unique += result["class_unique"]
+            grand_stubs += result["stubs"]
+            grand_dup += result["dup"]
 
     if all_module_sigs:
         write_json_output(all_module_sigs, args.output)
