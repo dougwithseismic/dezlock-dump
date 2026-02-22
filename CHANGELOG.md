@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-02-22
+
+### Added
+- Interface scanner — enumerates `CreateInterface` registrations across all loaded modules, exports factory/instance/vtable RVAs
+- String reference scanner — finds `.rdata` strings with code xrefs, categorizes as convar, class_name, lifecycle, or debug
+- Vtable member offset analyzer — decodes x86-64 function prologues to infer `this`-pointer field offsets from member access patterns (no PDB needed)
+- RTTI-only SDK struct headers — generates `_rtti/` per-class `.hpp` files for 9,000+ classes that lack schema registration, using inferred field layouts with type inference and access flag annotations
+- `_rtti-layouts.hpp` master include for all RTTI layout headers
+- `--layouts` CLI flag and interactive menu option `[4]` for member layout analysis
+- Interfaces and string references sections in `_all-modules.json` export
+- Summary stats for interfaces, string refs, and member layouts in console output
+
+### Changed
+- `--all` now enables layouts in addition to sdk + signatures
+- Enriched JSON output writes via nlohmann serialization when layout analysis is active (instead of raw file copy)
+
 ## [1.4.0] - 2025-06-22
 
 ### Changed

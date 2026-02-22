@@ -15,6 +15,8 @@
 #include "src/rtti-hierarchy.hpp"
 #include "src/global-scanner.hpp"
 #include "src/pattern-scanner.hpp"
+#include "src/interface-scanner.hpp"
+#include "src/string-scanner.hpp"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -107,7 +109,9 @@ static bool write_field_json(FILE* fp, const schema::RuntimeField& f, bool first
 bool write_export(schema::SchemaManager& mgr, const char* path,
                   const globals::GlobalMap& discovered,
                   const pattern::ResultMap& pattern_globals,
-                  const pattern::PatternConfig& pattern_config) {
+                  const pattern::PatternConfig& pattern_config,
+                  const interfaces::InterfaceMap& iface_map,
+                  const strings::StringMap& string_map) {
     FILE* fp = fopen(path, "w");
     if (!fp) {
         LOG_E("Failed to open %s for writing", path);
@@ -404,6 +408,83 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
         }
     }
 
+    // ---- Interfaces section (CreateInterface registrations) ----
+    if (!iface_map.empty()) {
+        fprintf(fp, ",\n  \"interfaces\": {\n");
+        int mod_idx = 0;
+        for (const auto& [mod_name, entries] : iface_map) {
+            if (entries.empty()) continue;
+
+            if (mod_idx > 0) fprintf(fp, ",\n");
+            fprintf(fp, "    \"%s\": [\n", json_escape(mod_name.c_str()).c_str());
+            for (size_t i = 0; i < entries.size(); i++) {
+                const auto& e = entries[i];
+                if (i > 0) fprintf(fp, ",\n");
+                fprintf(fp, "      {\"name\": \"%s\", \"base_name\": \"%s\", \"version\": %d",
+                        json_escape(e.name.c_str()).c_str(),
+                        json_escape(e.base_name.c_str()).c_str(),
+                        e.version);
+                if (e.factory_rva)
+                    fprintf(fp, ", \"factory_rva\": \"0x%X\"", e.factory_rva);
+                if (e.instance_rva)
+                    fprintf(fp, ", \"instance_rva\": \"0x%X\"", e.instance_rva);
+                if (e.vtable_rva)
+                    fprintf(fp, ", \"vtable_rva\": \"0x%X\"", e.vtable_rva);
+                fprintf(fp, "}");
+            }
+            fprintf(fp, "\n    ]");
+            mod_idx++;
+        }
+        fprintf(fp, "\n  }");
+    }
+
+    // ---- String references section ----
+    if (!string_map.empty()) {
+        fprintf(fp, ",\n  \"string_refs\": {\n");
+        int mod_idx = 0;
+        for (const auto& [mod_name, mod_data] : string_map) {
+            if (mod_data.strings.empty()) continue;
+
+            if (mod_idx > 0) fprintf(fp, ",\n");
+            fprintf(fp, "    \"%s\": {\n", json_escape(mod_name.c_str()).c_str());
+
+            // Summary
+            fprintf(fp, "      \"summary\": {\"total_strings\": %d, \"total_xrefs\": %d, "
+                        "\"categories\": {\"convar\": %d, \"class_name\": %d, \"lifecycle\": %d, \"debug\": %d}},\n",
+                    mod_data.summary.total_strings, mod_data.summary.total_xrefs,
+                    mod_data.summary.convar, mod_data.summary.class_name,
+                    mod_data.summary.lifecycle, mod_data.summary.debug);
+
+            // Strings array
+            fprintf(fp, "      \"strings\": [\n");
+            for (size_t i = 0; i < mod_data.strings.size(); i++) {
+                const auto& s = mod_data.strings[i];
+                if (i > 0) fprintf(fp, ",\n");
+                fprintf(fp, "        {\"value\": \"%s\", \"rva\": \"0x%X\", \"category\": \"%s\"",
+                        json_escape(s.value.c_str()).c_str(), s.rva,
+                        json_escape(s.category.c_str()).c_str());
+                if (!s.associated_class.empty())
+                    fprintf(fp, ", \"associated_class\": \"%s\"",
+                            json_escape(s.associated_class.c_str()).c_str());
+                if (!s.xrefs.empty()) {
+                    fprintf(fp, ", \"xrefs\": [");
+                    for (size_t x = 0; x < s.xrefs.size(); x++) {
+                        if (x > 0) fprintf(fp, ", ");
+                        fprintf(fp, "{\"code_rva\": \"0x%X\", \"func_rva\": \"0x%X\", \"type\": \"%s\"}",
+                                s.xrefs[x].code_rva, s.xrefs[x].func_rva,
+                                s.xrefs[x].type.c_str());
+                    }
+                    fprintf(fp, "]");
+                }
+                fprintf(fp, "}");
+            }
+            fprintf(fp, "\n      ]\n");
+            fprintf(fp, "    }");
+            mod_idx++;
+        }
+        fprintf(fp, "\n  }");
+    }
+
     fprintf(fp, "\n}\n");
     fclose(fp);
 
@@ -601,9 +682,36 @@ void worker_thread(HMODULE hModule) {
             }
         }
 
+        // ---- Enumerate CreateInterface registrations ----
+        LOG_I("Scanning CreateInterface registrations...");
+        interfaces::InterfaceMap iface_map = interfaces::scan();
+        {
+            int total = 0;
+            for (const auto& [mod, entries] : iface_map) total += (int)entries.size();
+            LOG_I("Discovered %d interfaces across %d modules", total, (int)iface_map.size());
+        }
+
+        // ---- Scan for string references + code xrefs ----
+        LOG_I("Scanning string references...");
+        std::unordered_set<std::string> rtti_class_names;
+        for (const auto& [name, info] : mgr.rtti_map()) {
+            rtti_class_names.insert(name);
+        }
+        strings::StringMap string_map = strings::scan(rtti_class_names);
+        {
+            int total_str = 0, total_xref = 0;
+            for (const auto& [mod, data] : string_map) {
+                total_str += data.summary.total_strings;
+                total_xref += data.summary.total_xrefs;
+            }
+            LOG_I("Found %d strings with %d xrefs across %d modules",
+                  total_str, total_xref, (int)string_map.size());
+        }
+
         // Export to JSON (all modules)
         LOG_I("Writing JSON export...");
-        write_export(mgr, json_path, discovered, pattern_globals, pattern_config);
+        write_export(mgr, json_path, discovered, pattern_globals, pattern_config,
+                     iface_map, string_map);
     }
 
 done:

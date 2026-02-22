@@ -1707,6 +1707,428 @@ static ModuleResult process_sdk_module(const ModuleData& mod,
 }
 
 // ============================================================================
+// RTTI layout generation — struct headers from inferred member access patterns
+// ============================================================================
+
+// Infer C++ type from field size and access flags
+static std::string infer_type_name(int size, const std::vector<std::string>& access_flags) {
+    bool is_float = false;
+    bool is_ref = false;
+    for (const auto& flag : access_flags) {
+        if (flag == "float") is_float = true;
+        if (flag == "ref") is_ref = true;
+    }
+
+    switch (size) {
+        case 1:  return "uint8_t";
+        case 2:  return "uint16_t";
+        case 4:  return is_float ? "float" : "uint32_t";
+        case 8:  return is_ref ? "void*" : "uint64_t";
+        case 16: return is_float ? "float[4]" : "uint8_t[16]";
+        default: {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "uint8_t[%d]", size);
+            return buf;
+        }
+    }
+}
+
+// Build access flags comment string like "[read, write, float]"
+static std::string format_access_flags(const std::vector<std::string>& access_flags) {
+    if (access_flags.empty()) return "";
+    std::string s = "[";
+    for (size_t i = 0; i < access_flags.size(); i++) {
+        if (i > 0) s += ", ";
+        s += access_flags[i];
+    }
+    s += "]";
+    return s;
+}
+
+// Generate a single RTTI class .hpp content string
+static std::string generate_rtti_struct_header(
+    const std::string& class_name,
+    const std::string& module_name,
+    const json& fields_json,
+    int vtable_size,
+    int analyzed_count,
+    const std::string& parent_name,
+    const std::string& timestamp)
+{
+    std::string safe_name = sanitize_cpp_identifier(class_name);
+    if (safe_name.empty()) safe_name = class_name;
+
+    std::string guard = "SDK_RTTI_" + safe_name + "_HPP";
+    for (char& c : guard) {
+        c = (char)std::toupper(static_cast<unsigned char>(c));
+    }
+
+    std::vector<std::string> lines;
+    lines.push_back("// Auto-generated from RTTI vtable analysis \xe2\x80\x94 DO NOT EDIT");
+    lines.push_back("// Class: " + class_name);
+    lines.push_back("// Module: " + module_name);
+
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "// Vtable functions: %d total, %d analyzed",
+                 vtable_size, analyzed_count);
+        lines.push_back(buf);
+    }
+
+    lines.push_back("// Fields are inferred from member access patterns (no PDB)");
+
+    if (!parent_name.empty()) {
+        lines.push_back("// Parent: " + parent_name);
+    }
+
+    lines.push_back("// Generated: " + timestamp);
+    lines.push_back("#pragma once");
+    lines.push_back("#ifndef " + guard);
+    lines.push_back("#define " + guard);
+    lines.push_back("");
+    lines.push_back("#include <cstdint>");
+    lines.push_back("#include <cstddef>");
+    lines.push_back("");
+    lines.push_back("namespace sdk::rtti {");
+    lines.push_back("");
+    lines.push_back("#pragma pack(push, 1)");
+
+    std::string struct_line = "struct " + safe_name + " {";
+    if (!parent_name.empty()) {
+        struct_line = "struct " + safe_name + " {    // parent: " + parent_name;
+    }
+    lines.push_back(struct_line);
+
+    // vtable pointer at offset 0
+    lines.push_back("    void* vtable;                               // 0x0000 (8 bytes)");
+
+    int cursor = 8; // after vtable pointer
+
+    // Sort fields by offset
+    struct FieldEntry {
+        uint32_t offset;
+        int size;
+        std::vector<std::string> access;
+        std::vector<int> funcs;
+    };
+    std::vector<FieldEntry> fields;
+
+    for (const auto& fobj : fields_json) {
+        FieldEntry fe;
+        fe.offset = fobj.value("offset", 0u);
+        fe.size = fobj.value("size", 0);
+
+        if (fobj.contains("access") && fobj["access"].is_array()) {
+            for (const auto& a : fobj["access"]) {
+                if (a.is_string()) fe.access.push_back(a.get<std::string>());
+            }
+        }
+        if (fobj.contains("funcs") && fobj["funcs"].is_array()) {
+            for (const auto& f : fobj["funcs"]) {
+                if (f.is_number_integer()) fe.funcs.push_back(f.get<int>());
+            }
+        }
+
+        // Skip offset 0 — that's the vtable pointer we already emitted
+        if (fe.offset == 0) continue;
+        // Skip fields with invalid size
+        if (fe.size <= 0) continue;
+
+        fields.push_back(std::move(fe));
+    }
+
+    std::sort(fields.begin(), fields.end(),
+              [](const FieldEntry& a, const FieldEntry& b) { return a.offset < b.offset; });
+
+    for (const auto& fe : fields) {
+        int offset = static_cast<int>(fe.offset);
+
+        // Emit padding if needed
+        if (offset > cursor) {
+            int gap = offset - cursor;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "    uint8_t _pad%s[0x%s];",
+                     hex04(cursor).c_str(), hex_upper(gap).c_str());
+            lines.push_back(buf);
+        }
+
+        // Determine type
+        std::string cpp_type = infer_type_name(fe.size, fe.access);
+
+        // Build access comment
+        std::string access_str = format_access_flags(fe.access);
+
+        // Build func indices comment
+        std::string funcs_str;
+        if (!fe.funcs.empty()) {
+            funcs_str = " funcs: ";
+            for (size_t i = 0; i < fe.funcs.size(); i++) {
+                if (i > 0) funcs_str += ", ";
+                funcs_str += std::to_string(fe.funcs[i]);
+            }
+        }
+
+        // Format the field line
+        char offset_hex[16];
+        snprintf(offset_hex, sizeof(offset_hex), "0x%04X", offset);
+
+        char size_comment[64];
+        snprintf(size_comment, sizeof(size_comment), "(%d bytes)", fe.size);
+
+        // Check if type has array brackets
+        size_t bracket = cpp_type.find('[');
+        std::string field_name;
+        {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "field_0x%04X", offset);
+            field_name = buf;
+        }
+
+        std::string decl;
+        if (bracket != std::string::npos) {
+            std::string base = cpp_type.substr(0, bracket);
+            std::string arr = cpp_type.substr(bracket);
+            decl = "    " + base + " " + field_name + arr + ";";
+        } else {
+            decl = "    " + cpp_type + " " + field_name + ";";
+        }
+
+        // Pad declaration to align comments
+        while (decl.size() < 48) decl += ' ';
+
+        std::string comment = "// " + std::string(offset_hex) + " " + size_comment;
+        if (!access_str.empty()) comment += " " + access_str;
+        if (!funcs_str.empty()) comment += funcs_str;
+
+        lines.push_back(decl + comment);
+
+        cursor = offset + fe.size;
+    }
+
+    lines.push_back("};");
+    lines.push_back("#pragma pack(pop)");
+    lines.push_back("");
+    lines.push_back("} // namespace sdk::rtti");
+    lines.push_back("");
+    lines.push_back("#endif // " + guard);
+    lines.push_back("");
+
+    std::string result;
+    for (const auto& l : lines) { result += l; result += '\n'; }
+    return result;
+}
+
+// Process all RTTI classes in one module, write .hpp files to _rtti/ subdir
+static int generate_rtti_module(
+    const std::string& module_name,
+    const json& layouts_json,
+    const json& vtables_json,
+    const std::unordered_set<std::string>& schema_classes,
+    const std::string& output_dir,
+    const std::string& timestamp)
+{
+    if (!layouts_json.is_object() || layouts_json.empty()) return 0;
+
+    std::string mod_clean = strip_dll(module_name);
+
+    // Build vtable info lookup: class_name -> {parent, vtable_rva}
+    struct VtableInfo {
+        std::string parent;
+        std::string vtable_rva;
+    };
+    std::unordered_map<std::string, VtableInfo> vtable_lookup;
+
+    if (vtables_json.is_array()) {
+        for (const auto& vt : vtables_json) {
+            if (!vt.contains("class") || !vt["class"].is_string()) continue;
+            VtableInfo vi;
+            vi.parent = vt.value("parent", "");
+            if (vt.contains("vtable_rva")) {
+                if (vt["vtable_rva"].is_string())
+                    vi.vtable_rva = vt["vtable_rva"].get<std::string>();
+                else
+                    vi.vtable_rva = std::to_string(vt["vtable_rva"].get<uint64_t>());
+            }
+            vtable_lookup[vt["class"].get<std::string>()] = std::move(vi);
+        }
+    }
+
+    // Create _rtti directory
+    std::string rtti_dir = output_dir + "\\" + mod_clean + "\\_rtti";
+    create_dirs(rtti_dir);
+
+    int count = 0;
+
+    // Sort class names for deterministic output
+    std::vector<std::string> class_names;
+    for (auto it = layouts_json.begin(); it != layouts_json.end(); ++it) {
+        class_names.push_back(it.key());
+    }
+    std::sort(class_names.begin(), class_names.end());
+
+    for (const auto& class_name : class_names) {
+        // Skip classes that already have schema headers
+        if (schema_classes.count(class_name)) continue;
+
+        const auto& cls_data = layouts_json[class_name];
+        if (!cls_data.contains("fields") || !cls_data["fields"].is_array()) continue;
+        if (cls_data["fields"].empty()) continue;
+
+        // Get vtable metadata
+        int vtable_size = cls_data.value("vtable_size", 0);
+        int analyzed = cls_data.value("analyzed", 0);
+
+        // Get parent from RTTI data
+        std::string parent_name;
+        auto vit = vtable_lookup.find(class_name);
+        if (vit != vtable_lookup.end()) {
+            parent_name = vit->second.parent;
+        }
+
+        // Sanitize class name for file
+        std::string safe_name = sanitize_cpp_identifier(class_name);
+        if (safe_name.empty()) continue;
+
+        std::string header = generate_rtti_struct_header(
+            class_name, module_name, cls_data["fields"],
+            vtable_size, analyzed, parent_name, timestamp);
+
+        write_file(rtti_dir + "\\" + safe_name + ".hpp", header);
+        count++;
+    }
+
+    return count;
+}
+
+// Generate _rtti-layouts.hpp master include
+static std::string generate_rtti_master_include(
+    const std::vector<std::pair<std::string, std::vector<std::string>>>& module_classes,
+    const std::string& game,
+    const std::string& timestamp)
+{
+    std::string guard = make_guard(game + "_rtti_layouts");
+
+    std::vector<std::string> lines;
+    lines.push_back("// Auto-generated from RTTI vtable analysis \xe2\x80\x94 DO NOT EDIT");
+    lines.push_back("// Master include for all RTTI-inferred struct layouts");
+    lines.push_back("// Generated: " + timestamp);
+    lines.push_back("#pragma once");
+    lines.push_back("#ifndef " + guard);
+    lines.push_back("#define " + guard);
+    lines.push_back("");
+
+    int total = 0;
+    for (const auto& [mod_name, class_names] : module_classes) {
+        if (class_names.empty()) continue;
+        lines.push_back("// " + mod_name + " (" + std::to_string(class_names.size()) + " classes)");
+        for (const auto& cls : class_names) {
+            lines.push_back("#include \"" + mod_name + "/_rtti/" + cls + ".hpp\"");
+            total++;
+        }
+        lines.push_back("");
+    }
+
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "// Total: %d RTTI layout headers", total);
+        lines.push_back(buf);
+    }
+
+    lines.push_back("");
+    lines.push_back("#endif // " + guard);
+    lines.push_back("");
+
+    std::string result;
+    for (const auto& l : lines) { result += l; result += '\n'; }
+    return result;
+}
+
+// Top-level RTTI layout generation entry point
+static int generate_rtti_layouts(
+    const json& data,
+    const std::string& output_dir,
+    const std::string& game_name,
+    const std::string& timestamp,
+    const std::unordered_set<std::string>& schema_classes)
+{
+    if (!data.contains("member_layouts") || !data["member_layouts"].is_object())
+        return 0;
+
+    const auto& member_layouts = data["member_layouts"];
+
+    // Build a lookup from module name -> vtables array
+    std::unordered_map<std::string, const json*> module_vtables;
+    if (data.contains("modules") && data["modules"].is_array()) {
+        for (const auto& mod : data["modules"]) {
+            if (mod.contains("name") && mod["name"].is_string() &&
+                mod.contains("vtables") && mod["vtables"].is_array()) {
+                module_vtables[mod["name"].get<std::string>()] = &mod["vtables"];
+            }
+        }
+    }
+
+    int total_count = 0;
+    // Track generated classes per module for master include
+    std::vector<std::pair<std::string, std::vector<std::string>>> module_classes;
+
+    // Sort module names
+    std::vector<std::string> mod_names;
+    for (auto it = member_layouts.begin(); it != member_layouts.end(); ++it) {
+        mod_names.push_back(it.key());
+    }
+    std::sort(mod_names.begin(), mod_names.end());
+
+    for (const auto& mod_name : mod_names) {
+        const json* vtables_ptr = nullptr;
+        auto vit = module_vtables.find(mod_name);
+        if (vit != module_vtables.end()) vtables_ptr = vit->second;
+
+        json empty_arr = json::array();
+        const json& vtables_ref = vtables_ptr ? *vtables_ptr : empty_arr;
+
+        int mod_count = generate_rtti_module(
+            mod_name, member_layouts[mod_name], vtables_ref,
+            schema_classes, output_dir, timestamp);
+
+        if (mod_count > 0) {
+            // Collect generated class names for master include
+            std::string mod_clean = strip_dll(mod_name);
+            std::vector<std::string> class_names;
+            const auto& layouts = member_layouts[mod_name];
+
+            std::vector<std::string> sorted_names;
+            for (auto it = layouts.begin(); it != layouts.end(); ++it) {
+                sorted_names.push_back(it.key());
+            }
+            std::sort(sorted_names.begin(), sorted_names.end());
+
+            for (const auto& cls_name : sorted_names) {
+                if (schema_classes.count(cls_name)) continue;
+                std::string safe = sanitize_cpp_identifier(cls_name);
+                if (safe.empty()) continue;
+                const auto& cls_data = layouts[cls_name];
+                if (!cls_data.contains("fields") || !cls_data["fields"].is_array() ||
+                    cls_data["fields"].empty()) continue;
+                class_names.push_back(safe);
+            }
+
+            module_classes.push_back({mod_clean, std::move(class_names)});
+            total_count += mod_count;
+
+            printf("  %-30s  %d RTTI layouts\n", mod_name.c_str(), mod_count);
+        }
+    }
+
+    // Generate master include
+    if (total_count > 0) {
+        std::string master = generate_rtti_master_include(module_classes, game_name, timestamp);
+        write_file(output_dir + "\\_rtti-layouts.hpp", master);
+    }
+
+    return total_count;
+}
+
+// ============================================================================
 // generate_sdk -- Main entry point
 // ============================================================================
 
@@ -1936,6 +2358,22 @@ SdkStats generate_sdk(const json& data,
         }
     }
 
+    // 7. RTTI layout headers
+    int rtti_count = 0;
+    if (data.contains("member_layouts")) {
+        // Build set of schema class names to skip
+        std::unordered_set<std::string> schema_classes;
+        for (const auto& mod : modules) {
+            for (const auto& cls : mod.classes) {
+                if (cls.size > 0 && !cls.fields.empty())
+                    schema_classes.insert(cls.name);
+            }
+        }
+        printf("\nGenerating RTTI layout headers...\n");
+        rtti_count = generate_rtti_layouts(data, output_dir, game_name, timestamp, schema_classes);
+    }
+    sdk_stats.rtti_layouts = rtti_count;
+
     printf("\n  _all-offsets.hpp: includes %d modules\n", (int)module_names.size());
     printf("  _all-enums.hpp: includes %d modules\n", (int)module_names.size());
     printf("  _all-vtables.hpp: %d vtables, %d functions\n", vtable_count, vtable_func_count);
@@ -1945,11 +2383,16 @@ SdkStats generate_sdk(const json& data,
     if (patterns_count > 0) {
         printf("  _patterns.hpp: %d scannable patterns\n", patterns_count);
     }
+    if (rtti_count > 0) {
+        printf("  _rtti-layouts.hpp: %d RTTI struct headers\n", rtti_count);
+    }
 
     // Print type resolution statistics
     resolve_stats.print_summary();
 
-    printf("\nDone! %d struct headers generated.\n", total_structs);
+    printf("\nDone! %d struct headers generated", total_structs);
+    if (rtti_count > 0) printf(" + %d RTTI layouts", rtti_count);
+    printf(".\n");
     printf("Output: %s\n", output_dir.c_str());
 
     // Populate return stats

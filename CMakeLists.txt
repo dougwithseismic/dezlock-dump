@@ -23,6 +23,8 @@ add_library(dezlock-worker SHARED
     src/log.cpp
     src/global-scanner.cpp
     src/pattern-scanner.cpp
+    src/interface-scanner.cpp
+    src/string-scanner.cpp
 )
 target_include_directories(dezlock-worker PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(dezlock-worker PRIVATE user32 psapi)
@@ -35,6 +37,7 @@ add_executable(dezlock-dump
     main.cpp
     src/generate-signatures.cpp
     src/import-schema.cpp
+    src/analyze-members.cpp
 )
 target_include_directories(dezlock-dump PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(dezlock-dump PRIVATE user32 advapi32)

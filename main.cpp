@@ -31,6 +31,7 @@
 #include "vendor/json.hpp"
 #include "src/generate-signatures.hpp"
 #include "src/import-schema.hpp"
+#include "src/analyze-members.hpp"
 using json = nlohmann::json;
 
 // ============================================================================
@@ -1133,6 +1134,7 @@ int main(int argc, char* argv[]) {
     int field_depth = 3;
     bool gen_signatures = false;
     bool gen_sdk = false;
+    bool gen_layouts = false;
     bool gen_all = false;
 
     for (int i = 1; i < argc; i++) {
@@ -1153,10 +1155,12 @@ int main(int argc, char* argv[]) {
             gen_signatures = true;
         } else if (strcmp(argv[i], "--sdk") == 0) {
             gen_sdk = true;
+        } else if (strcmp(argv[i], "--layouts") == 0) {
+            gen_layouts = true;
         } else if (strcmp(argv[i], "--all") == 0) {
             gen_all = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--depth <N>] [--sdk] [--signatures] [--all]\n\n");
+            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--depth <N>] [--sdk] [--signatures] [--layouts] [--all]\n\n");
             con_print("  --process     Target process name (skips game selection menu)\n");
             con_print("                Examples: --process cs2.exe, --process dota2.exe\n");
             con_print("  --output      Output directory (default: schema-dump/<game>/ next to exe)\n");
@@ -1164,7 +1168,8 @@ int main(int argc, char* argv[]) {
             con_print("  --depth       Field expansion depth for globals/entity trees (default: 3, max: 32)\n");
             con_print("  --sdk         Generate cherry-pickable C++ SDK headers\n");
             con_print("  --signatures  Generate byte pattern signatures\n");
-            con_print("  --all         Enable all generators (sdk + signatures)\n");
+            con_print("  --layouts     Analyze vtable functions for member field offsets\n");
+            con_print("  --all         Enable all generators (sdk + signatures + layouts)\n");
             wait_for_keypress();
             return 0;
         }
@@ -1309,6 +1314,7 @@ int main(int argc, char* argv[]) {
     if (gen_all) {
         gen_signatures = true;
         gen_sdk = true;
+        gen_layouts = true;
     }
 
     // Game name (lowercase) for --sdk and folder naming
@@ -1490,7 +1496,7 @@ int main(int argc, char* argv[]) {
     con_ok("Schema extracted (%.1fs)", waited / 10.0f);
 
     // ---- Interactive output selection (when no CLI flags were passed) ----
-    if (!gen_signatures && !gen_sdk) {
+    if (!gen_signatures && !gen_sdk && !gen_layouts) {
         con_print("\n");
         con_print("  Select outputs to generate:\n\n");
 
@@ -1515,9 +1521,14 @@ int main(int argc, char* argv[]) {
         con_color(CLR_TITLE);
         con_print("    [4] ");
         con_color(CLR_DEFAULT);
+        con_print("Class layouts (inferred member offsets)\n");
+
+        con_color(CLR_TITLE);
+        con_print("    [5] ");
+        con_color(CLR_DEFAULT);
         con_print("All of the above\n");
 
-        con_print("\n  Enter choices (e.g. 2 3), or press Enter for schema only: ");
+        con_print("\n  Enter choices (e.g. 2 3 4), or press Enter for schema only: ");
 
         HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
         char input_buf[256] = {};
@@ -1525,9 +1536,10 @@ int main(int argc, char* argv[]) {
         ReadConsoleA(hInput, input_buf, sizeof(input_buf) - 1, &chars_read, nullptr);
 
         for (DWORD ci = 0; ci < chars_read; ci++) {
-            if (input_buf[ci] == '4') { gen_sdk = true; gen_signatures = true; }
+            if (input_buf[ci] == '5') { gen_sdk = true; gen_signatures = true; gen_layouts = true; }
             if (input_buf[ci] == '2') { gen_sdk = true; }
             if (input_buf[ci] == '3') { gen_signatures = true; }
+            if (input_buf[ci] == '4') { gen_layouts = true; }
         }
 
         con_print("\n");
@@ -1601,8 +1613,31 @@ int main(int argc, char* argv[]) {
                (int)mod.classes.size(), (int)mod.enums.size());
     }
 
-    std::string json_out = output_dir + "\\_all-modules.json";
-    CopyFileA(json_path, json_out.c_str(), FALSE);
+    // ---- Member layout analysis (optional, runs before JSON write) ----
+    MemberAnalysisStats layout_stats = {};
+    if (gen_layouts) {
+        con_print("\n");
+        con_step("LAY", "Analyzing vtable functions for member offsets...");
+        layout_stats = analyze_members(data);
+        con_ok("Layouts: %d classes, %d inferred fields", layout_stats.classes_analyzed, layout_stats.total_fields);
+    }
+
+    // Write enriched JSON (includes interfaces + string_refs from worker, member_layouts from analyzer)
+    {
+        std::string json_out = output_dir + "\\_all-modules.json";
+        if (gen_layouts && data.contains("member_layouts")) {
+            // Write enriched data via nlohmann serialization
+            FILE* jfp = fopen(json_out.c_str(), "wb");
+            if (jfp) {
+                std::string dumped = data.dump();
+                fwrite(dumped.data(), 1, dumped.size(), jfp);
+                fclose(jfp);
+            }
+        } else {
+            // No post-processing enrichment — fast file copy
+            CopyFileA(json_path, json_out.c_str(), FALSE);
+        }
+    }
 
     // ---- Globals text output (with recursive field expansion) ----
     if (data.contains("globals")) {
@@ -2186,6 +2221,30 @@ int main(int argc, char* argv[]) {
         if (pat_count > 0)
             con_print("  %-20s %d (from patterns.json)\n", "Pattern globals:", pat_count);
     }
+    if (data.contains("interfaces")) {
+        int iface_total = 0;
+        for (const auto& [mod_name, mod_ifaces] : data["interfaces"].items()) {
+            if (mod_ifaces.is_array())
+                iface_total += (int)mod_ifaces.size();
+        }
+        if (iface_total > 0)
+            con_print("  %-20s %d\n", "Interfaces:", iface_total);
+    }
+    if (data.contains("string_refs")) {
+        int str_total = 0, xref_total = 0;
+        for (const auto& [mod_name, mod_strs] : data["string_refs"].items()) {
+            if (mod_strs.contains("summary") && mod_strs["summary"].is_object()) {
+                str_total += mod_strs["summary"].value("total_strings", 0);
+                xref_total += mod_strs["summary"].value("total_xrefs", 0);
+            }
+        }
+        if (str_total > 0)
+            con_print("  %-20s %d strings, %d xrefs\n", "String refs:", str_total, xref_total);
+    }
+    if (layout_stats.classes_analyzed > 0) {
+        con_print("  %-20s %d classes, %d inferred fields\n",
+                  "Member layouts:", layout_stats.classes_analyzed, layout_stats.total_fields);
+    }
     if (sig_stats.total > 0) {
         con_print("  %-20s %d (%d unique, %d class-unique, %d stubs)\n",
                   "Signatures:", sig_stats.total, sig_stats.unique,
@@ -2196,6 +2255,8 @@ int main(int argc, char* argv[]) {
                   "SDK:", sdk_stats.structs, sdk_stats.enums, sdk_stats.vtables);
         if (sdk_stats.globals > 0)
             con_print("  %-20s %d globals, %d patterns\n", "", sdk_stats.globals, sdk_stats.patterns);
+        if (sdk_stats.rtti_layouts > 0)
+            con_print("  %-20s %d RTTI layout headers\n", "", sdk_stats.rtti_layouts);
         if (sdk_stats.total_fields > 0)
             con_print("  %-20s %d/%d fields resolved\n", "Type resolution:",
                       sdk_stats.resolved, sdk_stats.total_fields);

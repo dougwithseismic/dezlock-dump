@@ -65,6 +65,7 @@ struct SdkStats {
     int resolved = 0;
     int unresolved = 0;
     int total_fields = 0;
+    int rtti_layouts = 0;  // number of RTTI-only struct headers generated
 };
 
 SdkStats generate_sdk(const nlohmann::json& data,

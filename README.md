@@ -10,7 +10,7 @@ Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2)
 
 ## What's New
 
-**v1.4.0** — Signature and SDK generation ported to C++ — zero external dependencies, no Python required. Single exe does everything.
+**v1.5.0** — Interface scanner, string reference scanner, vtable member offset analyzer, and RTTI-only SDK struct headers for 9,000+ non-schema classes.
 
 See the full [Changelog](CHANGELOG.md) for all releases.
 
@@ -49,7 +49,8 @@ Output lands in `schema-dump/<game>/` next to the exe.
 | `--output <dir>` | `schema-dump/<game>/` | Output directory |
 | `--signatures` | off | Generate byte pattern signatures |
 | `--sdk` | off | Generate cherry-pickable C++ SDK headers |
-| `--all` | off | Enable all generators |
+| `--layouts` | off | Analyze vtable functions for inferred member field offsets |
+| `--all` | off | Enable all generators (sdk + signatures + layouts) |
 
 > **Note:** Schema dump finishes in seconds. Signature generation (`--signatures` / `--all`) processes 800k+ functions and can take several minutes.
 
@@ -97,6 +98,14 @@ CCitadelInput::CreateMove = 48 89 5C 24 ? 55 48 8D AC 24
 CSource2Client::idx_0 = 40 53 56 57 48 81
 ```
 
+### RTTI layout headers
+9,000+ non-schema classes get generated struct headers with inferred field offsets from vtable function analysis — no PDB required. Each field has type inference (`float`, `void*`, `uint32_t`, etc.) and access pattern annotations.
+
+```cpp
+#include "sdk/client/_rtti/CTraceFilter.hpp"
+// namespace sdk::rtti — separate from schema structs
+```
+
 ### Full RTTI inheritance
 23,000+ classes with complete parent chains and vtable RVAs from MSVC x64 RTTI — including internal engine classes with no schema entry (CCitadelInput, CPanoramaUIEngine, CInputSystem, etc.).
 
@@ -130,6 +139,8 @@ Optional `patterns.json` for untyped globals that vtable scanning can't find (`d
 | `sdk/_all-vtables.hpp` | VTable RVAs + function indices |
 | `sdk/_globals.hpp` | Resolved global pointer RVAs |
 | `sdk/_patterns.hpp` | Runtime-scannable byte patterns for globals |
+| `sdk/_rtti-layouts.hpp` | Master include for all RTTI layout headers |
+| `sdk/<module>/_rtti/<Class>.hpp` | Per-class RTTI-inferred struct headers |
 | `viewer/index.html` | Interactive browser-based viewer for `_all-modules.json` |
 
 ## Interactive Viewer
