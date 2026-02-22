@@ -17,6 +17,9 @@ generated/
 *.opensdf
 .vs/
 
+# Python
+__pycache__/
+
 # Temp files
 *.log
 bin/
