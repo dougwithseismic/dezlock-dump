@@ -83,6 +83,7 @@ code{font-family:var(--mono);font-size:.9em;background:var(--code);padding:1px 5
 .sb-icon{flex-shrink:0;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;border-radius:3px;font-size:.7rem;font-weight:700;font-family:var(--mono)}
 .sb-icon-c{background:#1f6feb22;color:#58a6ff}.sb-icon-e{background:#3fb95022;color:#3fb950}
 .sb-icon-g{background:#d2992222;color:#d29922}.sb-icon-f{background:#a371f722;color:#a371f7}
+.sb-icon-pb{background:#9333ea22;color:#9333ea}
 .sb-name{overflow:hidden;text-overflow:ellipsis}
 .sb-mod{margin-left:auto;flex-shrink:0;font-size:.7rem;color:var(--t3)}
 .sb-ghdr{padding:6px 10px 3px;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);position:sticky;top:0;background:var(--bg1);z-index:1}
@@ -126,6 +127,10 @@ table.ft{width:100%;border-collapse:collapse;font-size:.82rem;font-family:var(--
 .ft td{padding:4px 10px;border-bottom:1px solid var(--brd-l);white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
 .ft tr:hover td{background:var(--bg-h)}
 .f-off{color:var(--t3)}.f-name{color:var(--t1)}.f-type{color:var(--acc)}.f-size{color:var(--t3)}.f-def{color:var(--t3);font-size:.75rem}
+.pb-oneof{color:var(--t3);font-size:.85em;font-style:italic}
+.pb-label{font-size:.85em;padding:1px 6px;border-radius:3px;background:var(--bg3)}
+.pb-repeated{background:#2563eb22;color:#3b82f6}
+.pb-required{background:#dc262622;color:#ef4444}
 
 /* Globals */
 .gl-mhdr{display:flex;align-items:center;gap:8px;padding:8px 0 4px;margin-top:12px;border-bottom:1px solid var(--brd-l);cursor:pointer}
@@ -215,6 +220,7 @@ table.ft{width:100%;border-collapse:collapse;font-size:.82rem;font-family:var(--
         <button class="tab" data-tab="enums">Enums</button>
         <button class="tab" data-tab="globals">Globals</button>
         <button class="tab" data-tab="tree">Tree</button>
+        <button class="tab" data-tab="protobuf">Protobuf</button>
       </nav>
       <div id="content" class="content"><div class="empty"><p>Select a class, enum, or view from the sidebar</p></div></div>
     </main>
@@ -275,6 +281,7 @@ self.onmessage = function(e) {
 // ========================================================================
 let D = null; // parsed data
 let classMap, enumMap, allClasses, allEnums, childrenMap, rootClasses, moduleNames, moduleFilter;
+var allProtoMessages = [], protoMap = new Map();
 let activeTab = 'classes', activeItem = null;
 let searchEntries = []; // [[name, category, module, context], ...]
 let worker = null;
@@ -324,6 +331,7 @@ function nav(type, mod, name) {
   else if(type==='enum') location.hash='enum/'+encodeURIComponent(mod)+'/'+encodeURIComponent(name);
   else if(type==='globals') location.hash='globals';
   else if(type==='tree') location.hash='tree';
+  else if(type==='protobuf') location.hash='protobuf/'+encodeURIComponent(mod)+'/'+encodeURIComponent(name);
 }
 
 let debounceTimer;
@@ -479,6 +487,24 @@ function onDataReady(raw) {
     }
   }
 
+  // Protobuf messages for search
+  allProtoMessages = [];
+  protoMap = new Map();
+  var pbm = D.protobuf_messages || {};
+  for(var mn in pbm) {
+    var files = (pbm[mn].files||[]);
+    for(var fi=0; fi<files.length; fi++) {
+      var pf = files[fi];
+      var msgs = pf.messages||[];
+      for(var mi=0; mi<msgs.length; mi++) {
+        var msg = msgs[mi];
+        protoMap.set(msg.name, {m:mn, f:pf.name, o:msg});
+        allProtoMessages.push({n:msg.name, m:mn});
+        searchEntries.push([msg.name, 'pb', mn, pf.name]);
+      }
+    }
+  }
+
   moduleNames.sort();
   rootClasses.sort();
   moduleFilter = new Set(moduleNames);
@@ -554,6 +580,9 @@ function updateSBList() {
     }
     items.sort(function(a,b){return a.n.localeCompare(b.n);});
     renderSBItems(items, 'g');
+  } else if(activeTab==='protobuf') {
+    items = allProtoMessages.filter(function(p){return moduleFilter.has(p.m);}).sort(function(a,b){return a.n.localeCompare(b.n);});
+    renderSBItems(items, 'pb');
   }
 }
 
@@ -581,7 +610,8 @@ function renderSBItems(items, cat) {
     (function(it, c){
       row.onclick = function(){
         document.getElementById('sidebar').classList.remove('open');
-        nav(c==='e'?'enum':'class', it.m, it.n);
+        if(c==='pb') nav('protobuf', it.m, it.n);
+        else nav(c==='e'?'enum':'class', it.m, it.n);
       };
     })(item, cat);
 
@@ -590,9 +620,9 @@ function renderSBItems(items, cat) {
   $sbList.appendChild(frag);
 }
 
-function catLabel(c){return{c:'Classes',e:'Enums',g:'Globals',f:'Fields',v:'Enum Values'}[c]||c;}
-function catIcon(c){return{c:'C',e:'E',g:'G',f:'F',v:'V'}[c]||'?';}
-function catIconClass(c){return{c:'sb-icon-c',e:'sb-icon-e',g:'sb-icon-g',f:'sb-icon-f',v:'sb-icon-f'}[c]||'';}
+function catLabel(c){return{c:'Classes',e:'Enums',g:'Globals',f:'Fields',v:'Enum Values',pb:'Protobuf'}[c]||c;}
+function catIcon(c){return{c:'C',e:'E',g:'G',f:'F',v:'V',pb:'PB'}[c]||'?';}
+function catIconClass(c){return{c:'sb-icon-c',e:'sb-icon-e',g:'sb-icon-g',f:'sb-icon-f',v:'sb-icon-f',pb:'sb-icon-pb'}[c]||'';}
 
 // ========================================================================
 // Search
@@ -661,7 +691,7 @@ function renderSearchResults(results) {
     groups[cat].push(e);
   }
 
-  var order = ['c','e','f','v','g'];
+  var order = ['c','e','f','v','g','pb'];
   var frag = document.createDocumentFragment();
   for(var oi=0; oi<order.length; oi++) {
     var cat = order[oi];
@@ -684,6 +714,7 @@ function renderSearchResults(results) {
           else if(c==='f') nav('class',entry[2],entry[3]);
           else if(c==='e') nav('enum',entry[2],entry[0]);
           else if(c==='v') nav('enum',entry[2],entry[3]);
+          else if(c==='pb') { setTab('protobuf'); activeItem={type:'pb',module:entry[2],name:entry[0]}; renderContent(); location.hash='protobuf/'+encodeURIComponent(entry[2])+'/'+encodeURIComponent(entry[0]); }
         };
       })(e, cat);
 
@@ -714,6 +745,13 @@ function handleHash() {
     setTab('globals'); activeItem=null; renderContent();
   } else if(p[0]==='tree') {
     setTab('tree'); activeItem=null; renderContent();
+  } else if(p[0]==='protobuf' && p.length>=3) {
+    setTab('protobuf');
+    activeItem = {type:'pb', module:p[1], name:p.slice(2).join('/')};
+    renderContent();
+    highlightSB();
+  } else if(p[0]==='protobuf') {
+    setTab('protobuf'); activeItem=null; renderContent();
   }
 }
 window.addEventListener('hashchange', handleHash);
@@ -733,6 +771,7 @@ $tabs.forEach(function(tab){
     setTab(t);
     if(t==='globals') nav('globals');
     else if(t==='tree') nav('tree');
+    else if(t==='protobuf') { location.hash='protobuf'; activeItem=null; renderContent(); }
     else { activeItem=null; updateSBList(); renderContent(); }
   });
 });
@@ -752,6 +791,7 @@ function renderContent() {
 
   if(activeTab==='globals') { renderGlobals(); return; }
   if(activeTab==='tree') { renderTree(); return; }
+  if(activeTab==='protobuf') { if(activeItem && activeItem.type==='pb') { var pb=protoMap.get(activeItem.name); if(pb) renderProtoMessage(pb.o, pb.m, pb.f); else $content.innerHTML='<div class="empty">Message "'+esc(activeItem.name)+'" not found</div>'; } else { renderProtobuf(); } return; }
   if(!activeItem) { showEmpty(); return; }
 
   if(activeItem.type==='class') {
@@ -1119,6 +1159,169 @@ function mkTreeNode(name, depth) {
     node.appendChild(cc);
   }
   return node;
+}
+
+// ========================================================================
+// Protobuf View
+// ========================================================================
+function renderProtobuf() {
+  $content.innerHTML = '';
+  var pbm = D.protobuf_messages;
+  if(!pbm || !Object.keys(pbm).length) { $content.innerHTML='<div class="empty">No protobuf messages found</div>'; return; }
+
+  $content.appendChild(el('h2','cls-name','Protobuf Messages'));
+
+  var mods = Object.keys(pbm).sort();
+  mods.forEach(function(mn){
+    if(!moduleFilter.has(mn)) return;
+    var mod = pbm[mn];
+    var files = mod.files||[];
+    if(!files.length) return;
+
+    var totalMsgs = 0;
+    files.forEach(function(f){ totalMsgs += (f.messages||[]).length; });
+
+    var sec=el('div');
+    var hdr=el('div','gl-mhdr');
+    var arrow=el('span','gl-arrow','\u25B6');
+    hdr.appendChild(arrow);
+    hdr.appendChild(el('span','gl-mname',mn));
+    hdr.appendChild(el('span','gl-mcnt','('+totalMsgs+' messages, '+files.length+' files)'));
+    var body=el('div');
+
+    files.slice().sort(function(a,b){return a.name.localeCompare(b.name);}).forEach(function(pf){
+      var msgs = pf.messages||[];
+      if(!msgs.length) return;
+
+      body.appendChild(mkSec(pf.name + (pf.package ? ' ['+pf.package+']' : ''), msgs.length));
+
+      var tw=el('div','tw'), t=el('table','ft'), th=el('thead'), hr=el('tr');
+      ['Message','Fields','Nested'].forEach(function(c){hr.appendChild(el('th','',c));});
+      th.appendChild(hr); t.appendChild(th);
+      var tb=el('tbody');
+      msgs.slice().sort(function(a,b){return a.name.localeCompare(b.name);}).forEach(function(msg){
+        var tr=el('tr');
+        var tdN=el('td');
+        var a=el('a','cl',msg.name);
+        a.href='#protobuf/'+encodeURIComponent(mn)+'/'+encodeURIComponent(msg.name);
+        a.onclick=function(ev){ ev.preventDefault(); activeItem={type:'pb',module:mn,name:msg.name}; renderContent(); location.hash='protobuf/'+encodeURIComponent(mn)+'/'+encodeURIComponent(msg.name); };
+        tdN.appendChild(a);
+        tr.appendChild(tdN);
+        tr.appendChild(el('td','',(msg.fields||[]).length.toString()));
+        var nested = (msg.nested_messages||[]).length + (msg.nested_enums||[]).length;
+        tr.appendChild(el('td','',nested?nested.toString():'\u2014'));
+        tb.appendChild(tr);
+      });
+      t.appendChild(tb); tw.appendChild(t); body.appendChild(tw);
+    });
+
+    var collapsed=false;
+    hdr.onclick=function(){ collapsed=!collapsed; body.style.display=collapsed?'none':''; arrow.classList.toggle('collapsed',collapsed); };
+    sec.appendChild(hdr); sec.appendChild(body); $content.appendChild(sec);
+  });
+}
+
+function renderProtoMessage(msg, mod, file) {
+  $content.innerHTML = '';
+  $content.appendChild(el('h2','cls-name',msg.name));
+
+  var meta=el('div','cls-meta');
+  meta.appendChild(metaI('Module',mod));
+  meta.appendChild(metaI('File',file));
+  meta.appendChild(metaI('Fields',String((msg.fields||[]).length)));
+  $content.appendChild(meta);
+
+  var oneofs = msg.oneof_decls||[];
+
+  var fields = msg.fields||[];
+  if(fields.length) {
+    var tw=el('div','tw'), t=el('table','ft'), th=el('thead'), hr=el('tr');
+    ['#','Name','Type','Label'].forEach(function(c){hr.appendChild(el('th','',c));});
+    th.appendChild(hr); t.appendChild(th);
+    var tb=el('tbody');
+    fields.slice().sort(function(a,b){return a.number-b.number;}).forEach(function(f){
+      var tr=el('tr');
+      tr.appendChild(el('td','f-off',String(f.number)));
+      var tdName=el('td','f-name',f.name);
+      if(f.oneof_index!=null && oneofs[f.oneof_index]) {
+        tdName.appendChild(el('span','pb-oneof',' [oneof: '+oneofs[f.oneof_index]+']'));
+      }
+      tr.appendChild(tdName);
+
+      var tdType=el('td');
+      if(f.type==='message'||f.type==='enum') {
+        var tname = (f.type_name||'').replace(/^\./,'');
+        var pb = protoMap.get(tname);
+        if(pb) {
+          var a=el('a','cl',tname);
+          a.href='#protobuf/'+encodeURIComponent(pb.m)+'/'+encodeURIComponent(tname);
+          a.onclick=function(ev){ ev.preventDefault(); activeItem={type:'pb',module:pb.m,name:tname}; renderContent(); location.hash='protobuf/'+encodeURIComponent(pb.m)+'/'+encodeURIComponent(tname); };
+          tdType.appendChild(a);
+        } else {
+          tdType.textContent=tname||f.type;
+        }
+      } else {
+        tdType.textContent=f.type;
+      }
+      tr.appendChild(tdType);
+
+      var tdLabel=el('td');
+      var labelBadge = el('span','pb-label',f.label||'');
+      if(f.label==='repeated') labelBadge.classList.add('pb-repeated');
+      if(f.label==='required') labelBadge.classList.add('pb-required');
+      tdLabel.appendChild(labelBadge);
+      tr.appendChild(tdLabel);
+
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb); tw.appendChild(t); $content.appendChild(tw);
+  }
+
+  var nenums = msg.nested_enums||[];
+  if(nenums.length) {
+    $content.appendChild(mkSec('Nested Enums', nenums.length));
+    nenums.forEach(function(ne){
+      var tw=el('div','tw'); tw.style.marginBottom='12px';
+      var lbl=el('div','sec-title',ne.name); lbl.style.marginBottom='4px'; tw.appendChild(lbl);
+      var t=el('table','ft'), th=el('thead'), hr=el('tr');
+      ['Name','Value'].forEach(function(c){hr.appendChild(el('th','',c));});
+      th.appendChild(hr); t.appendChild(th);
+      var tb=el('tbody');
+      (ne.values||[]).forEach(function(v){
+        var tr=el('tr');
+        tr.appendChild(el('td','f-name',v.name));
+        tr.appendChild(el('td','f-off',String(v.number)));
+        tb.appendChild(tr);
+      });
+      t.appendChild(tb); tw.appendChild(t); $content.appendChild(tw);
+    });
+  }
+
+  var nmsgs = msg.nested_messages||[];
+  if(nmsgs.length) {
+    $content.appendChild(mkSec('Nested Messages', nmsgs.length));
+    nmsgs.forEach(function(nm){
+      var card=el('div'); card.style.marginLeft='16px'; card.style.marginBottom='16px';
+      card.appendChild(el('h3','sec-title',nm.name));
+      var nfields = nm.fields||[];
+      if(nfields.length) {
+        var tw=el('div','tw'), t=el('table','ft'), th=el('thead'), hr=el('tr');
+        ['#','Name','Type','Label'].forEach(function(c){hr.appendChild(el('th','',c));});
+        th.appendChild(hr); t.appendChild(th);
+        var tb=el('tbody');
+        nfields.slice().sort(function(a,b){return a.number-b.number;}).forEach(function(f){
+          var tr=el('tr');
+          tr.appendChild(el('td','f-off',String(f.number)));
+          tr.appendChild(el('td','f-name',f.name));
+          tr.appendChild(el('td','',f.type_name?(f.type_name.replace(/^\./,'')):f.type));
+          tr.appendChild(el('td','',f.label||''));
+          tb.appendChild(tr);
+        });
+        t.appendChild(tb); tw.appendChild(t); card.appendChild(tw);
+      }
+      $content.appendChild(card);
+    });
+  }
 }
 
 // ========================================================================

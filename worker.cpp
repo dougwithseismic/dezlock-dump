@@ -17,6 +17,7 @@
 #include "src/pattern-scanner.hpp"
 #include "src/interface-scanner.hpp"
 #include "src/string-scanner.hpp"
+#include "src/protobuf-scanner.hpp"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -111,7 +112,8 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
                   const pattern::ResultMap& pattern_globals,
                   const pattern::PatternConfig& pattern_config,
                   const interfaces::InterfaceMap& iface_map,
-                  const strings::StringMap& string_map) {
+                  const strings::StringMap& string_map,
+                  const protobuf_scan::ProtoMap& proto_map) {
     FILE* fp = fopen(path, "w");
     if (!fp) {
         LOG_E("Failed to open %s for writing", path);
@@ -488,6 +490,151 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
         fprintf(fp, "\n  }");
     }
 
+    // ---- Protobuf messages section (decoded from embedded descriptors) ----
+    if (!proto_map.empty()) {
+        fprintf(fp, ",\n  \"protobuf_messages\": {\n");
+        int mod_idx = 0;
+        for (const auto& [mod_name, proto_files] : proto_map) {
+            if (proto_files.empty()) continue;
+
+            if (mod_idx > 0) fprintf(fp, ",\n");
+            fprintf(fp, "    \"%s\": {\n", json_escape(mod_name.c_str()).c_str());
+            fprintf(fp, "      \"files\": [\n");
+
+            for (size_t fi = 0; fi < proto_files.size(); fi++) {
+                const auto& pf = proto_files[fi];
+                if (fi > 0) fprintf(fp, ",\n");
+                fprintf(fp, "        {\n");
+                fprintf(fp, "          \"name\": \"%s\",\n", json_escape(pf.name.c_str()).c_str());
+                fprintf(fp, "          \"package\": \"%s\",\n", json_escape(pf.package.c_str()).c_str());
+                if (!pf.syntax.empty())
+                    fprintf(fp, "          \"syntax\": \"%s\",\n", json_escape(pf.syntax.c_str()).c_str());
+
+                // Dependencies
+                if (!pf.dependencies.empty()) {
+                    fprintf(fp, "          \"dependencies\": [");
+                    for (size_t di = 0; di < pf.dependencies.size(); di++) {
+                        if (di > 0) fprintf(fp, ", ");
+                        fprintf(fp, "\"%s\"", json_escape(pf.dependencies[di].c_str()).c_str());
+                    }
+                    fprintf(fp, "],\n");
+                }
+
+                // Messages (recursive helper via lambda)
+                struct JsonWriter {
+                    FILE* fp;
+                    const char* (*escape)(const char*);
+
+                    void write_message(const protobuf_scan::ProtoMessage& msg, int indent) {
+                        std::string pad(indent, ' ');
+                        fprintf(fp, "%s{\n", pad.c_str());
+                        fprintf(fp, "%s  \"name\": \"%s\",\n", pad.c_str(), json_escape(msg.name.c_str()).c_str());
+
+                        // Fields
+                        fprintf(fp, "%s  \"fields\": [", pad.c_str());
+                        for (size_t i = 0; i < msg.fields.size(); i++) {
+                            const auto& f = msg.fields[i];
+                            if (i > 0) fprintf(fp, ",");
+                            fprintf(fp, "\n%s    {\"name\": \"%s\", \"number\": %d, \"type\": \"%s\", \"label\": \"%s\"",
+                                    pad.c_str(),
+                                    json_escape(f.name.c_str()).c_str(),
+                                    f.number,
+                                    protobuf_scan::field_type_name(f.type),
+                                    f.label == 1 ? "optional" : f.label == 2 ? "required" : f.label == 3 ? "repeated" : "unknown");
+                            if (!f.type_name.empty())
+                                fprintf(fp, ", \"type_name\": \"%s\"", json_escape(f.type_name.c_str()).c_str());
+                            if (!f.default_value.empty())
+                                fprintf(fp, ", \"default_value\": \"%s\"", json_escape(f.default_value.c_str()).c_str());
+                            if (f.oneof_index >= 0)
+                                fprintf(fp, ", \"oneof_index\": %d", f.oneof_index);
+                            if (!f.json_name.empty())
+                                fprintf(fp, ", \"json_name\": \"%s\"", json_escape(f.json_name.c_str()).c_str());
+                            fprintf(fp, "}");
+                        }
+                        if (!msg.fields.empty()) fprintf(fp, "\n%s  ", pad.c_str());
+                        fprintf(fp, "]");
+
+                        // Nested messages
+                        if (!msg.nested_messages.empty()) {
+                            fprintf(fp, ",\n%s  \"nested_messages\": [\n", pad.c_str());
+                            for (size_t i = 0; i < msg.nested_messages.size(); i++) {
+                                if (i > 0) fprintf(fp, ",\n");
+                                write_message(msg.nested_messages[i], indent + 4);
+                            }
+                            fprintf(fp, "\n%s  ]", pad.c_str());
+                        }
+
+                        // Nested enums
+                        if (!msg.nested_enums.empty()) {
+                            fprintf(fp, ",\n%s  \"nested_enums\": [", pad.c_str());
+                            for (size_t i = 0; i < msg.nested_enums.size(); i++) {
+                                const auto& e = msg.nested_enums[i];
+                                if (i > 0) fprintf(fp, ",");
+                                fprintf(fp, "\n%s    {\"name\": \"%s\", \"values\": [",
+                                        pad.c_str(), json_escape(e.name.c_str()).c_str());
+                                for (size_t v = 0; v < e.values.size(); v++) {
+                                    if (v > 0) fprintf(fp, ", ");
+                                    fprintf(fp, "{\"name\": \"%s\", \"number\": %d}",
+                                            json_escape(e.values[v].name.c_str()).c_str(),
+                                            e.values[v].number);
+                                }
+                                fprintf(fp, "]}");
+                            }
+                            if (!msg.nested_enums.empty()) fprintf(fp, "\n%s  ", pad.c_str());
+                            fprintf(fp, "]");
+                        }
+
+                        // Oneof declarations
+                        if (!msg.oneof_decls.empty()) {
+                            fprintf(fp, ",\n%s  \"oneof_decls\": [", pad.c_str());
+                            for (size_t i = 0; i < msg.oneof_decls.size(); i++) {
+                                if (i > 0) fprintf(fp, ", ");
+                                fprintf(fp, "\"%s\"", json_escape(msg.oneof_decls[i].c_str()).c_str());
+                            }
+                            fprintf(fp, "]");
+                        }
+
+                        fprintf(fp, "\n%s}", pad.c_str());
+                    }
+                };
+
+                JsonWriter jw{fp, nullptr};
+
+                fprintf(fp, "          \"messages\": [\n");
+                for (size_t mi2 = 0; mi2 < pf.messages.size(); mi2++) {
+                    if (mi2 > 0) fprintf(fp, ",\n");
+                    jw.write_message(pf.messages[mi2], 12);
+                }
+                if (!pf.messages.empty()) fprintf(fp, "\n          ");
+                fprintf(fp, "],\n");
+
+                // Top-level enums
+                fprintf(fp, "          \"enums\": [");
+                for (size_t ei = 0; ei < pf.enums.size(); ei++) {
+                    const auto& e = pf.enums[ei];
+                    if (ei > 0) fprintf(fp, ",");
+                    fprintf(fp, "\n            {\"name\": \"%s\", \"values\": [",
+                            json_escape(e.name.c_str()).c_str());
+                    for (size_t v = 0; v < e.values.size(); v++) {
+                        if (v > 0) fprintf(fp, ", ");
+                        fprintf(fp, "{\"name\": \"%s\", \"number\": %d}",
+                                json_escape(e.values[v].name.c_str()).c_str(),
+                                e.values[v].number);
+                    }
+                    fprintf(fp, "]}");
+                }
+                if (!pf.enums.empty()) fprintf(fp, "\n          ");
+                fprintf(fp, "]\n");
+
+                fprintf(fp, "        }");
+            }
+            fprintf(fp, "\n      ]\n");
+            fprintf(fp, "    }");
+            mod_idx++;
+        }
+        fprintf(fp, "\n  }");
+    }
+
     fprintf(fp, "\n}\n");
     fclose(fp);
 
@@ -712,10 +859,14 @@ void worker_thread(HMODULE hModule) {
                   total_str, total_xref, (int)string_map.size());
         }
 
+        // ---- Scan for embedded protobuf descriptors ----
+        LOG_I("Scanning for protobuf descriptors...");
+        protobuf_scan::ProtoMap proto_map = protobuf_scan::scan();
+
         // Export to JSON (all modules)
         LOG_I("Writing JSON export...");
         write_export(mgr, json_path, discovered, pattern_globals, pattern_config,
-                     iface_map, string_map);
+                     iface_map, string_map, proto_map);
     }
 
 done:

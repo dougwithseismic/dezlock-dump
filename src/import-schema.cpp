@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <algorithm>
 #include <atomic>
@@ -2129,6 +2130,310 @@ static int generate_rtti_layouts(
 }
 
 // ============================================================================
+// Protobuf field constant generation
+// ============================================================================
+
+static void generate_protobuf_message_content(
+    std::vector<std::string>& lines,
+    const json& msg,
+    int indent_level)
+{
+    std::string indent(indent_level * 4, ' ');
+    std::string name = msg.value("name", "");
+
+    // Nested enums
+    if (msg.contains("nested_enums") && msg["nested_enums"].is_array()) {
+        for (const auto& en : msg["nested_enums"]) {
+            std::string enum_name = en.value("name", "UnknownEnum");
+            lines.push_back(indent + "enum class " + enum_name + " : int {");
+            if (en.contains("values") && en["values"].is_array()) {
+                for (const auto& v : en["values"]) {
+                    std::string vname = v.value("name", "");
+                    int vnum = v.value("number", 0);
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "%s    %s = %d,", indent.c_str(), vname.c_str(), vnum);
+                    lines.push_back(buf);
+                }
+            }
+            lines.push_back(indent + "};");
+            lines.push_back("");
+        }
+    }
+
+    // Nested messages (recurse)
+    if (msg.contains("nested_messages") && msg["nested_messages"].is_array()) {
+        for (const auto& sub : msg["nested_messages"]) {
+            std::string sub_name = sub.value("name", "UnknownMsg");
+            lines.push_back(indent + "namespace " + sub_name + " {");
+            generate_protobuf_message_content(lines, sub, indent_level + 1);
+            lines.push_back(indent + "} // namespace " + sub_name);
+            lines.push_back("");
+        }
+    }
+
+    // Build oneof grouping
+    std::vector<std::string> oneof_decls;
+    if (msg.contains("oneof_decls") && msg["oneof_decls"].is_array()) {
+        for (const auto& od : msg["oneof_decls"]) {
+            if (od.is_string()) oneof_decls.push_back(od.get<std::string>());
+        }
+    }
+
+    // Group fields by oneof_index
+    std::unordered_map<int, std::vector<const json*>> oneof_groups;
+    std::vector<const json*> regular_fields;
+
+    if (msg.contains("fields") && msg["fields"].is_array()) {
+        for (const auto& f : msg["fields"]) {
+            if (f.contains("oneof_index") && f["oneof_index"].is_number_integer()) {
+                int idx = f["oneof_index"].get<int>();
+                oneof_groups[idx].push_back(&f);
+            } else {
+                regular_fields.push_back(&f);
+            }
+        }
+    }
+
+    // Emit regular fields
+    for (const auto* fp : regular_fields) {
+        std::string fname = fp->value("name", "unknown");
+        int fnum = fp->value("number", 0);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%sconstexpr int %s = %d;", indent.c_str(), fname.c_str(), fnum);
+        lines.push_back(buf);
+    }
+
+    // Emit oneof groups
+    for (size_t i = 0; i < oneof_decls.size(); i++) {
+        int idx = static_cast<int>(i);
+        if (oneof_groups.find(idx) == oneof_groups.end()) continue;
+        lines.push_back("");
+        lines.push_back(indent + "// oneof " + oneof_decls[i]);
+        for (const auto* fp : oneof_groups[idx]) {
+            std::string fname = fp->value("name", "unknown");
+            int fnum = fp->value("number", 0);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%sconstexpr int %s = %d;", indent.c_str(), fname.c_str(), fnum);
+            lines.push_back(buf);
+        }
+    }
+}
+
+static std::string generate_protobuf_header(
+    const std::string& message_name,
+    const std::string& module_name,
+    const std::string& proto_file,
+    const std::string& package,
+    const json& message_json)
+{
+    std::string safe_name = sanitize_cpp_identifier(message_name);
+    if (safe_name.empty()) safe_name = message_name;
+
+    std::string guard = "SDK_PROTO_" + safe_name + "_HPP";
+    for (char& c : guard) {
+        c = (char)std::toupper(static_cast<unsigned char>(c));
+    }
+
+    std::vector<std::string> lines;
+    lines.push_back("// Auto-generated protobuf field constants \xe2\x80\x94 DO NOT EDIT");
+    lines.push_back("// Message: " + message_name);
+    lines.push_back("// Module: " + module_name);
+    lines.push_back("// Proto file: " + proto_file);
+    if (!package.empty()) {
+        lines.push_back("// Package: " + package);
+    }
+    lines.push_back("#pragma once");
+    lines.push_back("#ifndef " + guard);
+    lines.push_back("#define " + guard);
+    lines.push_back("");
+
+    // Forward declarations: scan fields for message types
+    std::set<std::string> fwd_types;
+    if (message_json.contains("fields") && message_json["fields"].is_array()) {
+        for (const auto& f : message_json["fields"]) {
+            if (f.value("type", "") == "message" && f.contains("type_name")) {
+                std::string tn = f["type_name"].get<std::string>();
+                // Strip leading dot
+                if (!tn.empty() && tn[0] == '.') tn = tn.substr(1);
+                fwd_types.insert(tn);
+            }
+        }
+    }
+
+    lines.push_back("namespace sdk::proto {");
+    lines.push_back("");
+
+    if (!fwd_types.empty()) {
+        for (const auto& t : fwd_types) {
+            lines.push_back("struct " + sanitize_cpp_identifier(t) + ";");
+        }
+        lines.push_back("");
+    }
+
+    lines.push_back("namespace " + safe_name + "_fields {");
+    lines.push_back("");
+
+    generate_protobuf_message_content(lines, message_json, 1);
+
+    lines.push_back("");
+    lines.push_back("} // namespace " + safe_name + "_fields");
+    lines.push_back("");
+    lines.push_back("} // namespace sdk::proto");
+    lines.push_back("");
+    lines.push_back("#endif // " + guard);
+    lines.push_back("");
+
+    std::string result;
+    for (const auto& l : lines) { result += l; result += '\n'; }
+    return result;
+}
+
+static int generate_protobuf_module(
+    const std::string& module_name,
+    const json& module_data,
+    const std::string& output_dir,
+    std::vector<std::pair<std::string, std::string>>& generated_files)
+{
+    int count = 0;
+    std::string mod_clean = strip_dll(module_name);
+    std::string proto_dir = output_dir + "\\" + mod_clean + "\\_protobuf";
+    create_dirs(proto_dir);
+
+    if (!module_data.contains("files") || !module_data["files"].is_array()) return 0;
+
+    for (const auto& file_obj : module_data["files"]) {
+        std::string proto_file = file_obj.value("name", "");
+        std::string package = file_obj.value("package", "");
+
+        // Generate per-message headers
+        if (file_obj.contains("messages") && file_obj["messages"].is_array()) {
+            for (const auto& msg : file_obj["messages"]) {
+                std::string msg_name = msg.value("name", "");
+                if (msg_name.empty()) continue;
+
+                std::string content = generate_protobuf_header(
+                    msg_name, module_name, proto_file, package, msg);
+
+                std::string safe = sanitize_cpp_identifier(msg_name);
+                std::string filepath = proto_dir + "\\" + safe + ".hpp";
+                write_file(filepath, content);
+                generated_files.push_back({mod_clean, safe});
+                count++;
+            }
+        }
+
+        // Generate file-level enum headers
+        if (file_obj.contains("enums") && file_obj["enums"].is_array() &&
+            !file_obj["enums"].empty()) {
+            // Derive a name from the proto file
+            std::string enum_file_name = proto_file;
+            // Strip .proto extension
+            size_t dot = enum_file_name.rfind(".proto");
+            if (dot != std::string::npos) enum_file_name = enum_file_name.substr(0, dot);
+            std::string safe_file = sanitize_cpp_identifier(enum_file_name);
+            if (safe_file.empty()) safe_file = "proto_enums";
+            safe_file += "_enums";
+
+            std::string guard = "SDK_PROTO_" + safe_file + "_HPP";
+            for (char& c : guard) {
+                c = (char)std::toupper(static_cast<unsigned char>(c));
+            }
+
+            std::vector<std::string> lines;
+            lines.push_back("// Auto-generated protobuf enums \xe2\x80\x94 DO NOT EDIT");
+            lines.push_back("// Proto file: " + proto_file);
+            lines.push_back("// Module: " + module_name);
+            lines.push_back("#pragma once");
+            lines.push_back("#ifndef " + guard);
+            lines.push_back("#define " + guard);
+            lines.push_back("");
+            lines.push_back("namespace sdk::proto {");
+            lines.push_back("");
+
+            for (const auto& en : file_obj["enums"]) {
+                std::string ename = en.value("name", "UnknownEnum");
+                lines.push_back("enum class " + ename + " : int {");
+                if (en.contains("values") && en["values"].is_array()) {
+                    for (const auto& v : en["values"]) {
+                        std::string vname = v.value("name", "");
+                        int vnum = v.value("number", 0);
+                        char buf[128];
+                        snprintf(buf, sizeof(buf), "    %s = %d,", vname.c_str(), vnum);
+                        lines.push_back(buf);
+                    }
+                }
+                lines.push_back("};");
+                lines.push_back("");
+            }
+
+            lines.push_back("} // namespace sdk::proto");
+            lines.push_back("");
+            lines.push_back("#endif // " + guard);
+            lines.push_back("");
+
+            std::string result;
+            for (const auto& l : lines) { result += l; result += '\n'; }
+            write_file(proto_dir + "\\" + safe_file + ".hpp", result);
+            generated_files.push_back({mod_clean, safe_file});
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static int generate_protobuf_layouts(
+    const json& data,
+    const std::string& output_dir,
+    const std::string& game_name,
+    const std::string& timestamp)
+{
+    if (!data.contains("protobuf_messages") || !data["protobuf_messages"].is_object())
+        return 0;
+
+    const auto& pb = data["protobuf_messages"];
+    int total_count = 0;
+    std::vector<std::pair<std::string, std::string>> generated_files;
+
+    // Sort module names
+    std::vector<std::string> mod_names;
+    for (auto it = pb.begin(); it != pb.end(); ++it) {
+        mod_names.push_back(it.key());
+    }
+    std::sort(mod_names.begin(), mod_names.end());
+
+    for (const auto& mod_name : mod_names) {
+        const auto& mod_data = pb[mod_name];
+        int mod_count = generate_protobuf_module(mod_name, mod_data, output_dir, generated_files);
+        total_count += mod_count;
+        if (mod_count > 0) {
+            printf("  %-30s  %d protobuf messages\n", mod_name.c_str(), mod_count);
+        }
+    }
+
+    // Generate master include
+    if (total_count > 0) {
+        std::vector<std::string> lines;
+        lines.push_back("// Auto-generated protobuf master include \xe2\x80\x94 DO NOT EDIT");
+        lines.push_back("// Game: " + game_name);
+        lines.push_back("// Generated: " + timestamp);
+        lines.push_back("#pragma once");
+        lines.push_back("");
+
+        for (const auto& gf : generated_files) {
+            lines.push_back("#include \"" + gf.first + "/_protobuf/" + gf.second + ".hpp\"");
+        }
+        lines.push_back("");
+
+        std::string result;
+        for (const auto& l : lines) { result += l; result += '\n'; }
+        write_file(output_dir + "\\_all-protobuf.hpp", result);
+    }
+
+    return total_count;
+}
+
+// ============================================================================
 // generate_sdk -- Main entry point
 // ============================================================================
 
@@ -2374,6 +2679,14 @@ SdkStats generate_sdk(const json& data,
     }
     sdk_stats.rtti_layouts = rtti_count;
 
+    // 8. Protobuf field constants
+    int protobuf_count = 0;
+    if (data.contains("protobuf_messages")) {
+        printf("\nGenerating protobuf field constants...\n");
+        protobuf_count = generate_protobuf_layouts(data, output_dir, game_name, timestamp);
+    }
+    sdk_stats.protobuf_messages = protobuf_count;
+
     printf("\n  _all-offsets.hpp: includes %d modules\n", (int)module_names.size());
     printf("  _all-enums.hpp: includes %d modules\n", (int)module_names.size());
     printf("  _all-vtables.hpp: %d vtables, %d functions\n", vtable_count, vtable_func_count);
@@ -2386,12 +2699,16 @@ SdkStats generate_sdk(const json& data,
     if (rtti_count > 0) {
         printf("  _rtti-layouts.hpp: %d RTTI struct headers\n", rtti_count);
     }
+    if (protobuf_count > 0) {
+        printf("  _all-protobuf.hpp: %d protobuf message headers\n", protobuf_count);
+    }
 
     // Print type resolution statistics
     resolve_stats.print_summary();
 
     printf("\nDone! %d struct headers generated", total_structs);
     if (rtti_count > 0) printf(" + %d RTTI layouts", rtti_count);
+    if (protobuf_count > 0) printf(" + %d protobuf messages", protobuf_count);
     printf(".\n");
     printf("Output: %s\n", output_dir.c_str());
 

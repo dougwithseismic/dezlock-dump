@@ -10,7 +10,7 @@ Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2)
 
 ## What's New
 
-**v1.5.0** — Interface scanner, string reference scanner, vtable member offset analyzer, and RTTI-only SDK struct headers for 9,000+ non-schema classes.
+**v1.6.0** — Protobuf descriptor scanner. Decodes embedded `.proto` definitions from game binaries — extracts named fields, types, and message hierarchies for protobuf-only classes like `CBaseUserCmdPB` that have no Source 2 schema registration.
 
 See the full [Changelog](CHANGELOG.md) for all releases.
 
@@ -106,6 +106,31 @@ CSource2Client::idx_0 = 40 53 56 57 48 81
 // namespace sdk::rtti — separate from schema structs
 ```
 
+### Protobuf message definitions
+Decodes serialized `.proto` descriptors embedded in game binaries. Extracts full message definitions with named fields, types, nesting, and oneofs — no PDB or protobuf library required.
+
+```
+message CBaseUserCmdPB {
+  optional int32 legacy_command_number = 1;
+  optional int32 client_tick = 2;
+  optional CInButtonStatePB buttons_pb = 3;
+  optional CMsgQAngle viewangles = 4;
+  optional float forwardmove = 5;
+  optional float leftmove = 6;
+  optional float upmove = 7;
+  repeated CSubtickMoveStep subtick_moves = 18;
+  ...
+}
+
+message CCitadelUserCmdPB {
+  optional CBaseUserCmdPB base = 1;
+  optional CMsgVector vec_camera_position = 2;
+  optional CMsgQAngle ang_camera_angles = 3;
+  optional int32 enemy_hero_aimed_at = 10;
+  ...
+}
+```
+
 ### Full RTTI inheritance
 23,000+ classes with complete parent chains and vtable RVAs from MSVC x64 RTTI — including internal engine classes with no schema entry (CCitadelInput, CPanoramaUIEngine, CInputSystem, etc.).
 
@@ -131,6 +156,7 @@ Optional `patterns.json` for untyped globals that vtable scanning can't find (`d
 | `_globals.txt` | All global singletons with recursive field trees |
 | `_access-paths.txt` | Schema globals only — fast offset grep |
 | `_entity-paths.txt` | Every entity class with full field trees |
+| `_protobuf-messages.txt` | Decoded protobuf message definitions from all modules |
 | `_all-modules.json` | Complete structured JSON export |
 | `signatures/<module>.txt` | Pattern signatures per module |
 | `sdk/<Class>.hpp` | Per-class C++ SDK headers |

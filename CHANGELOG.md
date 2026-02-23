@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-02-23
+
+### Added
+- Protobuf descriptor scanner — decodes serialized `FileDescriptorProto` blobs embedded in `.rdata` sections of all loaded game DLLs
+- Full protobuf wire format parser (varint, length-delimited, nested messages) with zero external dependencies
+- `_protobuf-messages.txt` output — human-readable `.proto` definitions with messages, fields, enums, oneofs, and nesting
+- `"protobuf_messages"` section in `_all-modules.json` export with structured message/field/enum data per module
+- Protobuf summary stats in console output
+- Extracts named fields for protobuf-only classes like `CBaseUserCmdPB` (viewangles, forwardmove, buttons, etc.) that have no Source 2 schema registration
+
 ## [1.5.0] - 2026-02-22
 
 ### Added

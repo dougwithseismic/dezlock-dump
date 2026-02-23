@@ -25,6 +25,7 @@ add_library(dezlock-worker SHARED
     src/pattern-scanner.cpp
     src/interface-scanner.cpp
     src/string-scanner.cpp
+    src/protobuf-scanner.cpp
 )
 target_include_directories(dezlock-worker PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(dezlock-worker PRIVATE user32 psapi)
