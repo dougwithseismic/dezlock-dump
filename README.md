@@ -11,6 +11,8 @@ Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2)
 
 [![Watch the demo](https://img.youtube.com/vi/fz-JlwcnIfY/maxresdefault.jpg)](https://www.youtube.com/watch?v=fz-JlwcnIfY)
 
+**[Watch the demo on YouTube](https://www.youtube.com/watch?v=fz-JlwcnIfY)**
+
 ## What's New
 
 **v1.6.0** — Protobuf descriptor scanner. Decodes embedded `.proto` definitions from game binaries — extracts named fields, types, and message hierarchies for protobuf-only classes like `CBaseUserCmdPB` that have no Source 2 schema registration.
@@ -219,6 +221,16 @@ Or just run `build.bat`. Output lands in `build/bin/Release/`.
 - Windows 10/11 (x64)
 - Target Source 2 game running with `client.dll` loaded
 - Run as **administrator**
+
+## Technical Deep-Dives
+
+Articles explaining the engineering behind each major subsystem:
+
+- [How Source 2's SchemaSystem Works Internally](docs/how-source2-schema-system-works.md) — CUtlTSHash walking, RuntimeClass/Field structures, flat layout resolution
+- [Building an MSVC x64 RTTI Scanner from Scratch](docs/building-msvc-x64-rtti-scanner.md) — TypeDescriptor chains, vtable discovery, inheritance reconstruction across 23,000+ classes
+- [Manual DLL Mapping: How and Why We Skip LoadLibrary](docs/manual-dll-mapping-explained.md) — PE section copying, relocations, import resolution, SEH registration
+- [Auto-Discovering 10,000+ Global Singletons](docs/auto-discovering-global-singletons.md) — .data section scanning, vtable cross-referencing, pattern-based supplementary resolution
+- [Building an Interactive Binary Analysis Viewer](docs/building-a-binary-analysis-viewer.md) — Single-file architecture, Web Worker parsing, live WebSocket entity inspector
 
 ## Disclaimer
 
