@@ -326,6 +326,7 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
 
     // ---- Globals section (auto-discovered via vtable scan) ----
     if (!discovered.empty()) {
+        const auto& rtti = mgr.rtti_map();
         fprintf(fp, ",\n  \"globals\": {\n");
         int mod_idx = 0;
         for (const auto& [mod_name, entries] : discovered) {
@@ -336,10 +337,30 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
             for (size_t i = 0; i < entries.size(); i++) {
                 const auto& g = entries[i];
                 if (i > 0) fprintf(fp, ",\n");
-                fprintf(fp, "      {\"class\": \"%s\", \"rva\": \"0x%X\", \"vtable_rva\": \"0x%X\", \"type\": \"%s\", \"has_schema\": %s}",
+                fprintf(fp, "      {\"class\": \"%s\", \"rva\": \"0x%X\", \"vtable_rva\": \"0x%X\", \"type\": \"%s\", \"has_schema\": %s",
                         g.class_name.c_str(), g.global_rva, g.vtable_rva,
                         g.is_pointer ? "pointer" : "static",
                         g.has_schema ? "true" : "false");
+
+                // Enrich with RTTI data if available
+                std::string composite_key = mod_name + "::" + g.class_name;
+                auto it = rtti.find(composite_key);
+                if (it != rtti.end()) {
+                    const auto& info = it->second;
+                    if (!info.parent.empty())
+                        fprintf(fp, ", \"parent\": \"%s\"", info.parent.c_str());
+                    fprintf(fp, ", \"function_count\": %d", (int)info.vtable_func_rvas.size());
+                    if (!info.chain.empty()) {
+                        fprintf(fp, ", \"inheritance\": [");
+                        for (size_t j = 0; j < info.chain.size(); j++) {
+                            if (j > 0) fprintf(fp, ", ");
+                            fprintf(fp, "\"%s\"", info.chain[j].c_str());
+                        }
+                        fprintf(fp, "]");
+                    }
+                }
+
+                fprintf(fp, "}");
             }
             fprintf(fp, "\n    ]");
             mod_idx++;
@@ -644,6 +665,184 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
 }
 
 // ============================================================================
+// Live Pipe Server — binary read/write proxy for dezlock-dump.exe live mode
+// ============================================================================
+
+static const uint8_t PIPE_OP_READ        = 0x01;
+static const uint8_t PIPE_OP_WRITE       = 0x02;
+static const uint8_t PIPE_OP_MODULE_BASE = 0x03;
+static const uint8_t PIPE_OP_SHUTDOWN    = 0xFF;
+
+static const uint8_t PIPE_STATUS_OK       = 0x00;
+static const uint8_t PIPE_STATUS_SEH      = 0x01;
+static const uint8_t PIPE_STATUS_BAD_ARGS = 0x02;
+
+#pragma pack(push, 1)
+struct PipeRequest {
+    uint8_t  op;
+    uint8_t  pad[3];
+    uint32_t size;
+    uint64_t addr;
+};
+
+struct PipeResponse {
+    uint8_t  status;
+    uint8_t  pad[3];
+    uint32_t size;
+};
+#pragma pack(pop)
+
+static bool pipe_read_exact(HANDLE pipe, void* buf, DWORD len) {
+    DWORD total = 0;
+    while (total < len) {
+        DWORD bytesRead = 0;
+        if (!ReadFile(pipe, (uint8_t*)buf + total, len - total, &bytesRead, NULL) || bytesRead == 0)
+            return false;
+        total += bytesRead;
+    }
+    return true;
+}
+
+static bool pipe_write_exact(HANDLE pipe, const void* buf, DWORD len) {
+    DWORD total = 0;
+    while (total < len) {
+        DWORD written = 0;
+        if (!WriteFile(pipe, (const uint8_t*)buf + total, len - total, &written, NULL) || written == 0)
+            return false;
+        total += written;
+    }
+    return true;
+}
+
+// SEH wrappers — must be in separate functions (no C++ objects with destructors)
+static bool seh_memcpy_read(void* dst, const void* src, size_t len) {
+    __try {
+        memcpy(dst, src, len);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void run_pipe_server(HMODULE hModule) {
+    LOG_I("Starting named pipe server...");
+
+    HANDLE hPipe = CreateNamedPipeA(
+        "\\\\.\\pipe\\dezlock-live",
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 65536, 65536, 0, NULL);
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        LOG_E("CreateNamedPipe failed (err %lu)", GetLastError());
+        core::log::shutdown();
+        Sleep(200);
+        FreeLibraryAndExitThread(hModule, 1);
+        return;
+    }
+
+    LOG_I("Pipe created, waiting for exe to connect...");
+    if (!ConnectNamedPipe(hPipe, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+        LOG_E("ConnectNamedPipe failed (err %lu)", GetLastError());
+        CloseHandle(hPipe);
+        core::log::shutdown();
+        Sleep(200);
+        FreeLibraryAndExitThread(hModule, 1);
+        return;
+    }
+    LOG_I("Pipe client connected — serving memory requests");
+
+    bool running = true;
+    while (running) {
+        PipeRequest req = {};
+        if (!pipe_read_exact(hPipe, &req, sizeof(req))) {
+            LOG_W("Pipe read failed — client disconnected");
+            break;
+        }
+
+        switch (req.op) {
+        case PIPE_OP_READ: {
+            if (req.size == 0 || req.size > 65536) {
+                PipeResponse resp = { PIPE_STATUS_BAD_ARGS, {}, 0 };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+                break;
+            }
+            std::vector<uint8_t> buf(req.size);
+            bool ok = seh_memcpy_read(buf.data(), reinterpret_cast<const void*>(req.addr), req.size);
+            if (ok) {
+                PipeResponse resp = { PIPE_STATUS_OK, {}, req.size };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+                pipe_write_exact(hPipe, buf.data(), req.size);
+            } else {
+                PipeResponse resp = { PIPE_STATUS_SEH, {}, 0 };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+            }
+            break;
+        }
+        case PIPE_OP_WRITE: {
+            // Write capability removed — this tool is read-only.
+            // Drain any payload the client may have sent, then return error.
+            if (req.size > 0 && req.size <= 65536) {
+                std::vector<uint8_t> drain(req.size);
+                pipe_read_exact(hPipe, drain.data(), req.size);
+            }
+            PipeResponse resp = { PIPE_STATUS_BAD_ARGS, {}, 0 };
+            pipe_write_exact(hPipe, &resp, sizeof(resp));
+            break;
+        }
+        case PIPE_OP_MODULE_BASE: {
+            // size = length of module name string that follows header
+            if (req.size == 0 || req.size > 260) {
+                PipeResponse resp = { PIPE_STATUS_BAD_ARGS, {}, 0 };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+                break;
+            }
+            std::vector<char> name_buf(req.size + 1, 0);
+            if (!pipe_read_exact(hPipe, name_buf.data(), req.size)) {
+                LOG_W("Failed to read module name");
+                break;
+            }
+            name_buf[req.size] = '\0';
+
+            HMODULE hmod = GetModuleHandleA(name_buf.data());
+            if (hmod) {
+                uint64_t base = reinterpret_cast<uint64_t>(hmod);
+                PipeResponse resp = { PIPE_STATUS_OK, {}, 8 };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+                pipe_write_exact(hPipe, &base, 8);
+            } else {
+                PipeResponse resp = { PIPE_STATUS_BAD_ARGS, {}, 0 };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+            }
+            break;
+        }
+        case PIPE_OP_SHUTDOWN:
+            LOG_I("Received shutdown command");
+            running = false;
+            {
+                PipeResponse resp = { PIPE_STATUS_OK, {}, 0 };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+            }
+            break;
+        default:
+            LOG_W("Unknown pipe op 0x%02X", req.op);
+            {
+                PipeResponse resp = { PIPE_STATUS_BAD_ARGS, {}, 0 };
+                pipe_write_exact(hPipe, &resp, sizeof(resp));
+            }
+            break;
+        }
+    }
+
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
+    LOG_I("Pipe server shut down, unloading DLL...");
+    core::log::shutdown();
+    Sleep(200);
+    FreeLibraryAndExitThread(hModule, 0);
+}
+
+// ============================================================================
 // Main worker thread
 // ============================================================================
 
@@ -660,6 +859,23 @@ void worker_thread(HMODULE hModule) {
 
     char done_path[MAX_PATH];
     snprintf(done_path, MAX_PATH, "%sdezlock-done", temp_dir);
+
+    // Check for live mode
+    char live_cfg_path[MAX_PATH];
+    snprintf(live_cfg_path, MAX_PATH, "%sdezlock-live.cfg", temp_dir);
+    bool live_mode = false;
+    {
+        FILE* lcfg = fopen(live_cfg_path, "rb");
+        if (lcfg) {
+            uint32_t magic = 0, flag = 0;
+            if (fread(&magic, 4, 1, lcfg) == 1 && fread(&flag, 4, 1, lcfg) == 1) {
+                if (magic == 0xDEADDEAD && flag == 1) live_mode = true;
+            }
+            fclose(lcfg);
+            DeleteFileA(live_cfg_path);
+        }
+    }
+    if (live_mode) LOG_I("Live mode enabled — will start pipe server after dump");
 
     // Clean up any stale signal file
     DeleteFileA(done_path);
@@ -867,6 +1083,7 @@ void worker_thread(HMODULE hModule) {
         LOG_I("Writing JSON export...");
         write_export(mgr, json_path, discovered, pattern_globals, pattern_config,
                      iface_map, string_map, proto_map);
+
     }
 
 done:
@@ -877,12 +1094,16 @@ done:
         fclose(sig);
     }
 
+    if (live_mode) {
+        LOG_I("=== Dump complete, entering live pipe server mode ===");
+        run_pipe_server(hModule);
+        // run_pipe_server calls FreeLibraryAndExitThread, never returns
+        return;
+    }
+
     LOG_I("=== Worker complete, unloading ===");
     core::log::shutdown();
-
-    // Give the exe a moment to notice the signal before we unload
     Sleep(200);
-
     FreeLibraryAndExitThread(hModule, 0);
 }
 

@@ -1,7 +1,7 @@
 /**
  * Dezlock Dump — Standalone Schema Extraction Tool
  *
- * Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>]
+ * Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--live]
  *
  * 1. Interactive game selection (or --process to skip menu)
  * 2. Injects dezlock-worker.dll via manual-map (PE mapping + shellcode)
@@ -32,6 +32,8 @@
 #include "src/generate-signatures.hpp"
 #include "src/import-schema.hpp"
 #include "src/analyze-members.hpp"
+#include "src/ws-server.hpp"
+#include "src/live-bridge.hpp"
 using json = nlohmann::json;
 
 // ============================================================================
@@ -1121,6 +1123,136 @@ static bool is_elevated() {
 }
 
 // ============================================================================
+// Live Server — shared by --live (after dump) and --schema (standalone)
+// ============================================================================
+
+static int run_live_server(const json& data, bool pipe_required) {
+    con_print("\n");
+    con_step("LIVE", "Starting live memory bridge...");
+
+    // Wire up live bridge logging to console + log file
+    live::set_logger([](const char* tag, const char* msg) {
+        con_print("  [%s] %s\n", tag, msg);
+    });
+
+    try {
+        // Connect to DLL's named pipe
+        live::PipeClient pipe;
+        bool pipe_ok = pipe.connect();
+        if (pipe_ok) {
+            con_ok("Connected to worker pipe");
+        } else if (pipe_required) {
+            con_fail("Could not connect to worker pipe. DLL may have unloaded.");
+            con_info("Make sure the game is still running and --live was used.");
+            wait_for_keypress();
+            return 1;
+        } else {
+            con_info("No pipe connection — schema-only mode (mem.* commands disabled)");
+        }
+
+        // Load schema into cache
+        con_info("Loading schema into cache...");
+        live::SchemaCache cache;
+        if (!cache.load(data)) {
+            con_fail("Failed to load schema into cache.");
+            if (pipe_ok) pipe.shutdown();
+            wait_for_keypress();
+            return 1;
+        }
+        con_ok("Schema cached (%d modules)", (int)cache.modules().size());
+
+        // Start WebSocket server
+        ws::WsServer ws_server;
+
+        // SubManager for push-based subscriptions
+        live::SubManager subs(pipe, cache, [&ws_server](const std::string& msg) {
+            ws_server.broadcast(msg);
+        });
+
+        // Command dispatcher
+        live::CommandDispatcher dispatcher(cache, pipe, subs);
+
+        // Wire up WS message handling
+        bool ws_ok = ws_server.start(9100, [&](ws::ClientId client, const std::string& msg) {
+            try {
+                std::string response = dispatcher.dispatch(msg);
+                ws_server.send(client, response);
+            } catch (const std::exception& e) {
+                live::log_error("WS", "Message handler exception: %s", e.what());
+            } catch (...) {
+                live::log_error("WS", "Message handler unknown exception!");
+            }
+        });
+
+        if (!ws_ok) {
+            con_fail("Could not start WebSocket server on port 9100.");
+            con_info("Port may be in use. Check for another instance.");
+            if (pipe_ok) pipe.shutdown();
+            wait_for_keypress();
+            return 1;
+        }
+
+        ws_server.set_on_connect([](ws::ClientId) {});
+        ws_server.set_on_disconnect([](ws::ClientId) {});
+
+        con_ok("WebSocket server listening on ws://127.0.0.1:9100");
+        con_print("\n");
+        con_color(CLR_TITLE);
+        con_print("  LIVE MODE ACTIVE");
+        if (!pipe_ok) con_print(" (schema-only)");
+        con_print("\n");
+        con_color(CLR_DEFAULT);
+        con_print("  Open viewer/index.html and click 'Connect Live'\n");
+        con_print("  Press Ctrl+C to stop.\n\n");
+
+        // Ctrl+C handler
+        static std::atomic<bool> g_shutdown{false};
+        g_shutdown.store(false);
+        SetConsoleCtrlHandler([](DWORD type) -> BOOL {
+            if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
+                g_shutdown.store(true);
+                return TRUE;
+            }
+            return FALSE;
+        }, TRUE);
+
+        // Block until shutdown
+        while (!g_shutdown.load()) {
+            Sleep(100);
+            // Check if pipe is still alive (only when we had one)
+            if (pipe_ok && !pipe.connected()) {
+                con_print("\n");
+                con_fail("Game disconnected (pipe broken).");
+                con_info("WS server still running for schema queries. Ctrl+C to stop.");
+                pipe_ok = false;
+            }
+        }
+
+        con_print("\n");
+        con_step("---", "Shutting down...");
+
+        subs.stop();
+        ws_server.stop();
+        if (pipe_ok) pipe.shutdown();
+
+        con_ok("Live bridge stopped.");
+
+    } catch (const std::exception& e) {
+        con_fail("Live bridge crashed: %s", e.what());
+        wait_for_keypress();
+        return 1;
+    } catch (...) {
+        con_fail("Live bridge crashed with unknown exception.");
+        wait_for_keypress();
+        return 1;
+    }
+
+    con_print("\n");
+    if (g_log_fp) fclose(g_log_fp);
+    return 0;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1130,12 +1262,14 @@ int main(int argc, char* argv[]) {
     // Parse args (early pass — need process name for banner)
     std::string output_dir;
     std::string target_process;  // empty = interactive selection
+    std::string schema_path;     // --schema <path> — skip injection, load JSON directly
     int timeout_sec = 180;
     int field_depth = 3;
     bool gen_signatures = false;
     bool gen_sdk = false;
     bool gen_layouts = false;
     bool gen_all = false;
+    bool live_mode = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
@@ -1159,12 +1293,22 @@ int main(int argc, char* argv[]) {
             gen_layouts = true;
         } else if (strcmp(argv[i], "--all") == 0) {
             gen_all = true;
+        } else if (strcmp(argv[i], "--live") == 0) {
+            live_mode = true;
+        } else if (strcmp(argv[i], "--schema") == 0 && i + 1 < argc) {
+            schema_path = argv[++i];
+            live_mode = true; // --schema implies live mode
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--depth <N>] [--sdk] [--signatures] [--layouts] [--all]\n\n");
+            con_print("Usage: dezlock-dump.exe [--process <name>] [--output <dir>] [--wait <seconds>] [--depth <N>] [--sdk] [--signatures] [--layouts] [--all] [--live] [--schema <path>]\n\n");
             con_print("  --process     Target process name (skips game selection menu)\n");
             con_print("                Examples: --process cs2.exe, --process dota2.exe\n");
             con_print("  --output      Output directory (default: schema-dump/<game>/ next to exe)\n");
             con_print("  --wait        Max wait time for worker DLL (default: 30s)\n");
+            con_print("  --live        Stay running after dump — start WebSocket server on :9100\n");
+            con_print("                for real-time memory inspection from the viewer\n");
+            con_print("  --schema      Load existing _all-modules.json and start WS server directly\n");
+            con_print("                Skips injection/dump. Use with --process to also connect pipe.\n");
+            con_print("                Example: --schema schema-dump/deadlock/_all-modules.json\n");
             con_print("  --depth       Field expansion depth for globals/entity trees (default: 3, max: 32)\n");
             con_print("  --sdk         Generate cherry-pickable C++ SDK headers\n");
             con_print("  --signatures  Generate byte pattern signatures\n");
@@ -1189,6 +1333,38 @@ int main(int argc, char* argv[]) {
     con_print("  https://github.com/dougwithseismic/dezlock-dump\n");
     con_color(CLR_DEFAULT);
     con_print("\n");
+
+    // ---- --schema fast path: load JSON and jump straight to live mode ----
+    if (!schema_path.empty()) {
+        con_step("1/2", "Loading schema from file...");
+
+        FILE* sfp = fopen(schema_path.c_str(), "rb");
+        if (!sfp) {
+            con_fail("Cannot open schema file: %s", schema_path.c_str());
+            wait_for_keypress();
+            return 1;
+        }
+        fseek(sfp, 0, SEEK_END);
+        long ssize = ftell(sfp);
+        fseek(sfp, 0, SEEK_SET);
+        std::string schema_json(ssize, '\0');
+        fread(&schema_json[0], 1, ssize, sfp);
+        fclose(sfp);
+
+        json data;
+        try {
+            data = json::parse(schema_json);
+        } catch (const std::exception& e) {
+            con_fail("Failed to parse schema: %s", e.what());
+            wait_for_keypress();
+            return 1;
+        }
+
+        con_ok("Loaded %s (%.1f MB)", schema_path.c_str(), ssize / (1024.0 * 1024.0));
+
+        // Fall through to live mode with pipe_required = false
+        return run_live_server(data, false);
+    }
 
     // ---- Interactive game selection (when --process not provided) ----
     if (target_process.empty()) {
@@ -1434,12 +1610,34 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Write live config file before injection (tells DLL to stay loaded)
+    {
+        char live_cfg_path[MAX_PATH];
+        snprintf(live_cfg_path, MAX_PATH, "%sdezlock-live.cfg", temp_dir);
+        if (live_mode) {
+            FILE* lcfg = fopen(live_cfg_path, "wb");
+            if (lcfg) {
+                uint32_t magic = 0xDEADDEAD;
+                uint32_t flag = 1;
+                fwrite(&magic, 4, 1, lcfg);
+                fwrite(&flag, 4, 1, lcfg);
+                fclose(lcfg);
+            }
+        } else {
+            DeleteFileA(live_cfg_path); // clean up stale config
+        }
+    }
+
     {
         std::string step_msg = "Extracting schema from " + game_display + "...";
-        con_step("3/5", step_msg.c_str());
+        con_step(live_mode ? "3/6" : "3/5", step_msg.c_str());
     }
     con_info("This reads class layouts and field offsets from the game's memory.");
-    con_info("%s will not be modified. This is read-only.", game_display.c_str());
+    if (live_mode) {
+        con_info("%s will not be modified in read-only mode. Write requires --live.", game_display.c_str());
+    } else {
+        con_info("%s will not be modified. This is read-only.", game_display.c_str());
+    }
 
     if (!inject_dll(pid, dll_path)) {
         con_fail("Could not connect to %s process.", game_display.c_str());
@@ -1558,8 +1756,14 @@ int main(int argc, char* argv[]) {
     long fsize = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     std::string json_str(fsize, '\0');
-    fread(&json_str[0], 1, fsize, fp);
+    size_t bytes_read = fread(&json_str[0], 1, fsize, fp);
     fclose(fp);
+    json_str.resize(bytes_read);
+
+    // Trim trailing garbage after the last '}' (guards against partial writes / stale data)
+    auto last_brace = json_str.rfind('}');
+    if (last_brace != std::string::npos && last_brace + 1 < json_str.size())
+        json_str.resize(last_brace + 1);
 
     json data;
     try {
@@ -2453,6 +2657,11 @@ int main(int argc, char* argv[]) {
     }
 
     con_color(CLR_DEFAULT);
+
+    // ---- Live mode: start WebSocket server for real-time memory inspection ----
+    if (live_mode) {
+        return run_live_server(data, true /* pipe required */);
+    }
 
     if (g_log_fp) fclose(g_log_fp);
 

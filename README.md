@@ -9,6 +9,8 @@ Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2)
 
 ![dezlock-dump viewer](assets/viewer-preview.png)
 
+[![Watch the demo](https://img.youtube.com/vi/fz-JlwcnIfY/maxresdefault.jpg)](https://www.youtube.com/watch?v=fz-JlwcnIfY)
+
 ## What's New
 
 **v1.6.0** — Protobuf descriptor scanner. Decodes embedded `.proto` definitions from game binaries — extracts named fields, types, and message hierarchies for protobuf-only classes like `CBaseUserCmdPB` that have no Source 2 schema registration.
@@ -187,6 +189,20 @@ A browser-based viewer for exploring dump output interactively. Open `viewer/ind
 - Dark/light theme toggle
 - Works offline with 150MB+ JSON files (parses in a Web Worker)
 
+### Live Server
+
+The `--live` flag keeps the exe running after dump and starts a WebSocket server on `ws://127.0.0.1:9100`. The viewer can connect to it for real-time entity inspection — browse live entities, expand nested structs, follow handle references, and watch field values update in real time.
+
+```bash
+# Dump + stay live
+dezlock-dump.exe --all --live
+
+# Or skip injection entirely — load an existing dump and serve it
+dezlock-dump.exe --schema schema-dump/deadlock/_all-modules.json
+```
+
+Then open `viewer/index.html` and hit **Connect Live** (or paste `ws://127.0.0.1:9100` into the header bar). The Entities tab appears once connected.
+
 ## Build from Source
 
 Requires Visual Studio 2022 with C++ desktop workload and CMake 3.20+ (ships with VS2022).
@@ -203,6 +219,18 @@ Or just run `build.bat`. Output lands in `build/bin/Release/`.
 - Windows 10/11 (x64)
 - Target Source 2 game running with `client.dll` loaded
 - Run as **administrator**
+
+## Disclaimer
+
+This project is provided strictly for **educational and research purposes**. It is intended to help developers, researchers, and students understand game engine architecture, runtime type systems, and binary analysis techniques.
+
+- **No game modification.** The tool performs read-only memory inspection. It does not patch, hook, or alter game code or data at runtime.
+- **No competitive advantage.** This tool is not designed for use during online gameplay and provides no gameplay automation, aiming assistance, or any other form of unfair advantage.
+- **Use at your own risk.** Using this software may violate the Terms of Service of the target application. The author(s) accept no responsibility for account bans, suspensions, or other consequences resulting from its use.
+- **No warranty.** This software is provided "as is", without warranty of any kind, express or implied.
+- **Respect intellectual property.** The extracted schemas, class names, and type information remain the intellectual property of their respective owners. Do not redistribute extracted game data in ways that infringe on those rights.
+
+By using this software you acknowledge that you have read and understood this disclaimer and accept full responsibility for how you use it.
 
 ## Contributing
 

@@ -39,9 +39,24 @@ add_executable(dezlock-dump
     src/generate-signatures.cpp
     src/import-schema.cpp
     src/analyze-members.cpp
+    src/ws-server.cpp
+    src/live-bridge.cpp
 )
-target_include_directories(dezlock-dump PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(dezlock-dump PRIVATE user32 advapi32)
+target_include_directories(dezlock-dump PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/vendor          # asio.hpp, websocketpp/
+)
+target_compile_definitions(dezlock-dump PRIVATE
+    ASIO_STANDALONE
+    _WEBSOCKETPP_CPP11_INTERNAL_
+    _WEBSOCKETPP_CPP11_THREAD_
+    _WEBSOCKETPP_CPP11_FUNCTIONAL_
+    _WEBSOCKETPP_CPP11_SYSTEM_ERROR_
+    _WEBSOCKETPP_CPP11_RANDOM_DEVICE_
+    _WEBSOCKETPP_CPP11_MEMORY_
+    _WEBSOCKETPP_CPP11_TYPE_TRAITS_
+)
+target_link_libraries(dezlock-dump PRIVATE user32 advapi32 ws2_32)
 
 # --- Copy config files and scripts to output directory ---
 foreach(cfg patterns.json sdk-cherry-pick.json)
