@@ -1,6 +1,7 @@
 #define LOG_TAG "global-scanner"
 
 #include "global-scanner.hpp"
+#include "safe-memory.hpp"
 #include "schema-manager.hpp"
 #include "log.hpp"
 
@@ -9,19 +10,6 @@
 #include <unordered_set>
 
 namespace globals {
-
-// ============================================================================
-// Safe memory read (SEH protected — we're dereferencing arbitrary .data values)
-// ============================================================================
-
-static bool safe_read_u64(uintptr_t addr, uint64_t& out) {
-    __try {
-        out = *reinterpret_cast<const uint64_t*>(addr);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
 
 // ============================================================================
 // PE section walking
@@ -170,7 +158,7 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
                 if (!is_plausible_pointer(val)) continue;
 
                 uint64_t vtable_ptr = 0;
-                if (!safe_read_u64(val, vtable_ptr)) continue;
+                if (!safe_mem::read_u64(val, vtable_ptr)) continue;
                 if (vtable_ptr == 0) continue;
 
                 auto it = vtable_to_class.find(vtable_ptr);

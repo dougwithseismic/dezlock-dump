@@ -10,6 +10,7 @@
 #define LOG_TAG "string-scanner"
 
 #include "string-scanner.hpp"
+#include "safe-memory.hpp"
 #include "log.hpp"
 
 #include <Windows.h>
@@ -18,19 +19,6 @@
 #include <algorithm>
 
 namespace strings {
-
-// ============================================================================
-// SEH-safe memory reads
-// ============================================================================
-
-static bool safe_read_bytes(const void* src, void* dst, size_t len) {
-    __try {
-        memcpy(dst, src, len);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
 
 // ============================================================================
 // PE section discovery
@@ -234,7 +222,7 @@ static std::vector<CandidateString> collect_strings(uintptr_t mod_base) {
             // Try to read a string starting at pos
             char buf[520] = {};
             size_t max_read = (std::min)((size_t)(end - pos), sizeof(buf) - 1);
-            if (!safe_read_bytes(reinterpret_cast<const void*>(pos), buf, max_read)) {
+            if (!safe_mem::read_bytes(reinterpret_cast<const void*>(pos), buf, max_read)) {
                 pos += 16;
                 continue;
             }
@@ -295,7 +283,7 @@ static void scan_xrefs(std::vector<CandidateString>& candidates,
     for (const auto& sec : text_sections) {
         // Read entire section for fast scanning
         std::vector<uint8_t> code(sec.size);
-        if (!safe_read_bytes(reinterpret_cast<const void*>(sec.start), code.data(), sec.size))
+        if (!safe_mem::read_bytes(reinterpret_cast<const void*>(sec.start), code.data(), sec.size))
             continue;
 
         // Scan for LEA reg, [rip+disp32] and MOV reg, [rip+disp32]

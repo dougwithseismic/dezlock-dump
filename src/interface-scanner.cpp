@@ -16,6 +16,7 @@
 #define LOG_TAG "interface-scanner"
 
 #include "interface-scanner.hpp"
+#include "safe-memory.hpp"
 #include "log.hpp"
 
 #include <Windows.h>
@@ -25,43 +26,6 @@
 namespace interfaces {
 
 // ============================================================================
-// SEH-safe memory reads
-// ============================================================================
-
-static bool safe_read_u64(uintptr_t addr, uint64_t& out) {
-    __try {
-        out = *reinterpret_cast<const uint64_t*>(addr);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool safe_read_bytes(const void* src, void* dst, size_t len) {
-    __try {
-        memcpy(dst, src, len);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool safe_read_string(const char* src, char* dst, size_t max_len) {
-    __try {
-        size_t i = 0;
-        for (; i < max_len - 1; i++) {
-            dst[i] = src[i];
-            if (src[i] == '\0') return true;
-        }
-        dst[i] = '\0';
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        dst[0] = '\0';
-        return false;
-    }
-}
-
-// ============================================================================
 // Find InterfaceReg list head from CreateInterface function body
 // ============================================================================
 
@@ -69,7 +33,7 @@ static bool safe_read_string(const char* src, char* dst, size_t max_len) {
 // that loads the InterfaceReg* linked list head.
 static uintptr_t find_interface_list_head(uintptr_t func_addr) {
     uint8_t code[64];
-    if (!safe_read_bytes(reinterpret_cast<const void*>(func_addr), code, sizeof(code)))
+    if (!safe_mem::read_bytes(reinterpret_cast<const void*>(func_addr), code, sizeof(code)))
         return 0;
 
     for (size_t i = 0; i + 7 <= sizeof(code); i++) {
@@ -101,12 +65,12 @@ static uintptr_t find_interface_list_head(uintptr_t func_addr) {
         if (opcode == 0x8B) {
             // MOV — dereference to get the actual pointer
             uint64_t ptr_val = 0;
-            if (!safe_read_u64(target, ptr_val)) continue;
+            if (!safe_mem::read_u64(target, ptr_val)) continue;
             return static_cast<uintptr_t>(ptr_val);
         } else {
             // LEA — target is the static InterfaceReg* variable, dereference it
             uint64_t ptr_val = 0;
-            if (!safe_read_u64(target, ptr_val)) continue;
+            if (!safe_mem::read_u64(target, ptr_val)) continue;
             return static_cast<uintptr_t>(ptr_val);
         }
     }
@@ -160,7 +124,7 @@ static bool safe_call_factory(uint64_t create_fn, uintptr_t mod_base,
                 out_instance_rva = static_cast<uint32_t>(instance_addr - mod_base);
 
             uint64_t vtable_ptr = 0;
-            if (safe_read_u64(instance_addr, vtable_ptr)) {
+            if (safe_mem::read_u64(instance_addr, vtable_ptr)) {
                 if (vtable_ptr > mod_base)
                     out_vtable_rva = static_cast<uint32_t>(vtable_ptr - mod_base);
             }
@@ -191,9 +155,9 @@ static std::vector<InterfaceEntry> walk_interface_list(uintptr_t head, uintptr_t
         //   +0x10: InterfaceReg* m_pNext (8 bytes)
 
         uint64_t create_fn = 0, name_ptr = 0, next_ptr = 0;
-        if (!safe_read_u64(current + 0x00, create_fn)) break;
-        if (!safe_read_u64(current + 0x08, name_ptr)) break;
-        if (!safe_read_u64(current + 0x10, next_ptr)) break;
+        if (!safe_mem::read_u64(current + 0x00, create_fn)) break;
+        if (!safe_mem::read_u64(current + 0x08, name_ptr)) break;
+        if (!safe_mem::read_u64(current + 0x10, next_ptr)) break;
 
         // Validate name pointer
         if (name_ptr == 0) {
@@ -202,7 +166,7 @@ static std::vector<InterfaceEntry> walk_interface_list(uintptr_t head, uintptr_t
         }
 
         char name_buf[256] = {};
-        if (!safe_read_string(reinterpret_cast<const char*>(name_ptr), name_buf, sizeof(name_buf))) {
+        if (!safe_mem::read_string(reinterpret_cast<const char*>(name_ptr), name_buf, sizeof(name_buf))) {
             current = static_cast<uintptr_t>(next_ptr);
             continue;
         }
