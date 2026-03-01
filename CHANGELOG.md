@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Viewer rewritten in React + TypeScript + Vite + Tailwind CSS v4** — the 3,453-line monolithic `index.html` has been decomposed into 67 typed source files across a proper component architecture
+- Virtualized sidebar list via `react-window` (previously rendered up to 5,000 raw DOM nodes)
+- XSS vulnerabilities eliminated — React JSX auto-escapes all text content (previously 5 innerHTML injection points)
+- Per-instance debounced search (fixes global timer collision bug)
+- 11 duplicate table builders replaced with reusable `<DataTable>` and `<FieldTable>` components
+- 3 duplicate drilldown toggles replaced with reusable `<Drilldown>` component
+- 25+ global variables replaced with React state/context, properly scoped
+- 50+ inline style assignments replaced with Tailwind utility classes
+- Hash routing preserved (`#class/mod/name` format unchanged)
+- All live/entity features preserved: WebSocket connection, entity browser, field subscription, pointer drill-down, snapshot diff
+
+### Added
+- `viewer/` is now a standalone Vite project — `pnpm dev` for HMR development, `pnpm build` for static output
+- TypeScript type definitions for all schema, live, and entity data structures
+- React context providers for schema data, live client state, and theme
+- **Inline type expansion** — click the chevron next to any type reference to drill down into that class's fields without leaving the current view (recursive up to 3 levels deep)
+- **Per-row copy button** — hover any field row (top-level or nested) to reveal a "C" button that copies `[module]+offset name // type` to clipboard, with tick feedback
+- **Copy Pointer List button** — bulk-copy all pointer (`*`) fields in the current class's field section
+- "Go to full page" link in inline expansions opens in a new tab
+
 ## [1.6.0] - 2026-02-23
 
 ### Added

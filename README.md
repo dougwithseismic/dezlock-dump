@@ -15,6 +15,8 @@ Runtime schema + RTTI extraction tool for Source 2 games (Deadlock, CS2, Dota 2)
 
 ## What's New
 
+**Viewer rewrite** — The interactive viewer has been rebuilt from scratch with React 19 + TypeScript + Vite + Tailwind CSS v4. The 3,453-line monolithic HTML file is now 67 typed source files with virtualized lists, proper state management, and zero XSS vulnerabilities. All existing features preserved — same hash routing, same live entity inspector.
+
 **v1.6.0** — Protobuf descriptor scanner. Decodes embedded `.proto` definitions from game binaries — extracts named fields, types, and message hierarchies for protobuf-only classes like `CBaseUserCmdPB` that have no Source 2 schema registration.
 
 See the full [Changelog](CHANGELOG.md) for all releases.
@@ -172,23 +174,42 @@ Optional `patterns.json` for untyped globals that vtable scanning can't find (`d
 | `sdk/_patterns.hpp` | Runtime-scannable byte patterns for globals |
 | `sdk/_rtti-layouts.hpp` | Master include for all RTTI layout headers |
 | `sdk/<module>/_rtti/<Class>.hpp` | Per-class RTTI-inferred struct headers |
-| `viewer/index.html` | Interactive browser-based viewer for `_all-modules.json` |
+| `viewer/dist/index.html` | Interactive browser-based viewer for `_all-modules.json` |
 
 ## Interactive Viewer
 
-A browser-based viewer for exploring dump output interactively. Open `viewer/index.html` in any browser — no server, no build step, no dependencies.
+A React + TypeScript viewer for exploring dump output interactively. Built with Vite and Tailwind CSS v4.
 
-1. Open `viewer/index.html` directly from your filesystem
-2. Drop your `_all-modules.json` onto the landing page (or use the file picker)
-3. Browse classes, fields, enums, globals, and inheritance trees
+**Quick start (development):**
+
+```bash
+cd viewer
+pnpm install
+pnpm dev        # http://localhost:5173
+```
+
+**Production build:**
+
+```bash
+cd viewer
+pnpm build      # outputs to viewer/dist/
+```
+
+Then open `viewer/dist/index.html` in any browser, or use `pnpm dev` during development.
+
+1. Drop your `_all-modules.json` onto the landing page (or use the file picker)
+2. Browse classes, fields, enums, globals, protobuf messages, and inheritance trees
+3. Connect live to inspect entities in real time
 
 **Features:**
 - Searchable class/field/enum browser with module filtering (Ctrl+K to focus)
 - Sortable field offset tables with own/flattened inherited field toggle
 - Clickable inheritance chains — click any parent class to navigate
 - Global singletons browser with module grouping and pattern globals
-- Full inheritance tree with collapsible nodes
-- Dark/light theme toggle
+- Full inheritance tree with lazy-loaded collapsible nodes
+- Protobuf message browser with nested message/enum support
+- Dark/light theme toggle (persisted)
+- Virtualized sidebar for smooth scrolling with 5,000+ items
 - Works offline with 150MB+ JSON files (parses in a Web Worker)
 
 ### Live Server
@@ -203,7 +224,7 @@ dezlock-dump.exe --all --live
 dezlock-dump.exe --schema schema-dump/deadlock/_all-modules.json
 ```
 
-Then open `viewer/index.html` and hit **Connect Live** (or paste `ws://127.0.0.1:9100` into the header bar). The Entities tab appears once connected.
+Then open the viewer (`pnpm dev` or `viewer/dist/index.html`) and hit **Connect Live** (or paste `ws://127.0.0.1:9100` into the header bar). The Entities tab appears once connected.
 
 ## Build from Source
 
@@ -230,7 +251,7 @@ Articles explaining the engineering behind each major subsystem:
 - [Building an MSVC x64 RTTI Scanner from Scratch](docs/building-msvc-x64-rtti-scanner.md) — TypeDescriptor chains, vtable discovery, inheritance reconstruction across 23,000+ classes
 - [Manual DLL Mapping: How and Why We Skip LoadLibrary](docs/manual-dll-mapping-explained.md) — PE section copying, relocations, import resolution, SEH registration
 - [Auto-Discovering 10,000+ Global Singletons](docs/auto-discovering-global-singletons.md) — .data section scanning, vtable cross-referencing, pattern-based supplementary resolution
-- [Building an Interactive Binary Analysis Viewer](docs/building-a-binary-analysis-viewer.md) — Single-file architecture, Web Worker parsing, live WebSocket entity inspector
+- [Building an Interactive Binary Analysis Viewer](docs/building-a-binary-analysis-viewer.md) — React + TypeScript architecture, Web Worker parsing, live WebSocket entity inspector
 
 ## Disclaimer
 
