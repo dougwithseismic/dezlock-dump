@@ -36,6 +36,10 @@ endif()
 # --- dezlock-dump (CLI orchestrator exe) ---
 add_executable(dezlock-dump
     main.cpp
+    src/console.cpp
+    src/injector.cpp
+    src/cli.cpp
+    src/output-generator.cpp
     src/generate-signatures.cpp
     src/import-schema.cpp
     src/analyze-members.cpp
