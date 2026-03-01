@@ -29,34 +29,7 @@
 namespace {
 
 // ============================================================================
-// Minimal interface discovery (no full interface walker needed)
-// ============================================================================
-
-void* find_schema_system() {
-    HMODULE hmod = GetModuleHandleA("schemasystem.dll");
-    if (!hmod) {
-        LOG_E("schemasystem.dll not found");
-        return nullptr;
-    }
-
-    using CreateInterfaceFn = void*(*)(const char*, int*);
-    auto fn = reinterpret_cast<CreateInterfaceFn>(
-        GetProcAddress(hmod, "CreateInterface"));
-    if (!fn) {
-        LOG_E("CreateInterface export not found in schemasystem.dll");
-        return nullptr;
-    }
-
-    int ret = 0;
-    void* iface = fn("SchemaSystem_001", &ret);
-    if (!iface) {
-        LOG_E("SchemaSystem_001 interface not found");
-    }
-    return iface;
-}
-
-// ============================================================================
-// JSON export (writes directly to file, no TCP)
+// JSON utility functions
 // ============================================================================
 
 // Helper: check if a string is safe for JSON (all printable ASCII)
@@ -106,6 +79,47 @@ static bool write_field_json(FILE* fp, const schema::RuntimeField& f, bool first
     fprintf(fp, "}");
     return true;
 }
+
+// Helper: write a JSON string array inline
+static void write_json_string_array(FILE* fp, const std::vector<std::string>& arr) {
+    fprintf(fp, "[");
+    for (size_t i = 0; i < arr.size(); i++) {
+        if (i > 0) fprintf(fp, ", ");
+        fprintf(fp, "\"%s\"", json_escape(arr[i].c_str()).c_str());
+    }
+    fprintf(fp, "]");
+}
+
+// ============================================================================
+// Minimal interface discovery (no full interface walker needed)
+// ============================================================================
+
+void* find_schema_system() {
+    HMODULE hmod = GetModuleHandleA("schemasystem.dll");
+    if (!hmod) {
+        LOG_E("schemasystem.dll not found");
+        return nullptr;
+    }
+
+    using CreateInterfaceFn = void*(*)(const char*, int*);
+    auto fn = reinterpret_cast<CreateInterfaceFn>(
+        GetProcAddress(hmod, "CreateInterface"));
+    if (!fn) {
+        LOG_E("CreateInterface export not found in schemasystem.dll");
+        return nullptr;
+    }
+
+    int ret = 0;
+    void* iface = fn("SchemaSystem_001", &ret);
+    if (!iface) {
+        LOG_E("SchemaSystem_001 interface not found");
+    }
+    return iface;
+}
+
+// ============================================================================
+// JSON export (writes directly to file, no TCP)
+// ============================================================================
 
 bool write_export(schema::SchemaManager& mgr, const char* path,
                   const globals::GlobalMap& discovered,
@@ -183,23 +197,17 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
 
             // Class metadata
             if (!cls.metadata.empty()) {
-                fprintf(fp, "          \"metadata\": [");
-                for (size_t m = 0; m < cls.metadata.size(); m++) {
-                    if (m > 0) fprintf(fp, ", ");
-                    fprintf(fp, "\"%s\"", json_escape(cls.metadata[m].c_str()).c_str());
-                }
-                fprintf(fp, "],\n");
+                fprintf(fp, "          \"metadata\": ");
+                write_json_string_array(fp, cls.metadata);
+                fprintf(fp, ",\n");
             }
 
             auto* rtti = mgr.get_inheritance(cls.name, mod.c_str());
             if (rtti && !rtti->parent.empty()) {
                 fprintf(fp, "          \"parent\": \"%s\",\n", json_escape(rtti->parent.c_str()).c_str());
-                fprintf(fp, "          \"inheritance\": [");
-                for (size_t i = 0; i < rtti->chain.size(); i++) {
-                    if (i > 0) fprintf(fp, ", ");
-                    fprintf(fp, "\"%s\"", json_escape(rtti->chain[i].c_str()).c_str());
-                }
-                fprintf(fp, "],\n");
+                fprintf(fp, "          \"inheritance\": ");
+                write_json_string_array(fp, rtti->chain);
+                fprintf(fp, ",\n");
             } else {
                 fprintf(fp, "          \"parent\": null,\n");
                 fprintf(fp, "          \"inheritance\": [],\n");
@@ -351,12 +359,8 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
                         fprintf(fp, ", \"parent\": \"%s\"", info.parent.c_str());
                     fprintf(fp, ", \"function_count\": %d", (int)info.vtable_func_rvas.size());
                     if (!info.chain.empty()) {
-                        fprintf(fp, ", \"inheritance\": [");
-                        for (size_t j = 0; j < info.chain.size(); j++) {
-                            if (j > 0) fprintf(fp, ", ");
-                            fprintf(fp, "\"%s\"", info.chain[j].c_str());
-                        }
-                        fprintf(fp, "]");
+                        fprintf(fp, ", \"inheritance\": ");
+                        write_json_string_array(fp, info.chain);
                     }
                 }
 
@@ -533,12 +537,9 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
 
                 // Dependencies
                 if (!pf.dependencies.empty()) {
-                    fprintf(fp, "          \"dependencies\": [");
-                    for (size_t di = 0; di < pf.dependencies.size(); di++) {
-                        if (di > 0) fprintf(fp, ", ");
-                        fprintf(fp, "\"%s\"", json_escape(pf.dependencies[di].c_str()).c_str());
-                    }
-                    fprintf(fp, "],\n");
+                    fprintf(fp, "          \"dependencies\": ");
+                    write_json_string_array(fp, pf.dependencies);
+                    fprintf(fp, ",\n");
                 }
 
                 // Messages (recursive helper via lambda)
@@ -843,6 +844,220 @@ void run_pipe_server(HMODULE hModule) {
 }
 
 // ============================================================================
+// Phase functions — each phase handles one scanning stage
+// ============================================================================
+
+// Phase 1: Schema system walking
+// Discovers all modules with schema data and dumps classes, fields, enums.
+// Returns the module count (0 on failure).
+static int phase_schema(schema::SchemaManager& mgr, void* schema_sys) {
+    if (!mgr.init(schema_sys)) {
+        LOG_E("Schema manager init failed");
+        return 0;
+    }
+
+    LOG_I("Auto-discovering all modules with schema data...");
+    int module_count = mgr.dump_all_modules();
+    if (module_count == 0) {
+        LOG_E("No modules with schema data found");
+        return 0;
+    }
+
+    LOG_I("Schema: %d modules, %d classes, %d fields, %d static fields, %d enums, %d enumerators",
+          module_count, mgr.class_count(), mgr.total_field_count(),
+          mgr.total_static_field_count(), mgr.enum_count(), mgr.total_enumerator_count());
+
+    for (const auto& mod : mgr.dumped_modules()) {
+        LOG_I("  module: %s", mod.c_str());
+    }
+
+    return module_count;
+}
+
+// Phase 2: RTTI hierarchy building
+// Walks RTTI from schema modules first, then all loaded DLLs.
+// Resolves RTTI class names through SchemaSystem.
+static void phase_rtti(schema::SchemaManager& mgr) {
+    // Walk RTTI hierarchy from all modules that have schema data
+    LOG_I("Walking RTTI hierarchies (schema modules)...");
+    std::unordered_set<HMODULE> scanned_modules;
+    for (const auto& mod_name : mgr.dumped_modules()) {
+        HMODULE hmod = GetModuleHandleA(mod_name.c_str());
+        if (!hmod) continue;
+
+        MODULEINFO mi = {};
+        if (GetModuleInformation(GetCurrentProcess(), hmod, &mi, sizeof(mi))) {
+            mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage, mod_name.c_str());
+            scanned_modules.insert(hmod);
+            LOG_I("  RTTI %s: %d classes total", mod_name.c_str(), mgr.rtti_class_count());
+        }
+    }
+
+    // Walk RTTI from ALL loaded DLLs (catches panorama.dll, tier0.dll, etc.)
+    // These have vtables but no SchemaSystem type scopes.
+    LOG_I("Walking RTTI hierarchies (all loaded DLLs)...");
+    {
+        HMODULE modules_arr[512];
+        DWORD needed = 0;
+        if (EnumProcessModules(GetCurrentProcess(), modules_arr, sizeof(modules_arr), &needed)) {
+            int extra_count = 0;
+            int mod_count = needed / sizeof(HMODULE);
+            for (int i = 0; i < mod_count; i++) {
+                if (scanned_modules.count(modules_arr[i])) continue;
+
+                char mod_path[MAX_PATH];
+                if (!GetModuleFileNameA(modules_arr[i], mod_path, MAX_PATH)) continue;
+
+                // Extract just the filename
+                const char* slash = strrchr(mod_path, '\\');
+                const char* mod_name = slash ? slash + 1 : mod_path;
+
+                // Skip system DLLs (ntdll, kernel32, etc.) — only scan .dll in game dirs
+                // Quick heuristic: skip anything in Windows\System32 or WinSxS
+                if (strstr(mod_path, "\\Windows\\") || strstr(mod_path, "\\windows\\"))
+                    continue;
+
+                MODULEINFO mi = {};
+                if (!GetModuleInformation(GetCurrentProcess(), modules_arr[i], &mi, sizeof(mi)))
+                    continue;
+
+                // Skip tiny modules (unlikely to have meaningful RTTI)
+                if (mi.SizeOfImage < 0x10000) continue;
+
+                int before = mgr.rtti_class_count();
+                mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage, mod_name);
+                int found = mgr.rtti_class_count() - before;
+                if (found > 0) {
+                    LOG_I("  RTTI %s: +%d classes (%d total)", mod_name, found, mgr.rtti_class_count());
+                    extra_count += found;
+                }
+            }
+            LOG_I("Extra RTTI scan: +%d classes from non-schema DLLs", extra_count);
+        }
+    }
+
+    // Resolve RTTI class names through SchemaSystem for all dumped modules
+    LOG_I("Resolving RTTI classes through SchemaSystem...");
+    {
+        int resolved = 0;
+        const auto& rtti_map = mgr.rtti_map();
+        for (const auto& [key, info] : rtti_map) {
+            std::string bare = schema::rtti_class_name(key);
+            // Try each dumped module
+            for (const auto& mod_name : mgr.dumped_modules()) {
+                auto* cls = mgr.find_class(mod_name.c_str(), bare.c_str());
+                if (cls) { resolved++; break; }
+            }
+        }
+        LOG_I("Resolved %d/%d RTTI classes with schema data", resolved, mgr.rtti_class_count());
+    }
+
+    LOG_I("Total: %d classes, %d fields, %d static, %d enums",
+          mgr.class_count(), mgr.total_field_count(),
+          mgr.total_static_field_count(), mgr.enum_count());
+}
+
+// Phase 3: Global singleton scanning
+// Scans .data sections for objects whose vtables match known RTTI classes.
+static globals::GlobalMap phase_globals(schema::SchemaManager& mgr) {
+    LOG_I("Scanning .data sections for global singletons...");
+
+    // Build set of class names that have schema data (for tagging)
+    std::unordered_set<std::string> schema_classes;
+    for (const auto& [key, cls] : mgr.cache()) {
+        // Cache key is "module::ClassName", extract just the class name
+        auto sep = key.find("::");
+        if (sep != std::string::npos)
+            schema_classes.insert(key.substr(sep + 2));
+        else
+            schema_classes.insert(key);
+    }
+    LOG_I("Schema class set: %d classes for tagging", (int)schema_classes.size());
+
+    globals::GlobalMap discovered = globals::scan(mgr.rtti_map(), schema_classes);
+    {
+        int total = 0;
+        for (const auto& [mod, entries] : discovered) total += (int)entries.size();
+        LOG_I("Auto-discovered %d globals", total);
+    }
+
+    return discovered;
+}
+
+// Phase 4: Pattern-based global resolution (supplementary)
+// Reads patterns.json from temp dir and resolves IDA-style patterns.
+struct PatternResult {
+    pattern::ResultMap results;
+    pattern::PatternConfig config;
+};
+
+static PatternResult phase_patterns(const char* temp_dir) {
+    PatternResult out;
+
+    char patterns_path[MAX_PATH];
+    snprintf(patterns_path, MAX_PATH, "%sdezlock-patterns.json", temp_dir);
+
+    if (pattern::load_config(patterns_path, out.config)) {
+        LOG_I("Running supplementary pattern scan (%d patterns)...", (int)out.config.entries.size());
+        out.results = pattern::resolve_all(out.config);
+
+        int found = 0, total = 0;
+        for (const auto& [mod, results] : out.results) {
+            for (const auto& r : results) {
+                total++;
+                if (r.found) found++;
+            }
+        }
+        LOG_I("Patterns: %d/%d resolved", found, total);
+    } else {
+        LOG_I("No patterns.json — pattern globals skipped (auto-discovery is primary)");
+    }
+
+    return out;
+}
+
+// Phase 5: Interface scanning
+// Enumerates CreateInterface registrations across all loaded DLLs.
+static interfaces::InterfaceMap phase_interfaces() {
+    LOG_I("Scanning CreateInterface registrations...");
+    interfaces::InterfaceMap iface_map = interfaces::scan();
+    {
+        int total = 0;
+        for (const auto& [mod, entries] : iface_map) total += (int)entries.size();
+        LOG_I("Discovered %d interfaces across %d modules", total, (int)iface_map.size());
+    }
+    return iface_map;
+}
+
+// Phase 6: String scanning
+// Scans for string references and code cross-references.
+static strings::StringMap phase_strings(schema::SchemaManager& mgr) {
+    LOG_I("Scanning string references...");
+    std::unordered_set<std::string> rtti_class_names;
+    for (const auto& [key, info] : mgr.rtti_map()) {
+        rtti_class_names.insert(schema::rtti_class_name(key));
+    }
+    strings::StringMap string_map = strings::scan(rtti_class_names);
+    {
+        int total_str = 0, total_xref = 0;
+        for (const auto& [mod, data] : string_map) {
+            total_str += data.summary.total_strings;
+            total_xref += data.summary.total_xrefs;
+        }
+        LOG_I("Found %d strings with %d xrefs across %d modules",
+              total_str, total_xref, (int)string_map.size());
+    }
+    return string_map;
+}
+
+// Phase 7: Protobuf extraction
+// Scans for embedded protobuf descriptors in loaded modules.
+static protobuf_scan::ProtoMap phase_protobuf() {
+    LOG_I("Scanning for protobuf descriptors...");
+    return protobuf_scan::scan();
+}
+
+// ============================================================================
 // Main worker thread
 // ============================================================================
 
@@ -900,188 +1115,33 @@ void worker_thread(HMODULE hModule) {
         }
         LOG_I("SchemaSystem: %p", schema_sys);
 
-        // Init schema manager
         auto& mgr = schema::instance();
-        if (!mgr.init(schema_sys)) {
-            LOG_E("Schema manager init failed");
+
+        // Phase 1: Schema system walking
+        if (phase_schema(mgr, schema_sys) == 0)
             goto done;
-        }
 
-        // Auto-discover and dump ALL modules with schema data
-        LOG_I("Auto-discovering all modules with schema data...");
-        {
-            int module_count = mgr.dump_all_modules();
-            if (module_count == 0) {
-                LOG_E("No modules with schema data found");
-                goto done;
-            }
-            LOG_I("Schema: %d modules, %d classes, %d fields, %d static fields, %d enums, %d enumerators",
-                  module_count, mgr.class_count(), mgr.total_field_count(),
-                  mgr.total_static_field_count(), mgr.enum_count(), mgr.total_enumerator_count());
+        // Phase 2: RTTI hierarchy building
+        phase_rtti(mgr);
 
-            // Log discovered modules
-            for (const auto& mod : mgr.dumped_modules()) {
-                LOG_I("  module: %s", mod.c_str());
-            }
-        }
+        // Phase 3: Global singleton scanning
+        globals::GlobalMap discovered = phase_globals(mgr);
 
-        // Walk RTTI hierarchy from all modules that have schema data
-        LOG_I("Walking RTTI hierarchies (schema modules)...");
-        std::unordered_set<HMODULE> scanned_modules;
-        for (const auto& mod_name : mgr.dumped_modules()) {
-            HMODULE hmod = GetModuleHandleA(mod_name.c_str());
-            if (!hmod) continue;
+        // Phase 4: Pattern-based global resolution
+        PatternResult pat = phase_patterns(temp_dir);
 
-            MODULEINFO mi = {};
-            if (GetModuleInformation(GetCurrentProcess(), hmod, &mi, sizeof(mi))) {
-                mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage, mod_name.c_str());
-                scanned_modules.insert(hmod);
-                LOG_I("  RTTI %s: %d classes total", mod_name.c_str(), mgr.rtti_class_count());
-            }
-        }
+        // Phase 5: Interface scanning
+        interfaces::InterfaceMap iface_map = phase_interfaces();
 
-        // Walk RTTI from ALL loaded DLLs (catches panorama.dll, tier0.dll, etc.)
-        // These have vtables but no SchemaSystem type scopes.
-        LOG_I("Walking RTTI hierarchies (all loaded DLLs)...");
-        {
-            HMODULE modules_arr[512];
-            DWORD needed = 0;
-            if (EnumProcessModules(GetCurrentProcess(), modules_arr, sizeof(modules_arr), &needed)) {
-                int extra_count = 0;
-                int mod_count = needed / sizeof(HMODULE);
-                for (int i = 0; i < mod_count; i++) {
-                    if (scanned_modules.count(modules_arr[i])) continue;
+        // Phase 6: String scanning
+        strings::StringMap string_map = phase_strings(mgr);
 
-                    char mod_path[MAX_PATH];
-                    if (!GetModuleFileNameA(modules_arr[i], mod_path, MAX_PATH)) continue;
-
-                    // Extract just the filename
-                    const char* slash = strrchr(mod_path, '\\');
-                    const char* mod_name = slash ? slash + 1 : mod_path;
-
-                    // Skip system DLLs (ntdll, kernel32, etc.) — only scan .dll in game dirs
-                    // Quick heuristic: skip anything in Windows\System32 or WinSxS
-                    if (strstr(mod_path, "\\Windows\\") || strstr(mod_path, "\\windows\\"))
-                        continue;
-
-                    MODULEINFO mi = {};
-                    if (!GetModuleInformation(GetCurrentProcess(), modules_arr[i], &mi, sizeof(mi)))
-                        continue;
-
-                    // Skip tiny modules (unlikely to have meaningful RTTI)
-                    if (mi.SizeOfImage < 0x10000) continue;
-
-                    int before = mgr.rtti_class_count();
-                    mgr.load_rtti(reinterpret_cast<uintptr_t>(mi.lpBaseOfDll), mi.SizeOfImage, mod_name);
-                    int found = mgr.rtti_class_count() - before;
-                    if (found > 0) {
-                        LOG_I("  RTTI %s: +%d classes (%d total)", mod_name, found, mgr.rtti_class_count());
-                        extra_count += found;
-                    }
-                }
-                LOG_I("Extra RTTI scan: +%d classes from non-schema DLLs", extra_count);
-            }
-        }
-
-        // Resolve RTTI class names through SchemaSystem for all dumped modules
-        LOG_I("Resolving RTTI classes through SchemaSystem...");
-        {
-            int resolved = 0;
-            const auto& rtti_map = mgr.rtti_map();
-            for (const auto& [key, info] : rtti_map) {
-                std::string bare = schema::rtti_class_name(key);
-                // Try each dumped module
-                for (const auto& mod_name : mgr.dumped_modules()) {
-                    auto* cls = mgr.find_class(mod_name.c_str(), bare.c_str());
-                    if (cls) { resolved++; break; }
-                }
-            }
-            LOG_I("Resolved %d/%d RTTI classes with schema data", resolved, mgr.rtti_class_count());
-        }
-
-        LOG_I("Total: %d classes, %d fields, %d static, %d enums",
-              mgr.class_count(), mgr.total_field_count(),
-              mgr.total_static_field_count(), mgr.enum_count());
-
-        // ---- Auto-discover globals via .data vtable scan ----
-        LOG_I("Scanning .data sections for global singletons...");
-
-        // Build set of class names that have schema data (for tagging)
-        std::unordered_set<std::string> schema_classes;
-        for (const auto& [key, cls] : mgr.cache()) {
-            // Cache key is "module::ClassName", extract just the class name
-            auto sep = key.find("::");
-            if (sep != std::string::npos)
-                schema_classes.insert(key.substr(sep + 2));
-            else
-                schema_classes.insert(key);
-        }
-        LOG_I("Schema class set: %d classes for tagging", (int)schema_classes.size());
-
-        globals::GlobalMap discovered = globals::scan(mgr.rtti_map(), schema_classes);
-        {
-            int total = 0;
-            for (const auto& [mod, entries] : discovered) total += (int)entries.size();
-            LOG_I("Auto-discovered %d globals", total);
-        }
-
-        // ---- Optional: pattern-based globals (supplementary) ----
-        pattern::ResultMap pattern_globals;
-        pattern::PatternConfig pattern_config;
-        {
-            char patterns_path[MAX_PATH];
-            snprintf(patterns_path, MAX_PATH, "%sdezlock-patterns.json", temp_dir);
-
-            if (pattern::load_config(patterns_path, pattern_config)) {
-                LOG_I("Running supplementary pattern scan (%d patterns)...", (int)pattern_config.entries.size());
-                pattern_globals = pattern::resolve_all(pattern_config);
-
-                int found = 0, total = 0;
-                for (const auto& [mod, results] : pattern_globals) {
-                    for (const auto& r : results) {
-                        total++;
-                        if (r.found) found++;
-                    }
-                }
-                LOG_I("Patterns: %d/%d resolved", found, total);
-            } else {
-                LOG_I("No patterns.json — pattern globals skipped (auto-discovery is primary)");
-            }
-        }
-
-        // ---- Enumerate CreateInterface registrations ----
-        LOG_I("Scanning CreateInterface registrations...");
-        interfaces::InterfaceMap iface_map = interfaces::scan();
-        {
-            int total = 0;
-            for (const auto& [mod, entries] : iface_map) total += (int)entries.size();
-            LOG_I("Discovered %d interfaces across %d modules", total, (int)iface_map.size());
-        }
-
-        // ---- Scan for string references + code xrefs ----
-        LOG_I("Scanning string references...");
-        std::unordered_set<std::string> rtti_class_names;
-        for (const auto& [key, info] : mgr.rtti_map()) {
-            rtti_class_names.insert(schema::rtti_class_name(key));
-        }
-        strings::StringMap string_map = strings::scan(rtti_class_names);
-        {
-            int total_str = 0, total_xref = 0;
-            for (const auto& [mod, data] : string_map) {
-                total_str += data.summary.total_strings;
-                total_xref += data.summary.total_xrefs;
-            }
-            LOG_I("Found %d strings with %d xrefs across %d modules",
-                  total_str, total_xref, (int)string_map.size());
-        }
-
-        // ---- Scan for embedded protobuf descriptors ----
-        LOG_I("Scanning for protobuf descriptors...");
-        protobuf_scan::ProtoMap proto_map = protobuf_scan::scan();
+        // Phase 7: Protobuf extraction
+        protobuf_scan::ProtoMap proto_map = phase_protobuf();
 
         // Export to JSON (all modules)
         LOG_I("Writing JSON export...");
-        write_export(mgr, json_path, discovered, pattern_globals, pattern_config,
+        write_export(mgr, json_path, discovered, pat.results, pat.config,
                      iface_map, string_map, proto_map);
 
     }
