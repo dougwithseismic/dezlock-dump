@@ -1146,6 +1146,23 @@ table.inline-expand-table {
 .inline-expand-table .inline-expand-row {
   margin-left: 20px;
 }
+.inline-expand-table .f-live {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inline-expand-table .f-live.live-diff-flash {
+  animation: diffFlash 0.6s ease-out;
+}
+
+/* ── Inspector inline expand ──────────────────────────────────── */
+.insp-inline-expand-wrap {
+  padding: 4px 8px 8px 24px;
+  border-bottom: 1px solid var(--brd-l);
+  background: var(--bg1);
+}
 
 /* ── Inspector virtual scroll ─────────────────────────────────── */
 .insp-virtual-wrap {

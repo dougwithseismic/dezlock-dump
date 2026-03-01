@@ -3,13 +3,14 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useSchema } from '../../context/schema-context'
 import { useLive } from '../../context/live-context'
 import { flatFields } from '../../lib/flat-fields'
-import { liveEditorType } from '../../lib/format'
+import { liveEditorType, extractType } from '../../lib/format'
 import type { EntityListItem } from '../../types/entity'
 import type { FlatField } from '../../types/schema'
 import type { DiffChanges } from '../../types/live'
 import { EntityInspectorToolbar } from './entity-inspector-toolbar'
 import { EntityInspectorField } from './entity-inspector-field'
 import { ColumnResizeHandle } from './column-resize-handle'
+import { InlineClassExpander } from '../shared/inline-class-expander'
 
 interface EntityInspectorPaneProps {
   entity: EntityListItem | null
@@ -20,6 +21,19 @@ interface EntityInspectorPaneProps {
 type VirtualItem =
   | { type: 'section-header'; groupName: string; fieldCount: number }
   | { type: 'field'; field: FlatField; groupName: string }
+  | { type: 'inline-expand'; typeName: string; typeMod: string; fieldKey: string; parentFieldName: string }
+
+function extractNestedLiveValues(
+  liveValues: Record<string, unknown>,
+  fieldName: string,
+): Record<string, unknown> | undefined {
+  const val = liveValues[fieldName]
+  if (val && typeof val === 'object' && '_t' in (val as Record<string, unknown>)) {
+    const sv = val as { _t: string; fields?: Record<string, unknown> }
+    if (sv._t === 'struct' && sv.fields) return sv.fields
+  }
+  return undefined
+}
 
 export function EntityInspectorPane({
   entity,
@@ -27,13 +41,15 @@ export function EntityInspectorPane({
   onFollowEntity,
 }: EntityInspectorPaneProps) {
   const { client, connected } = useLive()
-  const { classMap, enumMap } = useSchema()
+  const { classMap, enumMap, resolveClassMod } = useSchema()
   const [fieldFilter, setFieldFilter] = useState('')
+  const [expandedFields, setExpandedFields] = useState<Set<string>>(new Set())
   const [showChanged, setShowChanged] = useState(false)
   const [snapshotActive, setSnapshotActive] = useState(false)
   const [liveValues, setLiveValues] = useState<Record<string, unknown>>({})
   const [changedFields, setChangedFields] = useState<Set<string>>(new Set())
   const [diffFlashFields, setDiffFlashFields] = useState<Set<string>>(new Set())
+  const [flashTick, setFlashTick] = useState(0)
   const [collapsedSections, setCollapsedSections] = useState<Map<string, boolean>>(new Map())
 
   const snapshotRef = useRef<Record<string, string>>({})
@@ -92,24 +108,47 @@ export function EntityInspectorPane({
       items.push({ type: 'section-header', groupName: group.name, fieldCount: group.fields.length })
       if (!collapsedSections.get(group.name)) {
         for (const field of visibleFields) {
+          const fieldKey = field.name + ':' + field.offset
           items.push({ type: 'field', field, groupName: group.name })
+          if (expandedFields.has(fieldKey)) {
+            const typeName = extractType(field.type)
+            const typeMod = typeName ? resolveClassMod(typeName, mod) : null
+            if (typeName && typeMod) {
+              items.push({ type: 'inline-expand', typeName, typeMod, fieldKey, parentFieldName: field.name })
+            }
+          }
         }
       }
     }
     return items
-  }, [groups, isFieldVisible, collapsedSections])
+  }, [groups, isFieldVisible, collapsedSections, expandedFields, resolveClassMod, mod])
 
   const virtualizer = useVirtualizer({
     count: virtualItems.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: (i) => virtualItems[i].type === 'section-header' ? 30 : 28,
+    estimateSize: (i) => {
+      const item = virtualItems[i]
+      if (item.type === 'section-header') return 30
+      if (item.type === 'inline-expand') return 250
+      return 28
+    },
     overscan: 20,
+    measureElement: (el) => el.getBoundingClientRect().height,
   })
 
   const toggleSection = useCallback((name: string) => {
     setCollapsedSections((prev) => {
       const next = new Map(prev)
       next.set(name, !prev.get(name))
+      return next
+    })
+  }, [])
+
+  const toggleFieldExpand = useCallback((fieldKey: string) => {
+    setExpandedFields((prev) => {
+      const next = new Set(prev)
+      if (next.has(fieldKey)) next.delete(fieldKey)
+      else next.add(fieldKey)
       return next
     })
   }, [])
@@ -151,6 +190,7 @@ export function EntityInspectorPane({
           return next
         })
         setDiffFlashFields(flashSet)
+        setFlashTick((t) => t + 1)
         if (flashTimerRef.current) clearTimeout(flashTimerRef.current)
         flashTimerRef.current = setTimeout(() => setDiffFlashFields(new Set()), 400)
       }
@@ -193,6 +233,7 @@ export function EntityInspectorPane({
     setLiveValues({})
     setChangedFields(new Set())
     setSnapshotActive(false)
+    setExpandedFields(new Set())
 
     let cancelled = false
 
@@ -342,14 +383,18 @@ export function EntityInspectorPane({
                     top: 0,
                     left: 0,
                     width: '100%',
-                    height: vRow.size,
                     transform: `translateY(${vRow.start}px)`,
                   }
 
                   if (item.type === 'section-header') {
                     const isCollapsed = collapsedSections.get(item.groupName) || false
                     return (
-                      <div key={'sh-' + item.groupName} style={style}>
+                      <div
+                        key={'sh-' + item.groupName}
+                        ref={virtualizer.measureElement}
+                        data-index={vRow.index}
+                        style={style}
+                      >
                         <div
                           className="insp-section-hdr"
                           onClick={() => toggleSection(item.groupName)}
@@ -374,9 +419,45 @@ export function EntityInspectorPane({
                     )
                   }
 
+                  if (item.type === 'inline-expand') {
+                    const nestedLive = extractNestedLiveValues(liveValues, item.parentFieldName) ?? {}
+                    return (
+                      <div
+                        key={'ie-' + item.fieldKey}
+                        ref={virtualizer.measureElement}
+                        data-index={vRow.index}
+                        style={style}
+                      >
+                        <div className="insp-inline-expand-wrap">
+                          <InlineClassExpander
+                            className={item.typeName}
+                            module={item.typeMod}
+                            preferModule={mod}
+                            depth={1}
+                            copyPrefix={`[${mod}] ${item.typeName}`}
+                            liveValues={nestedLive}
+                            enumMap={enumMap as Map<string, { o: { items?: { name: string; value: number }[] } }>}
+                            classMap={classMap as Map<string, unknown>}
+                            selectedEntityAddr={entity.addr}
+                          />
+                        </div>
+                      </div>
+                    )
+                  }
+
                   const f = item.field
+                  const fieldKey = f.name + ':' + f.offset
+                  const typeName = extractType(f.type)
+                  const typeMod = typeName ? resolveClassMod(typeName, mod) : null
+                  const canExpand = !!typeName && !!typeMod
+                  const isFieldExpanded = expandedFields.has(fieldKey)
                   return (
-                    <div key={'f-' + f.name + f.offset} style={style}>
+                    <div
+                      key={'f-' + f.name + f.offset}
+                      ref={virtualizer.measureElement}
+                      data-index={vRow.index}
+                      style={style}
+                    >
                       <EntityInspectorField
                         name={f.name}
                         type={f.type}
@@ -385,6 +466,7 @@ export function EntityInspectorPane({
                         editorType={liveEditorType(f.type, enumMap as Map<string, { o: { items?: { name: string; value: number }[] } }>, classMap as Map<string, unknown>)}
                         module={mod}
                         diffFlash={diffFlashFields.has(f.name)}
+                        flashTick={flashTick}
                         diffTitle={
                           changedFields.has(f.name) && snapshotRef.current[f.name]
                             ? 'Was: ' + snapshotRef.current[f.name]
@@ -393,6 +475,8 @@ export function EntityInspectorPane({
                         enumMap={enumMap as Map<string, { o: { items?: { name: string; value: number }[] } }>}
                         classMap={classMap as Map<string, unknown>}
                         selectedEntityAddr={entity.addr}
+                        onExpand={canExpand ? () => toggleFieldExpand(fieldKey) : undefined}
+                        isExpanded={isFieldExpanded}
                       />
                     </div>
                   )

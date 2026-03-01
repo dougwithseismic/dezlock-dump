@@ -101,6 +101,7 @@ export function FieldTable({ fields, showDefinedIn, preferModule, showLiveValues
             const edType = liveEditorType(f.type, enumMap as Map<string, unknown>, classMap as Map<string, unknown>)
             const canExpand = !!typeName && !!typeMod
             const isExpanded = expandedRows.has(vRow.index)
+            const copyLine = `[${preferModule || ''}]+${h(f.offset)} ${f.name}`
 
             return (
               <div
@@ -122,7 +123,7 @@ export function FieldTable({ fields, showDefinedIn, preferModule, showLiveValues
                   <div className="vt-grid-cell f-off">{h(f.offset)}</div>
                   <div className="vt-grid-cell f-name">
                     {f.name}
-                    <CopyFieldButton text={`[${preferModule || ''}]+${h(f.offset)} ${f.name} // ${f.type || ''}`} />
+                    <CopyFieldButton text={`${copyLine} // ${f.type || ''}`} />
                   </div>
                   <div className="vt-grid-cell f-type">
                     {typeName && typeMod ? (
@@ -185,6 +186,7 @@ export function FieldTable({ fields, showDefinedIn, preferModule, showLiveValues
                       module={typeMod}
                       preferModule={preferModule}
                       depth={1}
+                      copyPrefix={copyLine}
                     />
                   </div>
                 )}

@@ -1,3 +1,4 @@
+import { useRef, useLayoutEffect } from 'react'
 import { useSchema } from '../../context/schema-context'
 import { extractType } from '../../lib/format'
 import { ClassLink } from '../shared/class-link'
@@ -11,10 +12,13 @@ interface EntityInspectorFieldProps {
   editorType: string
   module: string
   diffFlash?: boolean
+  flashTick?: number
   diffTitle?: string
   enumMap?: Map<string, { o: { items?: { name: string; value: number }[] } }>
   classMap?: Map<string, unknown>
   selectedEntityAddr?: string
+  onExpand?: () => void
+  isExpanded?: boolean
 }
 
 export function EntityInspectorField({
@@ -24,12 +28,26 @@ export function EntityInspectorField({
   liveValue,
   module,
   diffFlash = false,
+  flashTick,
   diffTitle,
   enumMap,
   classMap,
   selectedEntityAddr,
+  onExpand,
+  isExpanded,
 }: EntityInspectorFieldProps) {
   const { enumMap: schemaEnumMap, resolveClassMod } = useSchema()
+  const valRef = useRef<HTMLDivElement>(null)
+
+  // Force CSS animation restart when flashTick changes while flashing
+  useLayoutEffect(() => {
+    if (diffFlash && valRef.current) {
+      const el = valRef.current
+      el.style.animation = 'none'
+      void el.offsetHeight
+      el.style.animation = ''
+    }
+  }, [diffFlash, flashTick])
 
   const typeName = extractType(type)
   const typeModule = typeName ? resolveClassMod(typeName, module) : null
@@ -49,7 +67,13 @@ export function EntityInspectorField({
           {' '}
           {typeName && typeModule ? (
             <>
-              <ClassLink name={typeName} module={typeModule} preferModule={module} />
+              <ClassLink
+                name={typeName}
+                module={typeModule}
+                preferModule={module}
+                onExpand={onExpand}
+                isExpanded={isExpanded}
+              />
               {rest && ' ' + rest}
             </>
           ) : typeName && typeEnumEntry ? (
@@ -73,6 +97,7 @@ export function EntityInspectorField({
         </span>
       </div>
       <div
+        ref={valRef}
         className={
           'insp-field-val live-val' + (diffFlash ? ' live-diff-flash' : '')
         }

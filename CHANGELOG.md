@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Entity inspector: live values in inline drill-down** — expanding a type (e.g. `CBodyComponent*`) in the entity inspector now shows a 5th "Live" column with real-time values from the parent entity subscription; nested struct data is extracted and passed recursively; pointer fields gracefully fall back to dashes
+- **Entity sidebar list** — extracted `EntitySidebarList` component for cleaner entity tab architecture
+- **Entity context** — new `EntityContext` provider to share entity state across components
+
+### Fixed
+- **Diff flash animation not restarting on rapid changes** — when the same field changed again before the 400ms clear timer fired, the CSS animation never replayed; added a `flashTick` counter with `useLayoutEffect` to force animation restart via DOM reflow
+- **Hook ordering crash in SidebarList** — early return before `useMemo`/`useCallback` caused "Rendered fewer hooks" React crash when toggling tabs
+
+### Changed
+- **InlineClassExpander** accepts optional `liveValues`, `enumMap`, `classMap`, `selectedEntityAddr` props; conditionally renders a "Live" column when values are provided; class view remains unchanged
+- **EntityInspectorPane** passes live values and schema maps through to `InlineClassExpander` for inline-expand virtual items; `parentFieldName` added to inline-expand VirtualItem type
+- **EntityInspectorField** gains `flashTick` prop for reliable diff flash restart
+- Entity view refactored — simplified by extracting sidebar and context logic
+
+## [1.7.0] - 2026-03-01
+
 ### Changed
 - **Viewer rewritten in React + TypeScript + Vite + Tailwind CSS v4** — the 3,453-line monolithic `index.html` has been decomposed into 67 typed source files across a proper component architecture
 - Virtualized sidebar list via `react-window` (previously rendered up to 5,000 raw DOM nodes)

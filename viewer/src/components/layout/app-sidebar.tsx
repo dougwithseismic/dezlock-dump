@@ -67,9 +67,11 @@ export function AppSidebar({ activeTab, open, onClose, searchInputRef }: AppSide
         <div data-sidebar-search>
           <SidebarSearch searchInputRef={searchInputRef} onSelect={handleSelect} />
         </div>
-        <div data-sidebar-filter>
-          <ModuleFilter />
-        </div>
+        {activeTab !== 'entities' && (
+          <div data-sidebar-filter>
+            <ModuleFilter />
+          </div>
+        )}
         <SidebarList activeTab={activeTab} height={listHeight} />
       </aside>
     </>

@@ -3,6 +3,7 @@ import { List } from 'react-window'
 import { useSchema } from '../../context/schema-context'
 import { useHashRouter } from '../../hooks/use-hash-router'
 import { SidebarItemRow } from './sidebar-item'
+import { EntitySidebarList } from '../entity/entity-sidebar-list'
 import { fnum } from '../../lib/format'
 import { CATEGORY_LABELS, type TabName, type CategoryCode } from '../../lib/constants'
 import type { SidebarItem } from '../../types/schema'
@@ -51,6 +52,8 @@ export function SidebarList({ activeTab, height }: SidebarListProps) {
   const { route, navigate } = useHashRouter()
 
   const { items, category } = useMemo(() => {
+    if (activeTab === 'entities') return { items: [] as SidebarItem[], category: 'c' as CategoryCode }
+
     let filtered: SidebarItem[] = []
     let cat: CategoryCode = 'c'
 
@@ -93,6 +96,11 @@ export function SidebarList({ activeTab, height }: SidebarListProps) {
     },
     [navigate, classMap],
   )
+
+  // Entities tab gets its own sidebar component (after all hooks)
+  if (activeTab === 'entities') {
+    return <EntitySidebarList height={height} />
+  }
 
   if (items.length === 0) {
     return (

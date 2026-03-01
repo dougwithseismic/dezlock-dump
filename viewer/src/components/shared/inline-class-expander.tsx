@@ -3,6 +3,7 @@ import { useSchema } from '../../context/schema-context'
 import { h, extractType } from '../../lib/format'
 import { ClassLink } from './class-link'
 import { CopyFieldButton } from './copy-field-button'
+import { LiveValueCell } from '../live-renderers/live-value-cell'
 import type { Field } from '../../types/schema'
 
 interface InlineClassExpanderProps {
@@ -10,19 +11,48 @@ interface InlineClassExpanderProps {
   module: string
   preferModule?: string
   depth?: number
+  copyPrefix: string
+  liveValues?: Record<string, unknown>
+  enumMap?: Map<string, { o: { items?: { name: string; value: number }[] } }>
+  classMap?: Map<string, unknown>
+  selectedEntityAddr?: string
 }
 
 const MAX_DEPTH = 3
 
-export function InlineClassExpander({ className, module, preferModule, depth = 1 }: InlineClassExpanderProps) {
-  const { classMap, resolveClassMod } = useSchema()
+function extractNestedLiveValues(
+  liveValues: Record<string, unknown> | undefined,
+  fieldName: string,
+): Record<string, unknown> | undefined {
+  if (!liveValues) return undefined
+  const val = liveValues[fieldName]
+  if (val && typeof val === 'object' && '_t' in (val as Record<string, unknown>)) {
+    const sv = val as { _t: string; fields?: Record<string, unknown> }
+    if (sv._t === 'struct' && sv.fields) return sv.fields
+  }
+  return undefined
+}
+
+export function InlineClassExpander({
+  className,
+  module,
+  preferModule,
+  depth = 1,
+  copyPrefix,
+  liveValues,
+  enumMap,
+  classMap,
+  selectedEntityAddr,
+}: InlineClassExpanderProps) {
+  const { classMap: schemaClassMap, resolveClassMod } = useSchema()
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set())
 
-  const entry = classMap.get(className)
+  const entry = schemaClassMap.get(className)
   if (!entry) return <div className="inline-expand-empty">Class "{className}" not found</div>
 
   const cls = entry.o
   const fields = cls.fields || []
+  const hasLive = !!liveValues
 
   const toggleRow = (index: number) => {
     setExpandedRows((prev) => {
@@ -61,6 +91,7 @@ export function InlineClassExpander({ className, module, preferModule, depth = 1
               <th>Name</th>
               <th>Type</th>
               <th>Size</th>
+              {hasLive && <th>Live</th>}
             </tr>
           </thead>
           <tbody>
@@ -69,6 +100,7 @@ export function InlineClassExpander({ className, module, preferModule, depth = 1
               const typeMod = typeName ? resolveClassMod(typeName, preferModule) : null
               const canExpand = depth < MAX_DEPTH && !!typeName && !!typeMod
               const isExpanded = expandedRows.has(i)
+              const fieldCopyPrefix = `${copyPrefix} -> ${h(f.offset)} ${f.name}`
 
               return (
                 <ExpandableFieldRow
@@ -78,11 +110,17 @@ export function InlineClassExpander({ className, module, preferModule, depth = 1
                   typeName={typeName}
                   typeMod={typeMod}
                   preferModule={preferModule}
-                  parentModule={resolvedMod}
                   canExpand={canExpand}
                   isExpanded={isExpanded}
                   onToggle={toggleRow}
                   depth={depth}
+                  copyPrefix={fieldCopyPrefix}
+                  hasLive={hasLive}
+                  liveValue={liveValues?.[f.name] ?? null}
+                  liveValues={liveValues}
+                  enumMap={enumMap}
+                  classMap={classMap}
+                  selectedEntityAddr={selectedEntityAddr}
                 />
               )
             })}
@@ -99,11 +137,17 @@ interface ExpandableFieldRowProps {
   typeName: string | null
   typeMod: string | null
   preferModule?: string
-  parentModule: string
   canExpand: boolean
   isExpanded: boolean
   onToggle: (index: number) => void
   depth: number
+  copyPrefix: string
+  hasLive: boolean
+  liveValue: unknown
+  liveValues?: Record<string, unknown>
+  enumMap?: Map<string, { o: { items?: { name: string; value: number }[] } }>
+  classMap?: Map<string, unknown>
+  selectedEntityAddr?: string
 }
 
 function ExpandableFieldRow({
@@ -112,19 +156,27 @@ function ExpandableFieldRow({
   typeName,
   typeMod,
   preferModule,
-  parentModule,
   canExpand,
   isExpanded,
   onToggle,
   depth,
+  copyPrefix,
+  hasLive,
+  liveValue,
+  liveValues,
+  enumMap,
+  classMap,
+  selectedEntityAddr,
 }: ExpandableFieldRowProps) {
+  const colCount = hasLive ? 5 : 4
+
   return (
     <>
       <tr>
         <td className="f-off">{h(field.offset)}</td>
         <td className="f-name">
           {field.name}
-          <CopyFieldButton text={`[${parentModule}]+${h(field.offset)} ${field.name} // ${field.type || ''}`} />
+          <CopyFieldButton text={`${copyPrefix} // ${field.type || ''}`} />
         </td>
         <td className="f-type">
           {typeName && typeMod ? (
@@ -149,15 +201,32 @@ function ExpandableFieldRow({
           )}
         </td>
         <td className="f-size">{field.size != null ? String(field.size) : '\u2014'}</td>
+        {hasLive && (
+          <td className="f-live live-val">
+            <LiveValueCell
+              fieldType={field.type || ''}
+              value={liveValue}
+              enumMap={enumMap}
+              classMap={classMap}
+              selectedEntityAddr={selectedEntityAddr}
+              fieldOffset={field.offset}
+            />
+          </td>
+        )}
       </tr>
       {isExpanded && typeName && typeMod && (
         <tr className="inline-expand-row">
-          <td colSpan={4}>
+          <td colSpan={colCount}>
             <InlineClassExpander
               className={typeName}
               module={typeMod}
               preferModule={preferModule}
               depth={depth + 1}
+              copyPrefix={copyPrefix}
+              liveValues={extractNestedLiveValues(liveValues, field.name)}
+              enumMap={enumMap}
+              classMap={classMap}
+              selectedEntityAddr={selectedEntityAddr}
             />
           </td>
         </tr>

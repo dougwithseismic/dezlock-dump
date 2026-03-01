@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback } from 'react'
 import { useSchema } from './context/schema-context'
 import { useLive } from './context/live-context'
+import { EntityProvider } from './context/entity-context'
 import { useHashRouter } from './hooks/use-hash-router'
 import { useKeyboardShortcuts } from './hooks/use-keyboard-shortcuts'
 import { LandingPage } from './components/landing/landing-page'
@@ -99,27 +100,26 @@ export function App() {
   return (
     <div className="flex flex-col h-screen" style={{ background: 'var(--bg0)' }}>
       <AppHeader />
-      <div className="flex flex-1 overflow-hidden relative">
-        <AppSidebar
-          activeTab={effectiveTab}
-          open={sidebarOpen}
-          onClose={() => setSidebarOpen(false)}
-          searchInputRef={searchInputRef}
-        />
-        <MobileSidebarToggle onClick={() => setSidebarOpen((p) => !p)} />
-        <main className="flex-1 flex flex-col overflow-hidden">
-          <TabBar activeTab={effectiveTab} onTabChange={handleTabChange} showEntities={connected} />
-          <div
-            className="flex-1 overflow-y-auto"
-            style={{
-              padding: effectiveTab === 'entities' ? 0 : '16px 20px',
-              overflow: effectiveTab === 'entities' ? 'hidden' : undefined,
-            }}
-          >
-            {renderContent()}
-          </div>
-        </main>
-      </div>
+      <EntityProvider>
+        <div className="flex flex-1 overflow-hidden relative">
+          <AppSidebar
+            activeTab={effectiveTab}
+            open={sidebarOpen}
+            onClose={() => setSidebarOpen(false)}
+            searchInputRef={searchInputRef}
+          />
+          <MobileSidebarToggle onClick={() => setSidebarOpen((p) => !p)} />
+          <main className="flex-1 flex flex-col overflow-hidden">
+            <TabBar activeTab={effectiveTab} onTabChange={handleTabChange} showEntities={connected} />
+            <div
+              className="flex-1 overflow-y-auto"
+              style={{ padding: '16px 20px' }}
+            >
+              {renderContent()}
+            </div>
+          </main>
+        </div>
+      </EntityProvider>
       <ConsoleDrawer open={consoleOpen} onToggle={() => setConsoleOpen((p) => !p)} />
       {!consoleOpen && D && (
         <div
