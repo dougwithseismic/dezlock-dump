@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - **Entity context** — new `EntityContext` provider to share entity state across components
 
 ### Fixed
+- **Inline drill-down missing inherited class fields** — `InlineClassExpander` only showed a class's own fields; now uses `flatFields()` to walk the full inheritance chain so parent class fields (and their live values) appear when expanding any type inline, with group headers separating each defining class
 - **Diff flash animation not restarting on rapid changes** — when the same field changed again before the 400ms clear timer fired, the CSS animation never replayed; added a `flashTick` counter with `useLayoutEffect` to force animation restart via DOM reflow
 - **Hook ordering crash in SidebarList** — early return before `useMemo`/`useCallback` caused "Rendered fewer hooks" React crash when toggling tabs
 

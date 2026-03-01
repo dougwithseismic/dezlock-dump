@@ -1,10 +1,11 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useSchema } from '../../context/schema-context'
+import { flatFields } from '../../lib/flat-fields'
 import { h, extractType } from '../../lib/format'
 import { ClassLink } from './class-link'
 import { CopyFieldButton } from './copy-field-button'
 import { LiveValueCell } from '../live-renderers/live-value-cell'
-import type { Field } from '../../types/schema'
+import type { FlatField } from '../../types/schema'
 
 interface InlineClassExpanderProps {
   className: string
@@ -51,8 +52,24 @@ export function InlineClassExpander({
   if (!entry) return <div className="inline-expand-empty">Class "{className}" not found</div>
 
   const cls = entry.o
-  const fields = cls.fields || []
+  const flat = flatFields(className, schemaClassMap)
+  const fields = flat.length > 0 ? flat : (cls.fields || []).map((f) => ({ ...f, definedIn: className }))
   const hasLive = !!liveValues
+
+  // Group fields by definedIn for section headers
+  const groups = useMemo(() => {
+    const result: { name: string; fields: FlatField[] }[] = []
+    const gm = new Map<string, FlatField[]>()
+    for (const f of fields) {
+      const key = (f as FlatField).definedIn || className
+      if (!gm.has(key)) {
+        gm.set(key, [])
+        result.push({ name: key, fields: gm.get(key)! })
+      }
+      gm.get(key)!.push(f as FlatField)
+    }
+    return result
+  }, [fields, className])
 
   const toggleRow = (index: number) => {
     setExpandedRows((prev) => {
@@ -95,34 +112,40 @@ export function InlineClassExpander({
             </tr>
           </thead>
           <tbody>
-            {fields.map((f: Field, i: number) => {
-              const typeName = extractType(f.type)
-              const typeMod = typeName ? resolveClassMod(typeName, preferModule) : null
-              const canExpand = depth < MAX_DEPTH && !!typeName && !!typeMod
-              const isExpanded = expandedRows.has(i)
-              const fieldCopyPrefix = `${copyPrefix} -> ${h(f.offset)} ${f.name}`
+            {groups.map((group) => {
+              const showGroupHeader = groups.length > 1
+              return group.fields.map((f: FlatField, i: number) => {
+                const globalIdx = fields.indexOf(f)
+                const typeName = extractType(f.type)
+                const typeMod = typeName ? resolveClassMod(typeName, preferModule) : null
+                const canExpand = depth < MAX_DEPTH && !!typeName && !!typeMod
+                const isExpanded = expandedRows.has(globalIdx)
+                const fieldCopyPrefix = `${copyPrefix} -> ${h(f.offset)} ${f.name}`
 
-              return (
-                <ExpandableFieldRow
-                  key={i}
-                  field={f}
-                  index={i}
-                  typeName={typeName}
-                  typeMod={typeMod}
-                  preferModule={preferModule}
-                  canExpand={canExpand}
-                  isExpanded={isExpanded}
-                  onToggle={toggleRow}
-                  depth={depth}
-                  copyPrefix={fieldCopyPrefix}
-                  hasLive={hasLive}
-                  liveValue={liveValues?.[f.name] ?? null}
-                  liveValues={liveValues}
-                  enumMap={enumMap}
-                  classMap={classMap}
-                  selectedEntityAddr={selectedEntityAddr}
-                />
-              )
+                return (
+                  <ExpandableFieldRow
+                    key={globalIdx}
+                    field={f}
+                    index={globalIdx}
+                    typeName={typeName}
+                    typeMod={typeMod}
+                    preferModule={preferModule}
+                    canExpand={canExpand}
+                    isExpanded={isExpanded}
+                    onToggle={toggleRow}
+                    depth={depth}
+                    copyPrefix={fieldCopyPrefix}
+                    hasLive={hasLive}
+                    liveValue={liveValues?.[f.name] ?? null}
+                    liveValues={liveValues}
+                    enumMap={enumMap}
+                    classMap={classMap}
+                    selectedEntityAddr={selectedEntityAddr}
+                    groupHeader={showGroupHeader && i === 0 ? group.name : undefined}
+                    colCount={hasLive ? 5 : 4}
+                  />
+                )
+              })
             })}
           </tbody>
         </table>
@@ -132,7 +155,7 @@ export function InlineClassExpander({
 }
 
 interface ExpandableFieldRowProps {
-  field: Field
+  field: FlatField
   index: number
   typeName: string | null
   typeMod: string | null
@@ -148,6 +171,8 @@ interface ExpandableFieldRowProps {
   enumMap?: Map<string, { o: { items?: { name: string; value: number }[] } }>
   classMap?: Map<string, unknown>
   selectedEntityAddr?: string
+  groupHeader?: string
+  colCount: number
 }
 
 function ExpandableFieldRow({
@@ -167,11 +192,18 @@ function ExpandableFieldRow({
   enumMap,
   classMap,
   selectedEntityAddr,
+  groupHeader,
+  colCount,
 }: ExpandableFieldRowProps) {
-  const colCount = hasLive ? 5 : 4
-
   return (
     <>
+      {groupHeader && (
+        <tr className="inline-expand-group-hdr">
+          <td colSpan={colCount} style={{ fontWeight: 600, fontSize: '.75rem', color: 'var(--t3)', padding: '4px 6px', borderBottom: '1px solid var(--brd)' }}>
+            {groupHeader}
+          </td>
+        </tr>
+      )}
       <tr>
         <td className="f-off">{h(field.offset)}</td>
         <td className="f-name">
