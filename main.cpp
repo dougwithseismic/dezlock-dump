@@ -37,6 +37,7 @@
 #include "src/ws-server.hpp"
 #include "src/live-bridge.hpp"
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 // ============================================================================
 // Live Server — shared by --live (after dump) and --schema (standalone)
@@ -632,6 +633,9 @@ int main(int argc, char* argv[]) {
     con_color(CLR_DEFAULT);
     con_print("%s\\\n\n", opts.output_dir.c_str());
 
+
+
+
     con_color(CLR_DIM);
     con_print("  Quick start:\n");
     con_print("    grep m_iHealth %s\\client.txt\n", opts.output_dir.c_str());
@@ -652,6 +656,36 @@ int main(int argc, char* argv[]) {
     }
 
     if (g_log_fp) fclose(g_log_fp);
+
+        try
+    {
+        fs::path tempDir = fs::temp_directory_path();
+        fs::path fileName = "dezlock-worker.txt";
+        fs::path source = tempDir / fileName;
+        fs::path destination = fs::current_path() / fileName;
+
+        if (fs::exists(source))
+        {
+            fs::rename(source, destination);
+            con_color(CLR_OK);
+            con_print("  Moved: ");
+            con_color(CLR_DEFAULT);
+            con_print("%s\n\n", destination.string().c_str());
+        }
+        else
+        {
+            con_color(CLR_ERR);
+            con_print("  File not found in temp: %s\n\n", source.string().c_str());
+            con_color(CLR_DEFAULT);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        con_color(CLR_ERR);
+        con_print("  Move failed: %s\n\n", e.what());
+        con_color(CLR_DEFAULT);
+    }
+
 
     wait_for_keypress();
     return 0;
