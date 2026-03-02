@@ -824,7 +824,8 @@ void generate_entity_paths(const json& data,
             for (const auto& parent : cls.inheritance) {
                 if (parent == "CEntityInstance" || parent == "C_BaseEntity" ||
                     parent == "CBaseEntity" || parent == "CBasePlayerPawn" ||
-                    parent == "C_BasePlayerPawn") {
+                    parent == "C_BasePlayerPawn" || parent == "CBasePlayerController" ||
+                    parent == "C_BasePlayerController") {
                     entity_classes.push_back({mod.name, &cls});
                     break;
                 }
@@ -841,7 +842,7 @@ void generate_entity_paths(const json& data,
     if (!epfp) return;
 
     fprintf(epfp, "# Dezlock Entity Paths — Full Field Trees for Entity Classes\n");
-    fprintf(epfp, "# Every class inheriting CEntityInstance / C_BaseEntity, fully expanded.\n");
+    fprintf(epfp, "# Every class inheriting CEntityInstance / C_BaseEntity / CBasePlayerController, fully expanded.\n");
     fprintf(epfp, "#\n");
     fprintf(epfp, "# Legend:\n");
     fprintf(epfp, "#   ->  pointer dereference (follow pointer, then read field)\n");

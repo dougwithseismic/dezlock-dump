@@ -12,7 +12,29 @@
     "CBasePlayerController": {
       "methods": [
         "const char* player_name() const { return m_iszPlayerName; }",
-        "uint64_t steam_id() const { return m_steamID; }"
+        "uint64_t steam_id() const { return m_steamID; }",
+        "bool is_local_player_controller() const { return m_bIsLocalPlayerController; }"
+      ]
+    },
+    "C_BasePlayerController": {
+      "methods": [
+        "const char* player_name() const { return m_iszPlayerName; }",
+        "uint64_t steam_id() const { return m_steamID; }",
+        "bool is_local_player_controller() const { return m_bIsLocalPlayerController; }"
+      ]
+    },
+    "CBasePlayerPawn": {
+      "methods": [
+        "const QAngle& eye_angles() const { return m_angEyeAngles; }",
+        "const Vec3& velocity() const { return m_vecVelocity; }",
+        "bool is_on_ground() const { return (m_fFlags & 1) != 0; }"
+      ]
+    },
+    "C_BasePlayerPawn": {
+      "methods": [
+        "const QAngle& eye_angles() const { return m_angEyeAngles; }",
+        "const Vec3& velocity() const { return m_vecVelocity; }",
+        "bool is_on_ground() const { return (m_fFlags & 1) != 0; }"
       ]
     },
     "CGameSceneNode": {
