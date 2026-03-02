@@ -137,7 +137,7 @@ void print_banner() {
     con_color(CLR_TITLE);
     con_print("  dezlock-dump");
     con_color(CLR_DIM);
-    con_print("  v1.4.0\n");
+    con_print("  v1.8.0\n");
     con_color(CLR_DEFAULT);
     con_print("  Runtime schema + RTTI extraction for Source 2 games\n");
     con_color(CLR_DIM);
