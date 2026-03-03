@@ -212,6 +212,8 @@ Then open `viewer/dist/index.html` in any browser, or use `pnpm dev` during deve
 - Virtualized sidebar for smooth scrolling with 5,000+ items
 - Works offline with 150MB+ JSON files (parses in a Web Worker)
 
+> **Note:** When both `client.dll` and `server.dll` are present (common in Deadlock/CS2), the exported `_all-modules.json` can reach **500MB+** since many classes are duplicated across both modules. The viewer handles this fine but loading may take a moment. `server.dll` is excluded from the module filter by default — enable it manually if you need server-side class data.
+
 ### Live Server
 
 The `--live` flag keeps the exe running after dump and starts a WebSocket server on `ws://127.0.0.1:9100`. The viewer can connect to it for real-time entity inspection — browse live entities, expand nested structs, follow handle references, and watch field values update in real time.

@@ -47,8 +47,8 @@ export function ClassView({ name, module }: ClassViewProps) {
     return <div className="empty">Class "{name}" not found</div>
   }
 
-  const cls = entry.o
   const mod = module || entry.m
+  const cls = entry.perMod?.[mod] ?? entry.o
   const own = cls.fields || []
   const flat = flatFields(cls.name, classMap)
   const hasFlat = flat.length > own.length

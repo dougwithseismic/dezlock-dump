@@ -340,6 +340,19 @@ bool SchemaCache::load(const nlohmann::json& data) {
         }
     }
 
+    // Sort modules: client.dll first, server.dll last, rest alphabetical.
+    // Ensures find_class_any/find_enum_any check client before server.
+    std::sort(m_modules.begin(), m_modules.end(),
+        [](const std::string& a, const std::string& b) {
+            bool a_client = _stricmp(a.c_str(), "client.dll") == 0;
+            bool b_client = _stricmp(b.c_str(), "client.dll") == 0;
+            bool a_server = _stricmp(a.c_str(), "server.dll") == 0;
+            bool b_server = _stricmp(b.c_str(), "server.dll") == 0;
+            if (a_client != b_client) return a_client;
+            if (a_server != b_server) return b_server;
+            return _stricmp(a.c_str(), b.c_str()) < 0;
+        });
+
     // Globals
     if (data.contains("globals") && data["globals"].is_object()) {
         for (const auto& [mod_name, entries] : data["globals"].items()) {

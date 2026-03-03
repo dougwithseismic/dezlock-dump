@@ -1221,6 +1221,29 @@ int SchemaManager::dump_all_modules() {
         }
     }
 
+    // Sort modules: client.dll first, server.dll last, rest alphabetical.
+    // This ensures first-wins deduplication downstream always prefers client data.
+    std::sort(m_dumped_modules.begin(), m_dumped_modules.end(),
+        [](const std::string& a, const std::string& b) {
+            bool a_client = _stricmp(a.c_str(), "client.dll") == 0;
+            bool b_client = _stricmp(b.c_str(), "client.dll") == 0;
+            bool a_server = _stricmp(a.c_str(), "server.dll") == 0;
+            bool b_server = _stricmp(b.c_str(), "server.dll") == 0;
+            if (a_client != b_client) return a_client;
+            if (a_server != b_server) return b_server;
+            return _stricmp(a.c_str(), b.c_str()) < 0;
+        });
+
+    // Warn when both are present — shared classes will use client data
+    bool has_client = false, has_server = false;
+    for (const auto& m : m_dumped_modules) {
+        if (_stricmp(m.c_str(), "client.dll") == 0) has_client = true;
+        if (_stricmp(m.c_str(), "server.dll") == 0) has_server = true;
+    }
+    if (has_client && has_server) {
+        LOG_W("both client.dll and server.dll present — client.dll takes priority for shared classes");
+    }
+
     LOG_I("dumped %d modules with schema data", dumped);
     return dumped;
 }

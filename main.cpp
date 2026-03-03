@@ -466,6 +466,18 @@ int main(int argc, char* argv[]) {
 
     auto modules = parse_modules(data);
 
+    // Check for client.dll + server.dll overlap
+    {
+        bool has_client = false, has_server = false;
+        for (const auto& mod : modules) {
+            if (_stricmp(mod.name.c_str(), "client.dll") == 0) has_client = true;
+            if (_stricmp(mod.name.c_str(), "server.dll") == 0) has_server = true;
+        }
+        if (has_client && has_server) {
+            con_info("Both client.dll and server.dll present — client.dll takes priority for shared classes.");
+        }
+    }
+
     if (!create_directory_recursive(opts.output_dir.c_str())) {
         con_fail("Cannot create output directory: %s", opts.output_dir.c_str());
         wait_for_keypress();
