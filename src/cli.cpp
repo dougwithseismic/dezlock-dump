@@ -38,6 +38,8 @@ CliOptions parse_args(int argc, char* argv[]) {
             opts.gen_all = true;
         } else if (strcmp(argv[i], "--live") == 0) {
             opts.live_mode = true;
+        } else if (strcmp(argv[i], "--no-update-check") == 0) {
+            opts.no_update_check = true;
         } else if (strcmp(argv[i], "--schema") == 0 && i + 1 < argc) {
             opts.schema_path = argv[++i];
             opts.live_mode = true; // --schema implies live mode
@@ -57,6 +59,7 @@ CliOptions parse_args(int argc, char* argv[]) {
             con_print("  --signatures  Generate byte pattern signatures\n");
             con_print("  --layouts     Analyze vtable functions for member field offsets\n");
             con_print("  --all         Enable all generators (sdk + signatures + layouts)\n");
+            con_print("  --no-update-check  Skip the GitHub update check on startup\n");
             opts.show_help = true;
         }
     }

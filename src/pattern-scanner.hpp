@@ -21,6 +21,7 @@ enum class ResolveMode {
 struct PatternEntry {
     std::string name;
     std::string module;
+    std::string game;    // optional — empty means all games; matched against host process exe stem
     ResolveMode mode = ResolveMode::RipRelative;
 
     // RipRelative fields
@@ -55,8 +56,11 @@ using ResultMap = std::unordered_map<std::string, std::vector<GlobalResult>>;
 bool load_config(const char* path, PatternConfig& out);
 
 // Resolve all patterns against loaded modules (in-process).
+// active_game is the host process exe stem (e.g. "cs2", "deadlock"), lowercase, no extension.
+// Entries with a non-empty "game" field are skipped when they don't match active_game.
+// Pass an empty string to run all entries regardless of game tag.
 // Two-pass: RipRelative first, then Derived.
-ResultMap resolve_all(const PatternConfig& cfg);
+ResultMap resolve_all(const PatternConfig& cfg, const std::string& active_game = "");
 
 // Low-level: scan memory for IDA-style pattern, resolve RIP-relative.
 // Returns RVA from module base, or 0 on failure.

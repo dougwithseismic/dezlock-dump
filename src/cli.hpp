@@ -15,6 +15,7 @@ struct CliOptions {
     bool gen_layouts = false;
     bool gen_all = false;
     bool live_mode = false;
+    bool no_update_check = false;
     bool show_help = false;
 };
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(dezlock-dump LANGUAGES CXX)
+project(dezlock-dump VERSION 1.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +33,9 @@ if(MSVC)
     target_link_options(dezlock-worker PRIVATE /GUARD:NO)
 endif()
 
+# --- Generate version.h from CMake project version ---
+configure_file(src/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h)
+
 # --- dezlock-dump (CLI orchestrator exe) ---
 add_executable(dezlock-dump
     main.cpp
@@ -45,10 +48,12 @@ add_executable(dezlock-dump
     src/analyze-members.cpp
     src/ws-server.cpp
     src/live-bridge.cpp
+    src/version-check.cpp
 )
 target_include_directories(dezlock-dump PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/vendor          # asio.hpp, websocketpp/
+    ${CMAKE_BINARY_DIR}/generated       # version.h
 )
 target_compile_definitions(dezlock-dump PRIVATE
     ASIO_STANDALONE
@@ -60,7 +65,7 @@ target_compile_definitions(dezlock-dump PRIVATE
     _WEBSOCKETPP_CPP11_MEMORY_
     _WEBSOCKETPP_CPP11_TYPE_TRAITS_
 )
-target_link_libraries(dezlock-dump PRIVATE user32 advapi32 ws2_32)
+target_link_libraries(dezlock-dump PRIVATE user32 advapi32 ws2_32 winhttp)
 
 # --- Copy config files and scripts to output directory ---
 foreach(cfg patterns.json sdk-cherry-pick.json)

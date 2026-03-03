@@ -986,20 +986,23 @@ static globals::GlobalMap phase_globals(schema::SchemaManager& mgr) {
 
 // Phase 4: Pattern-based global resolution (supplementary)
 // Reads patterns.json from temp dir and resolves IDA-style patterns.
+// active_game is the host process exe stem (e.g. "cs2", "deadlock"), used to filter
+// entries that carry a "game" tag.
 struct PatternResult {
     pattern::ResultMap results;
     pattern::PatternConfig config;
 };
 
-static PatternResult phase_patterns(const char* temp_dir) {
+static PatternResult phase_patterns(const char* temp_dir, const std::string& active_game) {
     PatternResult out;
 
     char patterns_path[MAX_PATH];
     snprintf(patterns_path, MAX_PATH, "%sdezlock-patterns.json", temp_dir);
 
     if (pattern::load_config(patterns_path, out.config)) {
-        LOG_I("Running supplementary pattern scan (%d patterns)...", (int)out.config.entries.size());
-        out.results = pattern::resolve_all(out.config);
+        LOG_I("Running supplementary pattern scan (%d patterns, game=%s)...",
+              (int)out.config.entries.size(), active_game.c_str());
+        out.results = pattern::resolve_all(out.config, active_game);
 
         int found = 0, total = 0;
         for (const auto& [mod, results] : out.results) {
@@ -1061,9 +1064,38 @@ static protobuf_scan::ProtoMap phase_protobuf() {
 // Main worker thread
 // ============================================================================
 
+// Derive the host game name from the process exe (e.g. "C:\...\cs2.exe" -> "cs2").
+// Returns lowercase stem with no path or extension.
+static std::string detect_game_name() {
+    char exe_path[MAX_PATH] = {};
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+
+    // Strip directory
+    const char* stem = exe_path;
+    for (const char* p = exe_path; *p; ++p) {
+        if (*p == '\\' || *p == '/') stem = p + 1;
+    }
+
+    std::string name(stem);
+
+    // Strip .exe extension (case-insensitive)
+    if (name.size() > 4) {
+        std::string ext = name.substr(name.size() - 4);
+        for (auto& c : ext) c = (char)tolower((unsigned char)c);
+        if (ext == ".exe") name.resize(name.size() - 4);
+    }
+
+    for (auto& c : name) c = (char)tolower((unsigned char)c);
+    return name;
+}
+
 void worker_thread(HMODULE hModule) {
     core::log::init("dezlock-worker", true);
     LOG_I("=== Dezlock Dump Worker starting ===");
+
+    // Detect host game from process exe name (e.g. "cs2", "deadlock")
+    std::string active_game = detect_game_name();
+    LOG_I("Detected game: %s", active_game.c_str());
 
     // Build output paths
     char temp_dir[MAX_PATH];
@@ -1128,7 +1160,7 @@ void worker_thread(HMODULE hModule) {
         globals::GlobalMap discovered = phase_globals(mgr);
 
         // Phase 4: Pattern-based global resolution
-        PatternResult pat = phase_patterns(temp_dir);
+        PatternResult pat = phase_patterns(temp_dir, active_game);
 
         // Phase 5: Interface scanning
         interfaces::InterfaceMap iface_map = phase_interfaces();

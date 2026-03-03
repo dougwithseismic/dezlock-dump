@@ -1,4 +1,5 @@
 #include "src/console.hpp"
+#include "version.h"
 #include <cstdarg>
 #include <string>
 

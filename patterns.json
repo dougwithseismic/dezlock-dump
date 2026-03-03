@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Source 2 global pointer patterns (from cs2-dumper). Shared between CS2 and Deadlock.",
+  "description": "Source 2 global pointer patterns. Entries without a 'game' field run against any process. Entries with 'game' (e.g. \"cs2\", \"deadlock\") are skipped when the host process exe stem does not match.",
   "entries": [
     {
       "name": "dwEntityList",

@@ -36,6 +36,8 @@
 #include "src/analyze-members.hpp"
 #include "src/ws-server.hpp"
 #include "src/live-bridge.hpp"
+#include "src/version-check.hpp"
+#include "version.h"
 using json = nlohmann::json;
 
 // ============================================================================
@@ -185,6 +187,22 @@ int main(int argc, char* argv[]) {
     // Banner
     SetConsoleTitleA("dezlock-dump - Source 2 Schema Extractor");
     print_banner();
+
+    // Version check (non-blocking, silent on failure)
+    if (!opts.no_update_check) {
+        auto update = check_for_update();
+        if (update.has_update) {
+            con_color(CLR_WARN);
+            con_print("  UPDATE  ");
+            con_color(CLR_DEFAULT);
+            con_print("New version available: %s (you have %s)\n",
+                      update.latest_version.c_str(), DEZLOCK_VERSION_STR);
+            con_color(CLR_DIM);
+            con_print("          %s\n", update.release_url.c_str());
+            con_color(CLR_DEFAULT);
+            con_print("\n");
+        }
+    }
 
     // --schema fast path: load JSON and jump straight to live mode
     if (!opts.schema_path.empty()) {

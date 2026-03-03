@@ -87,6 +87,7 @@ bool load_config(const char* path, PatternConfig& out) {
         PatternEntry pe;
         pe.name   = entry.value("name", "");
         pe.module = entry.value("module", "");
+        pe.game   = entry.value("game", "");
 
         std::string mode_str = entry.value("mode", "rip_relative");
         if (mode_str == "derived") {
@@ -140,10 +141,11 @@ uint32_t scan_extract_u32(const uint8_t* mem, size_t size,
 // resolve_all — two-pass resolution
 // ============================================================================
 
-ResultMap resolve_all(const PatternConfig& cfg) {
-    // Group entries by module
+ResultMap resolve_all(const PatternConfig& cfg, const std::string& active_game) {
+    // Group entries by module, respecting per-entry game filter
     std::unordered_map<std::string, std::vector<const PatternEntry*>> by_module;
     for (const auto& e : cfg.entries) {
+        if (!e.game.empty() && !active_game.empty() && e.game != active_game) continue;
         by_module[e.module].push_back(&e);
     }
 
@@ -176,6 +178,7 @@ ResultMap resolve_all(const PatternConfig& cfg) {
 
     for (const auto& e : cfg.entries) {
         if (e.mode != ResolveMode::RipRelative) continue;
+        if (!e.game.empty() && !active_game.empty() && e.game != active_game) continue;
 
         auto mit = modules.find(e.module);
         if (mit == modules.end()) {
@@ -201,6 +204,7 @@ ResultMap resolve_all(const PatternConfig& cfg) {
     // Pass 2: Derived entries
     for (const auto& e : cfg.entries) {
         if (e.mode != ResolveMode::Derived) continue;
+        if (!e.game.empty() && !active_game.empty() && e.game != active_game) continue;
 
         // Look up base RVA
         auto base_it = resolved_rvas.find(e.derived_from);
