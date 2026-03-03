@@ -56,20 +56,27 @@ export function ModuleFilter() {
           </button>
         </div>
       </div>
-      {moduleNames.map((mn) => (
-        <label
-          key={mn}
-          className="flex items-center gap-1.5 py-0.5 cursor-pointer"
-          style={{ color: 'var(--t2)' }}
-        >
-          <input
-            type="checkbox"
-            checked={moduleFilter.has(mn)}
-            onChange={(e) => handleToggle(mn, e.target.checked)}
-          />
-          <span className="truncate">{mn}</span>
-        </label>
-      ))}
+      {moduleNames.map((mn) => {
+        const hasClient = moduleNames.some(m => m.toLowerCase() === 'client.dll')
+        const isServer = mn.toLowerCase() === 'server.dll'
+        return (
+          <label
+            key={mn}
+            className="flex items-center gap-1.5 py-0.5 cursor-pointer"
+            style={{ color: 'var(--t2)' }}
+          >
+            <input
+              type="checkbox"
+              checked={moduleFilter.has(mn)}
+              onChange={(e) => handleToggle(mn, e.target.checked)}
+            />
+            <span className="truncate">{mn}</span>
+            {hasClient && isServer && (
+              <span style={{ color: 'var(--t3)', fontSize: '0.7rem', opacity: 0.7 }}>(mirrors client)</span>
+            )}
+          </label>
+        )
+      })}
     </div>
   )
 }

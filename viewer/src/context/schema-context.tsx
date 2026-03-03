@@ -64,6 +64,9 @@ export function SchemaProvider({ children }: { children: ReactNode }) {
     const aPb: SidebarItem[] = []
     const pMap = new Map<string, ProtoMapEntry>()
 
+    const isHigherPriority = (a: string, b: string): boolean =>
+      a.toLowerCase() === 'client.dll' && b.toLowerCase() === 'server.dll'
+
     const mods = raw.modules || []
     for (const mod of mods) {
       const mn = mod.name
@@ -71,10 +74,15 @@ export function SchemaProvider({ children }: { children: ReactNode }) {
 
       for (const c of mod.classes || []) {
         if (!cMap.has(c.name)) {
-          cMap.set(c.name, { m: mn, o: c, mods: [mn] })
+          cMap.set(c.name, { m: mn, o: c, mods: [mn], perMod: { [mn]: c } })
         } else {
           const ex = cMap.get(c.name)!
           if (!ex.mods.includes(mn)) ex.mods.push(mn)
+          ex.perMod[mn] = c
+          if (isHigherPriority(mn, ex.m)) {
+            ex.m = mn
+            ex.o = c
+          }
         }
         aC.push({ n: c.name, m: mn })
         sEntries.push({ name: c.name, category: 'c', module: mn, context: null })
@@ -92,7 +100,17 @@ export function SchemaProvider({ children }: { children: ReactNode }) {
       }
 
       for (const e of mod.enums || []) {
-        if (!eMap.has(e.name)) eMap.set(e.name, { m: mn, o: e })
+        if (!eMap.has(e.name)) {
+          eMap.set(e.name, { m: mn, o: e, mods: [mn], perMod: { [mn]: e } })
+        } else {
+          const ex = eMap.get(e.name)!
+          if (!ex.mods.includes(mn)) ex.mods.push(mn)
+          ex.perMod[mn] = e
+          if (isHigherPriority(mn, ex.m)) {
+            ex.m = mn
+            ex.o = e
+          }
+        }
         aE.push({ n: e.name, m: mn })
         sEntries.push({ name: e.name, category: 'e', module: mn, context: null })
         for (const v of e.values || []) {
@@ -137,7 +155,11 @@ export function SchemaProvider({ children }: { children: ReactNode }) {
       allProtoMessages: aPb,
       protoMap: pMap,
     })
-    setModuleFilter(new Set(modNames))
+    const hasClient = modNames.some(m => m.toLowerCase() === 'client.dll')
+    const defaultFilter = hasClient
+      ? new Set(modNames.filter(m => m.toLowerCase() !== 'server.dll'))
+      : new Set(modNames)
+    setModuleFilter(defaultFilter)
   }, [])
 
   const classMap = schema?.classMap ?? new Map<string, ClassMapEntry>()

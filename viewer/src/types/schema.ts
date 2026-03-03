@@ -115,11 +115,14 @@ export interface ClassMapEntry {
   m: string
   o: ClassInfo
   mods: string[]
+  perMod: Record<string, ClassInfo>
 }
 
 export interface EnumMapEntry {
   m: string
   o: EnumInfo
+  mods: string[]
+  perMod: Record<string, EnumInfo>
 }
 
 export interface ProtoMapEntry {
