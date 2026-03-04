@@ -484,6 +484,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Clean stale .txt files from previous runs so RTTI-only modules
+    // don't leave empty leftovers when they no longer have schema data
+    {
+        WIN32_FIND_DATAA fd;
+        std::string pattern = opts.output_dir + "\\*.txt";
+        HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                std::string full = opts.output_dir + "\\" + fd.cFileName;
+                DeleteFileA(full.c_str());
+            } while (FindNextFileA(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
     // Build cross-module class lookup for flattening inherited fields
     std::unordered_map<std::string, const ClassInfo*> global_class_lookup;
     for (const auto& mod : modules) {
@@ -494,6 +509,10 @@ int main(int argc, char* argv[]) {
     }
 
     for (auto& mod : modules) {
+        // Skip RTTI-only modules with no schema classes or enums
+        if (mod.classes.empty() && mod.enums.empty())
+            continue;
+
         std::string module_name = mod.name;
         {
             auto pos = module_name.rfind(".dll");
