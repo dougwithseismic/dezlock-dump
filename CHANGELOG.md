@@ -2,28 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.0.0] - 2026-03-06
 
 ### Added
-- **Dynamic RTTI-based polymorphic pointer resolution** — when the live bridge dereferences a pointer field (e.g. `m_pSubclassVData` typed as `CEntitySubclassVDataBase*`), it now resolves the actual runtime type via MSVC x64 RTTI. This reveals the full derived class (e.g. `CitadelAbilityVData` with 100+ fields) instead of showing only the declared base type's fields. Affects all polymorphic pointers: VData, base entity pointers, modifier pointers, and any `SomeBase*` that's actually a derived type at runtime
-- **RTTI cache** — vtable-to-class-name mappings are cached globally (thread-safe) and seeded from the existing vtable lookup table during entity list enumeration, so repeated dereferences of the same type are near-instant
-- **Resolved type badge in viewer** — `LivePointer` now shows the RTTI-resolved class name as the primary badge and the declared schema type as a dimmed secondary badge when they differ
-- **Entity inspector: live values in inline drill-down** — expanding a type (e.g. `CBodyComponent*`) in the entity inspector now shows a 5th "Live" column with real-time values from the parent entity subscription; nested struct data is extracted and passed recursively; pointer fields gracefully fall back to dashes
-- **Entity sidebar list** — extracted `EntitySidebarList` component for cleaner entity tab architecture
-- **Entity context** — new `EntityContext` provider to share entity state across components
-
-### Fixed
-- **Client.dll data lost when server.dll is also present** — when both `client.dll` and `server.dll` were loaded, first-wins deduplication could silently drop client fields/offsets/sizes if server.dll happened to be enumerated first. Module ordering is now deterministic: `client.dll` always comes first, `server.dll` last, rest alphabetical. The viewer now stores per-module class data so both versions are accessible, and defaults to excluding `server.dll` from the filter when `client.dll` is present.
-- **Inline drill-down missing inherited class fields** — `InlineClassExpander` only showed a class's own fields; now uses `flatFields()` to walk the full inheritance chain so parent class fields (and their live values) appear when expanding any type inline, with group headers separating each defining class
-- **Diff flash animation not restarting on rapid changes** — when the same field changed again before the 400ms clear timer fired, the CSS animation never replayed; added a `flashTick` counter with `useLayoutEffect` to force animation restart via DOM reflow
-- **Hook ordering crash in SidebarList** — early return before `useMemo`/`useCallback` caused "Rendered fewer hooks" React crash when toggling tabs
+- **Virtual function wrappers in internal SDK** — `VFUNC(idx, ret, name)`, `VFUNC_ARGS(idx, ret, name, ...)`, and `VFUNC_RAW(idx)` macros that call through vtables by index. 1,766 classes with vtable sections, 44,484 total wrappers
+- **Auto-naming engine** — three-pass pipeline discovers function names from the binary with zero manual config: (1) debug string xrefs from `.rdata`, (2) member access inference from disassembled prologues, (3) protobuf method descriptors. 112 functions auto-named (GetHealth, GetMaxHealth, IsRagdollEnabled, etc.)
+- **SEH-protected vtable reads** — `sdk::vfunc::get_vtable()` uses `__try/__except` for safe memory access in injected context
+- **Internal SDK generator** (`src/generate-internal-sdk.cpp`) — parallel per-module header generation with inheritance-aware VFUNC filtering and stub detection
 
 ### Changed
-- **InlineClassExpander** accepts optional `liveValues`, `enumMap`, `classMap`, `selectedEntityAddr` props; conditionally renders a "Live" column when values are provided; class view remains unchanged
-- **EntityInspectorPane** passes live values and schema maps through to `InlineClassExpander` for inline-expand virtual items; `parentFieldName` added to inline-expand VirtualItem type; inline expansion now uses RTTI-resolved type from live data when available
-- **EntityInspectorField** gains `flashTick` prop for reliable diff flash restart
-- Entity view refactored — simplified by extracting sidebar and context logic
-- **entity.list RTTI refactored** — inline RTTI walk lambda replaced with reusable `resolve_rtti_cached()` function; vtable lookup table seeds the global cache on first entity list build
+- **Generate everything by default** — running `dezlock-dump.exe` with no flags now produces all outputs (SDK, signatures, layouts, internal SDK). No need for `--all`
+- **Removed interactive output selection menu** — the 6-option picker is gone. Game auto-detection stays
+- **README rewritten** — concise, SDK-first. VData (abilities, items, weapons, modifiers) called out explicitly. CLI reference as compact table
+
+### Fixed
+- **`--schema` path writing to wrong directory** — game name is now inferred from the schema path so output goes to the correct `schema-dump/<game>/` folder
+- **Empty txt generation for RTTI-only modules** — skipped when module has no schema classes
+
+## [1.9.0] - 2026-03-05
+
+### Added
+- **Dynamic RTTI-based polymorphic pointer resolution** — live bridge resolves actual runtime types via MSVC x64 RTTI, revealing full derived classes instead of declared base types
+- **RTTI cache** — vtable-to-class-name mappings cached globally (thread-safe), seeded from vtable lookup table
+- **Resolved type badge in viewer** — shows RTTI-resolved class name with declared type as secondary badge
+- **Entity inspector: live values in inline drill-down** — expanding types shows real-time values from entity subscription
+- **Version check on startup** — checks GitHub releases for updates
+
+### Fixed
+- **Client.dll data lost when server.dll is also present** — module ordering now deterministic: client.dll first, server.dll last
+- **Inline drill-down missing inherited class fields** — now walks full inheritance chain
+- **Diff flash animation not restarting on rapid changes** — added flashTick counter for reliable restart
+- **Hook ordering crash in SidebarList** — fixed early return before hooks
 
 ## [1.7.0] - 2026-03-01
 

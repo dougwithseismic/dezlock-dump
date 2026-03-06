@@ -34,6 +34,8 @@ CliOptions parse_args(int argc, char* argv[]) {
             opts.gen_sdk = true;
         } else if (strcmp(argv[i], "--layouts") == 0) {
             opts.gen_layouts = true;
+        } else if (strcmp(argv[i], "--internal-sdk") == 0) {
+            opts.gen_internal_sdk = true;
         } else if (strcmp(argv[i], "--all") == 0) {
             opts.gen_all = true;
         } else if (strcmp(argv[i], "--live") == 0) {
@@ -56,9 +58,10 @@ CliOptions parse_args(int argc, char* argv[]) {
             con_print("                Example: --schema schema-dump/deadlock/_all-modules.json\n");
             con_print("  --depth       Field expansion depth for globals/entity trees (default: 3, max: 32)\n");
             con_print("  --sdk         Generate cherry-pickable C++ SDK headers\n");
+            con_print("  --internal-sdk  Generate runtime-resolved internal SDK (patch-proof)\n");
             con_print("  --signatures  Generate byte pattern signatures\n");
             con_print("  --layouts     Analyze vtable functions for member field offsets\n");
-            con_print("  --all         Enable all generators (sdk + signatures + layouts)\n");
+            con_print("  --all         Enable all generators (sdk + internal-sdk + signatures + layouts)\n");
             con_print("  --no-update-check  Skip the GitHub update check on startup\n");
             opts.show_help = true;
         }
@@ -212,6 +215,11 @@ void select_outputs(CliOptions& opts) {
     con_color(CLR_DEFAULT);
     con_print("All of the above\n");
 
+    con_color(CLR_TITLE);
+    con_print("    [6] ");
+    con_color(CLR_DEFAULT);
+    con_print("Internal SDK (runtime-resolved, patch-proof)\n");
+
     con_print("\n  Enter choices (e.g. 2 3 4), or press Enter for schema only: ");
 
     HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
@@ -220,10 +228,11 @@ void select_outputs(CliOptions& opts) {
     ReadConsoleA(hInput, input_buf, sizeof(input_buf) - 1, &chars_read, nullptr);
 
     for (DWORD ci = 0; ci < chars_read; ci++) {
-        if (input_buf[ci] == '5') { opts.gen_sdk = true; opts.gen_signatures = true; opts.gen_layouts = true; }
+        if (input_buf[ci] == '5') { opts.gen_sdk = true; opts.gen_signatures = true; opts.gen_layouts = true; opts.gen_internal_sdk = true; }
         if (input_buf[ci] == '2') { opts.gen_sdk = true; }
         if (input_buf[ci] == '3') { opts.gen_signatures = true; }
         if (input_buf[ci] == '4') { opts.gen_layouts = true; }
+        if (input_buf[ci] == '6') { opts.gen_internal_sdk = true; }
     }
 
     con_print("\n");
@@ -248,11 +257,13 @@ void derive_game_info(CliOptions& opts) {
         SetConsoleTitleA(title.c_str());
     }
 
-    // --all enables everything
-    if (opts.gen_all) {
+    // Default to generating everything unless specific flags were passed
+    bool any_specific = opts.gen_sdk || opts.gen_signatures || opts.gen_layouts || opts.gen_internal_sdk;
+    if (opts.gen_all || !any_specific) {
         opts.gen_signatures = true;
         opts.gen_sdk = true;
         opts.gen_layouts = true;
+        opts.gen_internal_sdk = true;
     }
 
     // Game name (lowercase) for --sdk and folder naming

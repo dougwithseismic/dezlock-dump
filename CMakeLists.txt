@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(dezlock-dump VERSION 1.8.0 LANGUAGES CXX)
+project(dezlock-dump VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -45,7 +45,9 @@ add_executable(dezlock-dump
     src/output-generator.cpp
     src/generate-signatures.cpp
     src/import-schema.cpp
+    src/generate-internal-sdk.cpp
     src/analyze-members.cpp
+    src/vfunc-namer.cpp
     src/ws-server.cpp
     src/live-bridge.cpp
     src/version-check.cpp
