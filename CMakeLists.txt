@@ -45,7 +45,9 @@ add_executable(dezlock-dump
     src/output-generator.cpp
     src/generate-signatures.cpp
     src/import-schema.cpp
+    src/generate-internal-sdk.cpp
     src/analyze-members.cpp
+    src/vfunc-namer.cpp
     src/ws-server.cpp
     src/live-bridge.cpp
     src/version-check.cpp

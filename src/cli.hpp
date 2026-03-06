@@ -13,6 +13,7 @@ struct CliOptions {
     bool gen_signatures = false;
     bool gen_sdk = false;
     bool gen_layouts = false;
+    bool gen_internal_sdk = false;
     bool gen_all = false;
     bool live_mode = false;
     bool no_update_check = false;

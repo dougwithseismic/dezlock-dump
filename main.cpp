@@ -33,6 +33,7 @@
 #include "src/output-generator.hpp"
 #include "src/generate-signatures.hpp"
 #include "src/import-schema.hpp"
+#include "src/generate-internal-sdk.hpp"
 #include "src/analyze-members.hpp"
 #include "src/ws-server.hpp"
 #include "src/live-bridge.hpp"
@@ -231,6 +232,52 @@ int main(int argc, char* argv[]) {
         }
 
         con_ok("Loaded %s (%.1f MB)", opts.schema_path.c_str(), ssize / (1024.0 * 1024.0));
+
+        // Generate internal SDK from loaded schema if requested
+        if (opts.gen_internal_sdk) {
+            // Infer game name from schema path if no process specified
+            // e.g. "schema-dump/deadlock/_all-modules.json" -> "deadlock"
+            if (opts.target_process.empty() && opts.game_name.empty()) {
+                std::string sp = opts.schema_path;
+                // Normalize separators
+                for (auto& c : sp) if (c == '\\') c = '/';
+                auto pos = sp.rfind("/_all-modules.json");
+                if (pos != std::string::npos) {
+                    auto slash = sp.rfind('/', pos - 1);
+                    if (slash != std::string::npos)
+                        opts.game_name = sp.substr(slash + 1, pos - slash - 1);
+                    else
+                        opts.game_name = sp.substr(0, pos);
+                }
+                if (!opts.game_name.empty()) {
+                    opts.game_display = opts.game_name;
+                    if (!opts.game_display.empty())
+                        opts.game_display[0] = toupper(opts.game_display[0]);
+                    // Set target_process so derive_game_info doesn't produce empty name
+                    opts.target_process = opts.game_name + ".exe";
+                }
+            }
+            derive_game_info(opts);
+            auto modules = parse_modules(data);
+            std::unordered_map<std::string, const ClassInfo*> class_lookup;
+            for (const auto& mod : modules) {
+                for (const auto& cls : mod.classes) {
+                    if (class_lookup.find(cls.name) == class_lookup.end())
+                        class_lookup[cls.name] = &cls;
+                }
+            }
+            con_step("ISDK", "Generating runtime-resolved internal SDK...");
+            std::string isdk_output = opts.output_dir + "\\internal-sdk";
+            char exe_buf[MAX_PATH];
+            GetModuleFileNameA(nullptr, exe_buf, MAX_PATH);
+            char* last = strrchr(exe_buf, '\\');
+            if (last) *(last + 1) = '\0';
+            auto isdk_stats = generate_internal_sdk(data, modules, class_lookup, isdk_output,
+                                                     opts.game_name, std::string(exe_buf));
+            con_ok("Internal SDK: %d classes, %d fields, %d vfuncs, %d enums -> %s\\",
+                   isdk_stats.classes, isdk_stats.fields, isdk_stats.vfuncs, isdk_stats.enums, isdk_output.c_str());
+        }
+
         return run_live_server(data, false);
     }
 
@@ -423,11 +470,6 @@ int main(int argc, char* argv[]) {
     }
     con_ok("Schema extracted (%.1fs)", waited / 10.0f);
 
-    // ---- Interactive output selection (when no CLI flags were passed) ----
-    if (!opts.gen_signatures && !opts.gen_sdk && !opts.gen_layouts) {
-        select_outputs(opts);
-    }
-
     // ---- Generate output ----
     con_step("5/5", "Generating output files...");
 
@@ -585,6 +627,20 @@ int main(int argc, char* argv[]) {
         con_ok("SDK generated -> %s\\", sdk_output.c_str());
     }
 
+    // ---- Internal SDK generation (optional) ----
+    InternalSdkStats isdk_stats = {};
+    bool isdk_ok = false;
+    if (opts.gen_internal_sdk) {
+        con_print("\n");
+        con_step("ISDK", "Generating runtime-resolved internal SDK...");
+
+        std::string isdk_output = opts.output_dir + "\\internal-sdk";
+        isdk_stats = generate_internal_sdk(data, modules, global_class_lookup, isdk_output,
+                                            opts.game_name, std::string(exe_path));
+        isdk_ok = true;
+        con_ok("Internal SDK generated -> %s\\", isdk_output.c_str());
+    }
+
     // Clean up temp files
     DeleteFileA(done_path);
     DeleteFileA(patterns_temp);
@@ -674,6 +730,14 @@ int main(int argc, char* argv[]) {
             con_print("  %-20s %d/%d fields resolved\n", "Type resolution:",
                       sdk_stats.resolved, sdk_stats.total_fields);
     }
+    if (isdk_ok) {
+        con_print("  %-20s %d classes, %d fields, %d vfuncs, %d enums\n",
+                  "Internal SDK:", isdk_stats.classes, isdk_stats.fields, isdk_stats.vfuncs, isdk_stats.enums);
+        if (isdk_stats.helpers > 0)
+            con_print("  %-20s %d helper methods injected\n", "", isdk_stats.helpers);
+        if (isdk_stats.vfuncs > 0)
+            con_print("  %-20s %d virtual function wrappers\n", "", isdk_stats.vfuncs);
+    }
     con_print("\n");
 
     con_color(CLR_OK);
@@ -691,6 +755,9 @@ int main(int argc, char* argv[]) {
     }
     if (sdk_ok) {
         con_print("    #include \"sdk/client/C_BaseEntity.hpp\"\n");
+    }
+    if (isdk_ok) {
+        con_print("    #include \"internal-sdk/schema_runtime.hpp\"  // patch-proof\n");
     }
 
     con_color(CLR_DEFAULT);
