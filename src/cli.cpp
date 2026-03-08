@@ -257,9 +257,8 @@ void derive_game_info(CliOptions& opts) {
         SetConsoleTitleA(title.c_str());
     }
 
-    // Default to generating everything unless specific flags were passed
-    bool any_specific = opts.gen_sdk || opts.gen_signatures || opts.gen_layouts || opts.gen_internal_sdk;
-    if (opts.gen_all || !any_specific) {
+    // Expand --all into individual flags
+    if (opts.gen_all) {
         opts.gen_signatures = true;
         opts.gen_sdk = true;
         opts.gen_layouts = true;

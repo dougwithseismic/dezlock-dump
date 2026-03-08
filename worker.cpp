@@ -23,6 +23,7 @@
 #include <Psapi.h>
 #include <cstdio>
 #include <ctime>
+#include <future>
 #include <thread>
 #include <unordered_set>
 
@@ -1164,20 +1165,32 @@ void worker_thread(HMODULE hModule) {
         // Phase 2: RTTI hierarchy building
         phase_rtti(mgr);
 
-        // Phase 3: Global singleton scanning
-        globals::GlobalMap discovered = phase_globals(mgr);
+        // Phases 3-7: run in parallel (all read-only on mgr after phases 1-2)
+        LOG_I("Running phases 3-7 in parallel...");
 
-        // Phase 4: Pattern-based global resolution
-        PatternResult pat = phase_patterns(temp_dir, active_game);
+        auto fut_globals    = std::async(std::launch::async, [&mgr]() {
+            return phase_globals(mgr);
+        });
+        auto fut_patterns   = std::async(std::launch::async, [&temp_dir, &active_game]() {
+            return phase_patterns(temp_dir, active_game);
+        });
+        auto fut_interfaces = std::async(std::launch::async, []() {
+            return phase_interfaces();
+        });
+        auto fut_strings    = std::async(std::launch::async, [&mgr]() {
+            return phase_strings(mgr);
+        });
+        auto fut_protobuf   = std::async(std::launch::async, []() {
+            return phase_protobuf();
+        });
 
-        // Phase 5: Interface scanning
-        interfaces::InterfaceMap iface_map = phase_interfaces();
+        globals::GlobalMap          discovered = fut_globals.get();
+        PatternResult               pat        = fut_patterns.get();
+        interfaces::InterfaceMap    iface_map  = fut_interfaces.get();
+        strings::StringMap          string_map = fut_strings.get();
+        protobuf_scan::ProtoMap     proto_map  = fut_protobuf.get();
 
-        // Phase 6: String scanning
-        strings::StringMap string_map = phase_strings(mgr);
-
-        // Phase 7: Protobuf extraction
-        protobuf_scan::ProtoMap proto_map = phase_protobuf();
+        LOG_I("All parallel phases complete");
 
         // Export to JSON (all modules)
         LOG_I("Writing JSON export...");

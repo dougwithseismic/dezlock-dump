@@ -25,6 +25,7 @@
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
+#include <thread>
 
 #include "vendor/json.hpp"
 #include "src/console.hpp"
@@ -287,6 +288,11 @@ int main(int argc, char* argv[]) {
             wait_for_keypress();
             return 1;
         }
+    }
+
+    // Interactive output selection (when no CLI flags were passed)
+    if (!opts.gen_signatures && !opts.gen_sdk && !opts.gen_layouts && !opts.gen_internal_sdk && !opts.gen_all) {
+        select_outputs(opts);
     }
 
     // Derive game display name, game name, and default output dir
@@ -597,47 +603,77 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ---- Globals, access-paths, entity-paths, protobuf ----
-    generate_globals_txt(data, modules, opts.output_dir, opts.field_depth);
-    generate_entity_paths(data, modules, opts.output_dir, opts.field_depth);
-    generate_protobuf_output(data, opts.output_dir);
+    // ---- Parallel output generation ----
+    // Steps 5-10 write to independent files/directories, so they can run concurrently.
+    // Console output is NOT thread-safe, so we announce steps before launching and
+    // report results after joining.
 
-    // ---- Signature generation (optional) ----
     SignatureStats sig_stats = {};
-    if (opts.gen_signatures) {
-        con_print("\n");
-        con_step("SIG", "Generating byte pattern signatures...");
+    SdkStats sdk_stats = {};
+    InternalSdkStats isdk_stats = {};
+    bool sdk_ok = false;
+    bool isdk_ok = false;
 
+    // Announce what will be generated
+    con_info("Generating globals, entity paths, protobuf...");
+    if (opts.gen_signatures) con_info("Generating byte pattern signatures...");
+    if (opts.gen_sdk)        con_info("Generating cherry-pickable C++ SDK...");
+    if (opts.gen_internal_sdk) con_info("Generating runtime-resolved internal SDK...");
+
+    {
+        std::vector<std::thread> workers;
+
+        // Text generators (lightweight, independent output files)
+        workers.emplace_back([&]() {
+            generate_globals_txt(data, modules, opts.output_dir, opts.field_depth);
+        });
+        workers.emplace_back([&]() {
+            generate_entity_paths(data, modules, opts.output_dir, opts.field_depth);
+        });
+        workers.emplace_back([&]() {
+            generate_protobuf_output(data, opts.output_dir);
+        });
+
+        // Heavy generators (already multi-threaded internally, write to separate dirs)
+        if (opts.gen_signatures) {
+            workers.emplace_back([&]() {
+                std::string sig_output = opts.output_dir + "\\signatures";
+                sig_stats = generate_signatures(data, sig_output);
+            });
+        }
+        if (opts.gen_sdk) {
+            workers.emplace_back([&]() {
+                std::string sdk_output = opts.output_dir + "\\sdk";
+                sdk_stats = generate_sdk(data, modules, global_class_lookup, sdk_output,
+                                          opts.game_name, std::string(exe_path));
+                sdk_ok = true;
+            });
+        }
+        if (opts.gen_internal_sdk) {
+            workers.emplace_back([&]() {
+                std::string isdk_output = opts.output_dir + "\\internal-sdk";
+                isdk_stats = generate_internal_sdk(data, modules, global_class_lookup, isdk_output,
+                                                    opts.game_name, std::string(exe_path));
+                isdk_ok = true;
+            });
+        }
+
+        for (auto& t : workers)
+            t.join();
+    }
+
+    // Report results after all threads complete
+    con_ok("Globals, entity paths, protobuf written");
+    if (opts.gen_signatures) {
         std::string sig_output = opts.output_dir + "\\signatures";
-        sig_stats = generate_signatures(data, sig_output);
         con_ok("Signatures generated -> %s\\", sig_output.c_str());
     }
-
-    // ---- SDK generation (optional) ----
-    SdkStats sdk_stats = {};
-    bool sdk_ok = false;
     if (opts.gen_sdk) {
-        con_print("\n");
-        con_step("SDK", "Generating cherry-pickable C++ SDK...");
-
         std::string sdk_output = opts.output_dir + "\\sdk";
-        sdk_stats = generate_sdk(data, modules, global_class_lookup, sdk_output,
-                                  opts.game_name, std::string(exe_path));
-        sdk_ok = true;
         con_ok("SDK generated -> %s\\", sdk_output.c_str());
     }
-
-    // ---- Internal SDK generation (optional) ----
-    InternalSdkStats isdk_stats = {};
-    bool isdk_ok = false;
     if (opts.gen_internal_sdk) {
-        con_print("\n");
-        con_step("ISDK", "Generating runtime-resolved internal SDK...");
-
         std::string isdk_output = opts.output_dir + "\\internal-sdk";
-        isdk_stats = generate_internal_sdk(data, modules, global_class_lookup, isdk_output,
-                                            opts.game_name, std::string(exe_path));
-        isdk_ok = true;
         con_ok("Internal SDK generated -> %s\\", isdk_output.c_str());
     }
 
