@@ -184,43 +184,36 @@ bool select_game(CliOptions& opts) {
 // ============================================================================
 
 void select_outputs(CliOptions& opts) {
+    // Schema dump, byte signatures, and class layouts are always generated.
+    opts.gen_signatures = true;
+    opts.gen_layouts = true;
+
     con_print("\n");
-    con_print("  Select outputs to generate:\n\n");
+    con_print("  Schema dump, byte signatures, and class layouts are always generated.\n");
+    con_print("  Optionally generate an SDK for compile-time or runtime field access:\n\n");
 
     con_color(CLR_TITLE);
     con_print("    [1] ");
     con_color(CLR_DEFAULT);
-    con_print("Schema dump (txt)");
+    con_print("C++ SDK");
     con_color(CLR_DIM);
-    con_print("       always on\n");
+    con_print("                    hardcoded offsets, breaks on game updates\n");
     con_color(CLR_DEFAULT);
 
     con_color(CLR_TITLE);
     con_print("    [2] ");
     con_color(CLR_DEFAULT);
-    con_print("C++ SDK\n");
+    con_print("Internal SDK");
+    con_color(CLR_DIM);
+    con_print("               runtime-resolved, patch-proof\n");
+    con_color(CLR_DEFAULT);
 
     con_color(CLR_TITLE);
     con_print("    [3] ");
     con_color(CLR_DEFAULT);
-    con_print("Byte signatures\n");
+    con_print("Both\n");
 
-    con_color(CLR_TITLE);
-    con_print("    [4] ");
-    con_color(CLR_DEFAULT);
-    con_print("Class layouts (inferred member offsets)\n");
-
-    con_color(CLR_TITLE);
-    con_print("    [5] ");
-    con_color(CLR_DEFAULT);
-    con_print("All of the above\n");
-
-    con_color(CLR_TITLE);
-    con_print("    [6] ");
-    con_color(CLR_DEFAULT);
-    con_print("Internal SDK (runtime-resolved, patch-proof)\n");
-
-    con_print("\n  Enter choices (e.g. 2 3 4), or press Enter for schema only: ");
+    con_print("\n  Enter choice (1, 2, or 3), or press Enter to skip SDKs: ");
 
     HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
     char input_buf[256] = {};
@@ -228,11 +221,9 @@ void select_outputs(CliOptions& opts) {
     ReadConsoleA(hInput, input_buf, sizeof(input_buf) - 1, &chars_read, nullptr);
 
     for (DWORD ci = 0; ci < chars_read; ci++) {
-        if (input_buf[ci] == '5') { opts.gen_sdk = true; opts.gen_signatures = true; opts.gen_layouts = true; opts.gen_internal_sdk = true; }
-        if (input_buf[ci] == '2') { opts.gen_sdk = true; }
-        if (input_buf[ci] == '3') { opts.gen_signatures = true; }
-        if (input_buf[ci] == '4') { opts.gen_layouts = true; }
-        if (input_buf[ci] == '6') { opts.gen_internal_sdk = true; }
+        if (input_buf[ci] == '3') { opts.gen_sdk = true; opts.gen_internal_sdk = true; }
+        if (input_buf[ci] == '1') { opts.gen_sdk = true; }
+        if (input_buf[ci] == '2') { opts.gen_internal_sdk = true; }
     }
 
     con_print("\n");
