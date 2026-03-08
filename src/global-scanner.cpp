@@ -55,16 +55,18 @@ static bool is_plausible_pointer(uint64_t val) {
 // ============================================================================
 
 GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& rtti_map,
-               const std::unordered_set<std::string>& schema_classes) {
+               const std::unordered_set<std::string>& schema_classes,
+               const std::unordered_set<std::string>& scan_modules) {
     GlobalMap results;
 
     // ---- Build lookup tables ----
 
-    // Collect unique modules that have vtable data
+    // Resolve module base addresses for all modules that have vtable data.
+    // We need these to compute absolute vtable addresses for the lookup table.
     struct ModuleCtx {
         uintptr_t base = 0;
         size_t    size = 0;
-        std::vector<SectionRange> writable;
+        std::vector<SectionRange> writable;  // only populated for scan targets
     };
     std::unordered_map<std::string, ModuleCtx> modules;
 
@@ -81,14 +83,17 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
         ModuleCtx ctx;
         ctx.base = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
         ctx.size = mi.SizeOfImage;
-        ctx.writable = find_writable_sections(ctx.base);
+
+        // Only discover writable sections for modules we'll actually scan
+        if (scan_modules.count(info.source_module))
+            ctx.writable = find_writable_sections(ctx.base);
+
         modules[info.source_module] = ctx;
     }
 
-    // Build absolute-vtable-addr -> bare class name map (across all modules).
-    // Absolute addresses are unique per module, so no collision.
-    // class_to_vtable_rva is keyed by composite "module::ClassName" to avoid
-    // collisions when the same class exists in multiple modules.
+    // Build absolute-vtable-addr -> bare class name map (across ALL modules).
+    // This ensures we can match vtable pointers even if the class was defined
+    // in a non-scanned module (e.g. steamclient64.dll vtable referenced by client.dll).
     std::unordered_map<uint64_t, std::string> vtable_to_class;
     std::unordered_map<std::string, uint32_t> class_to_vtable_rva;
 
@@ -107,9 +112,54 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
     LOG_I("Vtable catalog: %d entries across %d modules",
           (int)vtable_to_class.size(), (int)modules.size());
 
+    // Pre-build a sorted list of readable memory regions for fast pointer validation.
+    // This avoids calling VirtualQuery (syscall) or triggering SEH for every pointer.
+    struct MemRegion { uintptr_t start; uintptr_t end; };
+    std::vector<MemRegion> readable_regions;
+    {
+        uintptr_t addr = 0x10000;  // skip null page
+        MEMORY_BASIC_INFORMATION mbi;
+        while (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_COMMIT &&
+                (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) &&
+                !(mbi.Protect & PAGE_GUARD)) {
+                uintptr_t rstart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                uintptr_t rend = rstart + mbi.RegionSize;
+                // Merge with previous region if contiguous
+                if (!readable_regions.empty() && readable_regions.back().end == rstart)
+                    readable_regions.back().end = rend;
+                else
+                    readable_regions.push_back({rstart, rend});
+            }
+            addr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (addr == 0) break;  // overflow
+        }
+        LOG_I("Memory map: %d readable regions", (int)readable_regions.size());
+    }
+
+    // Lambda: binary search to check if an address falls in a readable region
+    auto is_readable = [&readable_regions](uintptr_t addr) -> bool {
+        size_t lo = 0, hi = readable_regions.size();
+        while (lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            if (addr < readable_regions[mid].start)
+                hi = mid;
+            else if (addr >= readable_regions[mid].end)
+                lo = mid + 1;
+            else
+                return true;
+        }
+        return false;
+    };
+
     // ---- Scan each module's writable sections ----
 
+    // Only scan .data of whitelisted modules (game DLLs with schema data).
+    // The vtable catalog above includes ALL modules for cross-referencing.
     for (auto& [mod_name, mod] : modules) {
+        if (mod.writable.empty()) continue;  // not a scan target
+
         size_t writable_total = 0;
         for (const auto& sec : mod.writable) writable_total += sec.size;
 
@@ -154,11 +204,12 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
                 }
 
                 // ---- Pass 2: Indirect (pointer to object) ----
-                // Value looks like a pointer -> dereference -> check vtable
+                // Value looks like a pointer -> dereference -> check vtable.
+                // Use pre-built memory map (binary search) instead of SEH per pointer.
                 if (!is_plausible_pointer(val)) continue;
+                if (!is_readable(val)) continue;
 
-                uint64_t vtable_ptr = 0;
-                if (!safe_read_u64(val, vtable_ptr)) continue;
+                uint64_t vtable_ptr = *reinterpret_cast<const uint64_t*>(val);
                 if (vtable_ptr == 0) continue;
 
                 auto it = vtable_to_class.find(vtable_ptr);

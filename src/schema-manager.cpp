@@ -123,6 +123,15 @@ static bool seh_read_i64(uintptr_t addr, int64_t* out) {
     }
 }
 
+static bool seh_read_bytes(uintptr_t addr, void* out, size_t len) {
+    __try {
+        memcpy(out, reinterpret_cast<void*>(addr), len);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 static bool seh_read_string(uintptr_t addr, const char** out) {
     __try {
         const char* s = reinterpret_cast<const char*>(addr);
@@ -918,6 +927,16 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
 
     auto entries = collect_utltshash_entries(hash_base, seh_validate_class_info, module_name);
 
+    // Build module name without extension for comparison.
+    // Game stores module names without .dll (e.g. "entity2", "client")
+    // but module_name comes from GetModuleBaseNameA ("engine2.dll").
+    std::string mod_stem = module_name;
+    {
+        auto dot = mod_stem.rfind('.');
+        if (dot != std::string::npos)
+            mod_stem = mod_stem.substr(0, dot);
+    }
+
     int classes_found = 0;
     int skipped_xmod = 0;
     for (uintptr_t class_info : entries) {
@@ -928,7 +947,9 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
         if (seh_read_ptr(class_info + 0x10, &mod_ptr) && mod_ptr) {
             const char* entry_mod = nullptr;
             if (seh_read_string(mod_ptr, &entry_mod)
-                && entry_mod && _stricmp(entry_mod, module_name) != 0) {
+                && entry_mod
+                && _stricmp(entry_mod, module_name) != 0
+                && _stricmp(entry_mod, mod_stem.c_str()) != 0) {
                 // Log individual cross-module skips at debug level
                 uintptr_t xmod_name_ptr = 0;
                 if (seh_read_ptr(class_info + 0x08, &xmod_name_ptr) && xmod_name_ptr) {
@@ -936,6 +957,7 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
                     if (seh_read_string(xmod_name_ptr, &xmod_cls) && xmod_cls)
                         LOG_D("enumerate_scope: skip %s (belongs to %s, not %s)", xmod_cls, entry_mod, module_name);
                 }
+
                 skipped_xmod++;
                 continue;
             }
@@ -952,7 +974,8 @@ bool SchemaManager::enumerate_scope(void* type_scope, const char* module_name) {
     }
 
     if (skipped_xmod > 0)
-        LOG_I("enumerate_scope: skipped %d cross-module entries in %s", skipped_xmod, module_name);
+        LOG_I("enumerate_scope: skipped %d cross-module entries in %s (of %d total entries)",
+              skipped_xmod, module_name, (int)entries.size());
     LOG_I("enumerate_scope: %d classes from hash table in %s", classes_found, module_name);
 
     // Phase 2: Discover base classes referenced by m_pClass pointers but

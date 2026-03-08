@@ -33,7 +33,7 @@ using GlobalMap = std::unordered_map<std::string, std::vector<DiscoveredGlobal>>
 // API
 // ============================================================================
 
-// Scan writable (.data) sections of all modules that have RTTI classes.
+// Scan writable (.data) sections for global singletons.
 // Cross-references 8-byte values against known vtable addresses.
 //
 // Two-pass per module:
@@ -41,10 +41,12 @@ using GlobalMap = std::unordered_map<std::string, std::vector<DiscoveredGlobal>>
 //   2. Indirect: value is a pointer to memory whose first 8 bytes match a vtable
 //      (object on heap, .data has a pointer to it)
 //
-// rtti_map:      class_name -> InheritanceInfo (with vtable_rva + source_module)
+// rtti_map:       class_name -> InheritanceInfo (with vtable_rva + source_module)
 // schema_classes: set of class names that have SchemaSystem entries (for tagging)
+// scan_modules:   only scan .data of these modules (vtable catalog still uses all RTTI)
 GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& rtti_map,
-               const std::unordered_set<std::string>& schema_classes);
+               const std::unordered_set<std::string>& schema_classes,
+               const std::unordered_set<std::string>& scan_modules);
 
 } // namespace globals
 

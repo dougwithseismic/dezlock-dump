@@ -134,6 +134,11 @@ bool write_export(schema::SchemaManager& mgr, const char* path,
         return false;
     }
 
+    // Use a large write buffer to avoid thousands of tiny disk flushes.
+    // MSVC default is ~512 bytes; with multi-MB JSON output this is a major bottleneck.
+    static char write_buf[1 << 18]; // 256 KB
+    setvbuf(fp, write_buf, _IOFBF, sizeof(write_buf));
+
     time_t now = time(nullptr);
     char timebuf[64];
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S", localtime(&now));
@@ -974,7 +979,10 @@ static globals::GlobalMap phase_globals(schema::SchemaManager& mgr) {
     }
     LOG_I("Schema class set: %d classes for tagging", (int)schema_classes.size());
 
-    globals::GlobalMap discovered = globals::scan(mgr.rtti_map(), schema_classes);
+    // Only scan .data of game modules with schema data — skip Steam, NVIDIA, etc.
+    std::unordered_set<std::string> game_modules(
+        mgr.dumped_modules().begin(), mgr.dumped_modules().end());
+    globals::GlobalMap discovered = globals::scan(mgr.rtti_map(), schema_classes, game_modules);
     {
         int total = 0;
         for (const auto& [mod, entries] : discovered) total += (int)entries.size();
