@@ -698,51 +698,58 @@ inline int32_t resolve_offset(const char* module_name, const char* class_name, c
     type& name() {                                                          \
         static int32_t off = ::sdk::schema::resolve_offset(                 \
             _schema_module, _schema_class, #name);                          \
+        if (off == -1) { static type _z{}; _z = {}; return _z; }             \
         return *reinterpret_cast<type*>(                                    \
             reinterpret_cast<uintptr_t>(this) + off);                       \
     }                                                                       \
     const type& name() const {                                              \
         static int32_t off = ::sdk::schema::resolve_offset(                 \
             _schema_module, _schema_class, #name);                          \
+        if (off == -1) { static const type _z{}; return _z; }               \
         return *reinterpret_cast<const type*>(                              \
             reinterpret_cast<uintptr_t>(this) + off);                       \
     }
 
-// Array field: returns pointer to first element
+// Array field: returns pointer to first element (nullptr on failure)
 #define FIELD_ARRAY(name, elem_type, count)                                 \
     elem_type* name() {                                                     \
         static int32_t off = ::sdk::schema::resolve_offset(                 \
             _schema_module, _schema_class, #name);                          \
+        if (off == -1) return nullptr;                                      \
         return reinterpret_cast<elem_type*>(                                \
             reinterpret_cast<uintptr_t>(this) + off);                       \
     }                                                                       \
     const elem_type* name() const {                                         \
         static int32_t off = ::sdk::schema::resolve_offset(                 \
             _schema_module, _schema_class, #name);                          \
+        if (off == -1) return nullptr;                                      \
         return reinterpret_cast<const elem_type*>(                          \
             reinterpret_cast<uintptr_t>(this) + off);                       \
     }
 
-// Pointer field: reads and returns the pointer value
+// Pointer field: reads and returns the pointer value (default-constructed on failure)
 #define FIELD_PTR(name, type)                                               \
     type name() {                                                           \
         static int32_t off = ::sdk::schema::resolve_offset(                 \
             _schema_module, _schema_class, #name);                          \
+        if (off == -1) { type _z = {}; return _z; }                         \
         return *reinterpret_cast<type*>(                                    \
             reinterpret_cast<uintptr_t>(this) + off);                       \
     }
 
-// Opaque/embedded type: returns void* to the field's raw memory
+// Opaque/embedded type: returns void* to the field's raw memory (nullptr on failure)
 #define FIELD_BLOB(name, sz)                                                \
     void* name() {                                                          \
         static int32_t off = ::sdk::schema::resolve_offset(                 \
             _schema_module, _schema_class, #name);                          \
+        if (off == -1) return nullptr;                                      \
         return reinterpret_cast<void*>(                                     \
             reinterpret_cast<uintptr_t>(this) + off);                       \
     }                                                                       \
     const void* name() const {                                              \
         static int32_t off = ::sdk::schema::resolve_offset(                 \
             _schema_module, _schema_class, #name);                          \
+        if (off == -1) return nullptr;                                      \
         return reinterpret_cast<const void*>(                               \
             reinterpret_cast<uintptr_t>(this) + off);                       \
     }
@@ -801,6 +808,11 @@ static std::string generate_types_hpp() {
 #include <cstdint>
 #include <cstddef>
 
+// If the consumer project already defines SDK types (e.g., shared/sdk/types.hpp),
+// skip all definitions here. The consumer's types.hpp must define SDK_TYPES_DEFINED.
+#ifndef SDK_TYPES_DEFINED
+#define SDK_TYPES_DEFINED
+
 namespace sdk {
 
 struct Vec2 {
@@ -843,6 +855,8 @@ struct CHandle {
 struct ViewMatrix { float m[4][4]; };
 
 } // namespace sdk
+
+#endif // SDK_TYPES_DEFINED
 )";
 }
 
