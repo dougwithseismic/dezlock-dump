@@ -186,6 +186,10 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (opts.no_color) {
+        g_no_color = true;
+    }
+
     // Banner
     SetConsoleTitleA("dezlock-dump - Source 2 Schema Extractor");
     print_banner();

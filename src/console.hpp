@@ -6,6 +6,7 @@
 // Console handle and log file (global state)
 extern HANDLE g_console;
 extern FILE* g_log_fp;
+extern bool g_no_color;
 
 // Color constants
 static constexpr WORD CLR_DEFAULT = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;

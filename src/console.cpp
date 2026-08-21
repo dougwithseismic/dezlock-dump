@@ -2,9 +2,11 @@
 #include "version.h"
 #include <cstdarg>
 #include <string>
+#include <io.h>
 
 HANDLE g_console = INVALID_HANDLE_VALUE;
 FILE* g_log_fp = nullptr;
+bool g_no_color = false;
 
 void ensure_console() {
     g_console = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -12,6 +14,11 @@ void ensure_console() {
         AllocConsole();
         g_console = GetStdHandle(STD_OUTPUT_HANDLE);
     }
+
+    if (!_isatty(_fileno(stdout))) {
+        g_no_color = true;
+    }
+
     // Also open a log file for diagnostics
     char log_path[MAX_PATH];
     GetTempPathA(MAX_PATH, log_path);
@@ -29,14 +36,21 @@ void con_print(const char* fmt, ...) {
 
     // Write to console
     DWORD written = 0;
-    if (g_console != INVALID_HANDLE_VALUE)
-        WriteConsoleA(g_console, buf, (DWORD)len, &written, nullptr);
+    if (g_console != INVALID_HANDLE_VALUE) {
+        DWORD mode;
+        if (GetConsoleMode(g_console, &mode)) {
+            WriteConsoleA(g_console, buf, (DWORD)len, &written, nullptr);
+        } else {
+            WriteFile(g_console, buf, (DWORD)len, &written, nullptr);
+        }
+    }
 
     // Write to log
     if (g_log_fp) { fwrite(buf, 1, len, g_log_fp); fflush(g_log_fp); }
 }
 
 void con_color(WORD attr) {
+    if (g_no_color) return;
     if (g_console != INVALID_HANDLE_VALUE)
         SetConsoleTextAttribute(g_console, attr);
 }
