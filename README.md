@@ -3,7 +3,6 @@
 [![GitHub Release](https://img.shields.io/github/v/release/dougwithseismic/dezlock-dump?label=Version)](../../releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/dougwithseismic/dezlock-dump/build.yml?label=Build)](../../actions/workflows/build.yml)
 [![Discord](https://img.shields.io/discord/1469694564683088168?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sjcsVkE8ur)
-[![Hire Me](https://img.shields.io/badge/Hire%20Me-hello%40withseismic.com-blue?style=flat&logo=gmail&logoColor=white)](mailto:hello@withseismic.com)
 
 Extracts everything from a running Source 2 game (Deadlock, CS2, Dota 2) and generates a **patch-proof C++ SDK** that resolves offsets at runtime. No hardcoded values, no manual updates when the game patches.
 
