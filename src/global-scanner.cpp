@@ -113,7 +113,7 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
           (int)vtable_to_class.size(), (int)modules.size());
 
     // Pre-build a sorted list of readable memory regions for fast pointer validation.
-    // This avoids calling VirtualQuery (syscall) or triggering SEH for every pointer.
+    // This rejects most non-pointers without calling VirtualQuery (syscall) or taking an SEH fault.
     struct MemRegion { uintptr_t start; uintptr_t end; };
     std::vector<MemRegion> readable_regions;
     {
@@ -205,12 +205,15 @@ GlobalMap scan(const std::unordered_map<std::string, schema::InheritanceInfo>& r
 
                 // ---- Pass 2: Indirect (pointer to object) ----
                 // Value looks like a pointer -> dereference -> check vtable.
-                // Use pre-built memory map (binary search) instead of SEH per pointer.
-                if (!is_plausible_pointer(val)) continue;
+                // The memory map is only a cheap filter: it is a snapshot, and the game
+                // frees memory on its own threads while we scan, so the read must be guarded.
+                // Objects with a vtable are 8-byte aligned, which also keeps the read
+                // inside one page.
+                if (!is_plausible_pointer(val) || (val & 7) != 0) continue;
                 if (!is_readable(val)) continue;
 
-                uint64_t vtable_ptr = *reinterpret_cast<const uint64_t*>(val);
-                if (vtable_ptr == 0) continue;
+                uint64_t vtable_ptr = 0;
+                if (!safe_read_u64(val, vtable_ptr) || vtable_ptr == 0) continue;
 
                 auto it = vtable_to_class.find(vtable_ptr);
                 if (it != vtable_to_class.end()) {

@@ -1071,8 +1071,10 @@ bool SchemaManager::enumerate_enums(void* type_scope, const char* module_name) {
         0x0BE8, 0x0BF0, 0x0BF8, 0x0C00, 0x0C08, 0x0C10,
     };
 
-    // Try each candidate: look for a valid CUtlTSHash header that has
-    // bucket entries validating as enum info pointers
+    // Try each candidate and accept the first one that yields validated enum entries.
+    // A small hash can keep every entry in the pool's free list, with
+    // blocks_allocated == 0 and no bucket chains, so bucket hits cannot be the gate;
+    // collect_utltshash_entries walks both and validates each entry.
     for (int candidate_offset : enum_offsets) {
         uintptr_t hash_base = scope + candidate_offset;
 
@@ -1080,18 +1082,15 @@ bool SchemaManager::enumerate_enums(void* type_scope, const char* module_name) {
         if (!seh_read_i32(hash_base + 0x0C, &blocks_allocated)) continue;
         if (!seh_read_i32(hash_base + 0x10, &peak_alloc)) continue;
 
-        if (blocks_allocated <= 0 || blocks_allocated > 100000) continue;
+        if (blocks_allocated < 0 || blocks_allocated > 100000) continue;
+        if (peak_alloc <= 0 || peak_alloc > 100000) continue;
 
-        // Auto-detect bucket base for this candidate hash
-        uintptr_t buckets_base = find_bucket_base(hash_base, seh_validate_enum_info);
-        if (!buckets_base) continue;
+        std::string label = std::string(module_name) + " enums";
+        auto entries = collect_utltshash_entries(hash_base, seh_validate_enum_info, label.c_str());
+        if (entries.empty()) continue;
 
         LOG_I("enum CUtlTSHash found at scope+0x%X (allocated=%d, peak=%d)",
               candidate_offset, blocks_allocated, peak_alloc);
-
-        // Found it — collect entries using the standard bucket walker
-        std::string label = std::string(module_name) + " enums";
-        auto entries = collect_utltshash_entries(hash_base, seh_validate_enum_info, label.c_str());
 
         int enums_found = 0;
         for (uintptr_t enum_info : entries) {

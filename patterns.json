@@ -12,7 +12,15 @@
       "name": "dwLocalPlayerController",
       "module": "client.dll",
       "pattern": "48 8B 05 ?? ?? ?? ?? 41 89 BE",
-      "rip_offset": 3
+      "rip_offset": 3,
+      "game": "cs2"
+    },
+    {
+      "name": "dwLocalPlayerController",
+      "module": "client.dll",
+      "pattern": "33 C0 83 F9 FF 0F 44 C8 48 63 C1 48 8D 0D ?? ?? ?? ?? 48 8B 04 C1 C3",
+      "rip_offset": 14,
+      "game": "deadlock"
     },
     {
       "name": "dwViewMatrix",
@@ -36,7 +44,29 @@
       "name": "dwGlowManager",
       "module": "client.dll",
       "pattern": "48 8B 05 ?? ?? ?? ?? C3 CC CC CC CC CC CC CC CC 8B 41",
-      "rip_offset": 3
+      "rip_offset": 3,
+      "game": "cs2"
+    },
+    {
+      "name": "dwGlowManager",
+      "module": "client.dll",
+      "pattern": "4C 8B 0D ?? ?? ?? ?? 33 C9 4D 63 41 18 45 85 C0 7E",
+      "rip_offset": 3,
+      "game": "deadlock"
+    },
+    {
+      "name": "dwGlobalVars",
+      "module": "client.dll",
+      "pattern": "48 8B 05 ?? ?? ?? ?? 44 8B B7 ?? ?? ?? ?? 8B 70 04 B8 FF FF 00 00 89 B7 ?? ?? ?? ?? 66 01 43 04",
+      "rip_offset": 3,
+      "game": "deadlock"
+    },
+    {
+      "name": "dwFirstCUserCmdArray",
+      "module": "client.dll",
+      "pattern": "48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B CF 4C 8B F8 44 8B B0",
+      "rip_offset": 3,
+      "game": "deadlock"
     },
     {
       "name": "dwGameRules",
