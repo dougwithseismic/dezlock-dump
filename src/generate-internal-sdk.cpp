@@ -619,6 +619,14 @@ inline bool safe_read(uintptr_t addr, T* out) {
     }
 }
 
+inline bool safe_streq(const char* a, const char* b) {
+    __try {
+        return strcmp(a, b) == 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ---- Offset resolution with caching ----
 
 inline int32_t resolve_offset(const char* module_name, const char* class_name, const char* field_name) {
@@ -656,14 +664,19 @@ inline int32_t resolve_offset(const char* module_name, const char* class_name, c
     void* class_info = find_declared_class(mod.type_scope, class_name);
     if (!class_info) return -1;
 
-    // CSchemaClassInfo: field_count at +0x1C (int16), fields_ptr at +0x28
+    // CSchemaClassInfo: field_count at +0x1C (int16), fields_ptr at +0x28 on older builds.
+    // Newer builds store a second class-name pointer at +0x18, moving these to +0x24 / +0x30.
     // SchemaClassFieldData_t: 0x20 bytes each, name at +0x00, offset at +0x10
     uintptr_t ci = reinterpret_cast<uintptr_t>(class_info);
     int16_t field_count = 0;
     uintptr_t fields_ptr = 0;
 
-    if (!safe_read<int16_t>(ci + 0x1C, &field_count)) return -1;
-    if (!safe_read<uintptr_t>(ci + 0x28, &fields_ptr)) return -1;
+    const char* alt_name = nullptr;
+    bool current_layout = safe_read<const char*>(ci + 0x18, &alt_name) && alt_name
+        && safe_streq(alt_name, class_name);
+
+    if (!safe_read<int16_t>(ci + (current_layout ? 0x24 : 0x1C), &field_count)) return -1;
+    if (!safe_read<uintptr_t>(ci + (current_layout ? 0x30 : 0x28), &fields_ptr)) return -1;
     if (!fields_ptr || field_count <= 0) return -1;
 
     // Walk all fields and cache them (avoids repeated walks for the same class)

@@ -6,15 +6,6 @@
  *
  * Struct layouts from source2gen:
  *
- * SchemaClassInfoData_t:
- *   +0x08  m_pszName (const char*)
- *   +0x10  m_pszModule (const char*)
- *   +0x18  m_nSizeOf (int32)
- *   +0x1C  m_nFieldSize (int16)
- *   +0x21  m_nBaseClassSize (int8)  [confirmed via raw dump, NOT +0x23]
- *   +0x28  m_pFields (SchemaClassFieldData_t*)
- *   +0x38  m_pBaseClasses (SchemaBaseClassInfoData_t*)
- *
  * SchemaClassFieldData_t (0x20 bytes each):
  *   +0x00  m_pszName (const char*)
  *   +0x08  m_pSchemaType (CSchemaType*)
@@ -30,18 +21,44 @@
  *   +0x00  m_unOffset (uint32)  — offset of base within derived class
  *   +0x08  m_pClass (CSchemaClassInfo*)
  *
- * SchemaClassInfoData_t layout (from neverlosecc/source2gen):
+ * SchemaClassInfoData_t, legacy layout (from neverlosecc/source2gen) — games on older
+ * Source 2 builds:
  *   +0x00  m_pSelf (SchemaClassInfoData_t*)
  *   +0x08  m_pszName (const char*)
  *   +0x10  m_pszModule (const char*)
  *   +0x18  m_nSizeOf (int32)
  *   +0x1C  m_nFieldSize (int16)
+ *   +0x1E  m_nStaticFieldsSize (int16)
  *   +0x20  m_nStaticMetadataSize (int16)
  *   +0x22  m_unAlignOf (uint8)
  *   +0x23  m_nBaseClassSize (int8)  — count of base classes
  *   +0x28  m_pFields (SchemaClassFieldData_t*)
+ *   +0x30  m_pStaticFields (SchemaStaticFieldData_t*)
  *   +0x38  m_pBaseClasses (SchemaBaseClassInfoData_t*)
  *   +0x48  m_pStaticMetadata (SchemaMetadataEntryData_t*)
+ *
+ * SchemaClassInfoData_t, current layout (Deadlock, Sep 2026 update) — a second
+ * class-name pointer was inserted at +0x18 and the static-field array removed.
+ * Verified against every client.dll class in a live process:
+ *   +0x00  m_pSelf (SchemaClassInfoData_t*)
+ *   +0x08  m_pszName (const char*)
+ *   +0x10  m_pszModule (const char*)
+ *   +0x18  m_pszName (const char*) — separate copy of the class name (layout marker)
+ *   +0x20  m_nSizeOf (int32)
+ *   +0x24  m_nFieldSize (int16)
+ *   +0x26  m_nStaticMetadataSize (int16)
+ *   +0x28  m_unAlignOf (uint8)  — 0xFF when unknown
+ *   +0x29  m_nBaseClassSize (int8)
+ *   +0x2A  m_nMultipleInheritanceDepth (int16)
+ *   +0x2C  m_nSingleInheritanceDepth (int16)
+ *   +0x30  m_pFields (SchemaClassFieldData_t*)
+ *   +0x38  m_pBaseClasses (SchemaBaseClassInfoData_t*)
+ *   +0x40  m_pFieldMetadataOverrides
+ *   +0x48  m_pStaticMetadata (SchemaMetadataEntryData_t*)
+ *   +0x50  m_pTypeScope (CSchemaSystemTypeScope*)
+ *   +0x58  m_pSchemaType (CSchemaType*)
+ *
+ * The layout is detected per class — see ClassInfoLayout / detect_class_layout().
  *
  * CSchemaType:
  *   +0x08  m_pszName (const char*)
@@ -153,6 +170,48 @@ static bool seh_read_string(uintptr_t addr, const char** out) {
 }
 
 // ============================================================================
+// SchemaClassInfoData_t layout detection
+// ============================================================================
+
+// Offsets into SchemaClassInfoData_t. 0 = member not present in that layout.
+struct ClassInfoLayout {
+    uintptr_t size_of;
+    uintptr_t field_count;
+    uintptr_t static_field_count;
+    uintptr_t metadata_count;
+    uintptr_t base_count;
+    uintptr_t fields;
+    uintptr_t static_fields;
+    uintptr_t bases;
+    uintptr_t metadata;
+};
+
+// Pre-Sep-2026 Source 2 builds (other games may still ship this). Offsets are the
+// ones dezlock-dump always used, so behavior on those games is unchanged.
+static constexpr ClassInfoLayout kLegacyClassLayout = {
+    /*size_of*/ 0x18, /*field_count*/ 0x1C, /*static_field_count*/ 0x1E, /*metadata_count*/ 0x22,
+    /*base_count*/ 0x23, /*fields*/ 0x28, /*static_fields*/ 0x30, /*bases*/ 0x38, /*metadata*/ 0x48,
+};
+
+static constexpr ClassInfoLayout kCurrentClassLayout = {
+    /*size_of*/ 0x20, /*field_count*/ 0x24, /*static_field_count*/ 0, /*metadata_count*/ 0x26,
+    /*base_count*/ 0x29, /*fields*/ 0x30, /*static_fields*/ 0, /*bases*/ 0x38, /*metadata*/ 0x48,
+};
+
+// The current layout stores a second copy of the class name at +0x18. In the legacy
+// layout +0x18 holds m_nSizeOf/m_nFieldSize/m_nStaticFieldsSize, which never reads as
+// a pointer to a matching string (SEH turns an unreadable address into "legacy").
+static const ClassInfoLayout& detect_class_layout(uintptr_t ci, const char* class_name) {
+    uintptr_t alt_name_ptr = 0;
+    const char* alt_name = nullptr;
+    if (seh_read_ptr(ci + 0x18, &alt_name_ptr) && alt_name_ptr &&
+        seh_read_string(alt_name_ptr, &alt_name) && strncmp(alt_name, class_name, 128) == 0) {
+        return kCurrentClassLayout;
+    }
+    return kLegacyClassLayout;
+}
+
+// ============================================================================
 // Vtable call wrappers (SEH-isolated)
 // ============================================================================
 
@@ -243,16 +302,18 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
     out.name = name;
     out.module = module_name;
 
+    const ClassInfoLayout& layout = detect_class_layout(ci, name);
+
     // Read sizeof
-    seh_read_i32(ci + 0x18, &out.size);
+    seh_read_i32(ci + layout.size_of, &out.size);
 
     // Read field count
     int16_t field_count = 0;
-    seh_read_i16(ci + 0x1C, &field_count);
+    seh_read_i16(ci + layout.field_count, &field_count);
 
     // Read fields pointer
     uintptr_t fields_ptr = 0;
-    seh_read_ptr(ci + 0x28, &fields_ptr);
+    seh_read_ptr(ci + layout.fields, &fields_ptr);
 
     // Walk fields
     if (fields_ptr && field_count > 0 && field_count < 4096) {
@@ -307,20 +368,20 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
 
     // Read base classes
     //
-    // SchemaClassInfoData_t layout (from neverlosecc/source2gen, verified with static_assert):
-    //   +0x22  m_unAlignOf (uint8)
-    //   +0x23  m_nBaseClassSize (int8) — COUNT of base classes
-    //   +0x38  m_pBaseClasses (SchemaBaseClassInfoData_t*)
+    // SchemaClassInfoData_t (legacy / current layout):
+    //   +0x22 / +0x28  m_unAlignOf (uint8)
+    //   +0x23 / +0x29  m_nBaseClassSize (int8) — COUNT of base classes
+    //   +0x38          m_pBaseClasses (SchemaBaseClassInfoData_t*)
     //
     // SchemaBaseClassInfoData_t layout (from neverlosecc/source2gen):
     //   +0x00  m_unOffset (uint32)        — offset of base within derived class
     //   +0x08  m_pClass (CSchemaClassInfo*) — pointer to base class info
     //   Total: 0x10 bytes per entry
     int8_t base_count = 0;
-    seh_read_i8(ci + 0x23, &base_count);
+    seh_read_i8(ci + layout.base_count, &base_count);
 
     uintptr_t bases_ptr = 0;
-    seh_read_ptr(ci + 0x38, &bases_ptr);
+    seh_read_ptr(ci + layout.bases, &bases_ptr);
 
     out.base_classes.clear();
 
@@ -360,11 +421,14 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
     // We store the instance pointer as-is in the offset field (truncated to int32
     // for the RuntimeField struct). Static field offsets aren't meaningful for struct
     // generation; they represent global addresses.
+    //
+    // The current layout has no static-field array (layout.static_fields == 0).
     int16_t static_count = 0;
-    seh_read_i16(ci + 0x1E, &static_count);
-
     uintptr_t static_fields_ptr = 0;
-    seh_read_ptr(ci + 0x30, &static_fields_ptr);
+    if (layout.static_fields) {
+        seh_read_i16(ci + layout.static_field_count, &static_count);
+        seh_read_ptr(ci + layout.static_fields, &static_fields_ptr);
+    }
 
     if (static_fields_ptr && static_count > 0 && static_count < 1024) {
         out.static_fields.reserve(static_count);
@@ -400,17 +464,13 @@ bool SchemaManager::resolve_class(void* class_info, const char* module_name, Run
     }
 
     // ---- Class metadata ----
-    // classinfo+0x20 has packed fields: +0x20=align(int8), +0x21=base_count(int8)
-    // classinfo+0x22 = m_nMetadataCount (int16) — right after base_count byte + alignment
-    // classinfo+0x48 = m_pMetadata (SchemaMetadataEntryData_t*)
-    //
-    // Note: +0x20 is a packed area. We already read base_count from +0x21.
-    // Metadata count is at +0x22 (2 bytes).
+    // Legacy layout:  count read at +0x22 (int16), ptr at +0x48
+    // Current layout: m_nStaticMetadataSize at +0x26 (int16), m_pStaticMetadata at +0x48
     int16_t class_meta_count = 0;
-    seh_read_i16(ci + 0x22, &class_meta_count);
+    seh_read_i16(ci + layout.metadata_count, &class_meta_count);
 
     uintptr_t class_meta_ptr = 0;
-    seh_read_ptr(ci + 0x48, &class_meta_ptr);
+    seh_read_ptr(ci + layout.metadata, &class_meta_ptr);
 
     if (class_meta_ptr && class_meta_count > 0 && class_meta_count < 64) {
         for (int16_t m = 0; m < class_meta_count; ++m) {
