@@ -16,6 +16,7 @@ struct CliOptions {
     bool gen_internal_sdk = false;
     bool gen_all = false;
     bool live_mode = false;
+    bool no_color = false;
     bool no_update_check = false;
     bool show_help = false;
 };
